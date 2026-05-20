@@ -2031,6 +2031,62 @@ def record_loop_run(
     return _row_to_prompt_loop_run(row)
 
 
+def start_loop_run(
+    loop_id: int,
+    *,
+    started_at: float,
+    output_path: str,
+    target_mission_id: str = "",
+    target_tab_id: Optional[str] = None,
+) -> PromptLoopRun:
+    with _connect() as conn:
+        cur = conn.execute(
+            """
+            INSERT INTO prompt_loop_runs (
+                loop_id, started_at, finished_at, status, exit_code, output_path,
+                summary, target_mission_id, target_tab_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                loop_id,
+                started_at,
+                0.0,
+                "running",
+                None,
+                output_path,
+                "run started",
+                target_mission_id,
+                target_tab_id,
+            ),
+        )
+        row = conn.execute("SELECT * FROM prompt_loop_runs WHERE id = ?", (cur.lastrowid,)).fetchone()
+    return _row_to_prompt_loop_run(row)
+
+
+def finish_loop_run(
+    run_id: int,
+    *,
+    finished_at: float,
+    status: str,
+    exit_code: Optional[int],
+    summary: str,
+) -> PromptLoopRun:
+    with _connect() as conn:
+        conn.execute(
+            """
+            UPDATE prompt_loop_runs
+               SET finished_at = ?,
+                   status = ?,
+                   exit_code = ?,
+                   summary = ?
+             WHERE id = ?
+            """,
+            (finished_at, status, exit_code, summary, run_id),
+        )
+        row = conn.execute("SELECT * FROM prompt_loop_runs WHERE id = ?", (run_id,)).fetchone()
+    return _row_to_prompt_loop_run(row)
+
+
 def loop_runs(loop_id: int, limit: int = 20) -> list[PromptLoopRun]:
     with _connect() as conn:
         rows = conn.execute(

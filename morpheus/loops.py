@@ -41,6 +41,10 @@ NOISE_PREFIXES = (
     "use /skills to list",
     "› use /skills to list",
     "> use /skills to list",
+    "$ ",
+    "started:",
+    "cwd:",
+    "[loop ",
 )
 CODEX_EXEC_RE = re.compile(r"^codex\s+exec(?=\s|$)")
 
@@ -161,46 +165,52 @@ def run_loop(
     run_cwd = cwd or _loop_cwd(loop)
     output_path = _output_path(loop.id, started)
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    _write_output_header(output_path, command, run_cwd, started)
+    run = db.start_loop_run(
+        loop.id,
+        started_at=started,
+        output_path=str(output_path),
+        target_mission_id=loop.target_mission_id,
+        target_tab_id=loop.target_tab_id,
+    )
 
     status = "success"
     exit_code: Optional[int] = 0
     try:
-        completed = subprocess.run(
-            command,
-            shell=True,
-            cwd=str(run_cwd) if run_cwd else None,
-            text=True,
-            capture_output=True,
-            timeout=timeout,
-            check=False,
-        )
+        with output_path.open("a", encoding="utf-8") as out:
+            completed = subprocess.run(
+                command,
+                shell=True,
+                cwd=str(run_cwd) if run_cwd else None,
+                text=True,
+                stdout=out,
+                stderr=subprocess.STDOUT,
+                timeout=timeout,
+                check=False,
+            )
         exit_code = completed.returncode
-        stdout = completed.stdout or ""
-        stderr = completed.stderr or ""
         if completed.returncode != 0:
             status = "failed"
-        summary = summarize_output(stdout, stderr)
-        output = _format_output(command, stdout, stderr, completed.returncode)
-    except subprocess.TimeoutExpired as exc:
+        summary = summarize_output(_read_output(output_path))
+    except subprocess.TimeoutExpired:
         status = "timeout"
         exit_code = None
-        stdout = _decode_timeout_value(exc.stdout)
-        stderr = _decode_timeout_value(exc.stderr)
         summary = f"loop timed out after {timeout}s"
-        output = _format_output(command, stdout, stderr, None, timed_out=True)
-
-    output_path.write_text(output, encoding="utf-8")
+        _append_output_footer(output_path, status=status, exit_code=exit_code, timed_out=True)
+    except Exception as exc:
+        status = "failed"
+        exit_code = None
+        summary = str(exc)
+        _append_output_line(output_path, f"\n[loop runner error] {exc}\n")
     finished = time.time()
-    run = db.record_loop_run(
-        loop.id,
-        started_at=started,
+    if status != "timeout":
+        _append_output_footer(output_path, status=status, exit_code=exit_code)
+    run = db.finish_loop_run(
+        run.id,
         finished_at=finished,
         status=status,
         exit_code=exit_code,
-        output_path=str(output_path),
         summary=summary,
-        target_mission_id=loop.target_mission_id,
-        target_tab_id=loop.target_tab_id,
     )
     db.update_loop_after_run(
         loop.id,
@@ -264,37 +274,45 @@ def _output_path(loop_id: int, ts: float) -> Path:
     return db.DB_DIR / "loops" / str(loop_id) / f"{stamp}.txt"
 
 
+def _write_output_header(output_path: Path, command: str, cwd: Optional[Path], started: float) -> None:
+    lines = [
+        f"$ {command}",
+        f"started: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(started))}",
+    ]
+    if cwd:
+        lines.append(f"cwd: {cwd}")
+    lines.append("")
+    output_path.write_text("\n".join(lines), encoding="utf-8")
+
+
+def _append_output_footer(
+    output_path: Path,
+    *,
+    status: str,
+    exit_code: Optional[int],
+    timed_out: bool = False,
+) -> None:
+    code = "timeout" if timed_out else ("none" if exit_code is None else str(exit_code))
+    _append_output_line(output_path, f"\n\n[loop {status}; exit={code}]\n")
+
+
+def _append_output_line(output_path: Path, text: str) -> None:
+    with output_path.open("a", encoding="utf-8") as out:
+        out.write(text)
+
+
+def _read_output(output_path: Path) -> str:
+    try:
+        return output_path.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return ""
+
+
 def _loop_cwd(loop: db.PromptLoop) -> Optional[Path]:
     if not loop.project_root:
         return None
     path = Path(loop.project_root).expanduser()
     return path if path.exists() else None
-
-
-def _format_output(
-    command: str,
-    stdout: str,
-    stderr: str,
-    exit_code: Optional[int],
-    timed_out: bool = False,
-) -> str:
-    status = "timeout" if timed_out else f"exit {exit_code}"
-    return (
-        f"$ {command}\n"
-        f"# {status}\n\n"
-        "## stdout\n"
-        f"{stdout.rstrip()}\n\n"
-        "## stderr\n"
-        f"{stderr.rstrip()}\n"
-    )
-
-
-def _decode_timeout_value(value: object) -> str:
-    if value is None:
-        return ""
-    if isinstance(value, bytes):
-        return value.decode(errors="replace")
-    return str(value)
 
 
 def _clean_line(value: str) -> str:

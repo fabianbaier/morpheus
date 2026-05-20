@@ -124,6 +124,46 @@ class LoopsTest(unittest.TestCase):
             self.assertEqual(run.status, "success")
             self.assertEqual(captured["cwd"], str(project))
 
+    def test_run_loop_records_running_row_and_streams_output_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            observed = {}
+
+            def fake_run(*args, **kwargs):
+                running = db.loop_runs(observed["loop_id"], limit=1)[0]
+                observed["running_status"] = running.status
+                observed["output_exists_during_run"] = Path(running.output_path).exists()
+                kwargs["stdout"].write("Summary: streamed while running.\n")
+                kwargs["stdout"].flush()
+                return SimpleNamespace(returncode=0)
+
+            with patch.object(db, "DB_DIR", tmp_path), patch.object(
+                db, "DB_PATH", tmp_path / "morpheus.db"
+            ), patch.object(
+                loops.subprocess, "run", new=fake_run
+            ), patch.object(
+                loops.ctx_mod, "write_context_file", new=lambda: None
+            ), patch.object(
+                loops.ctx_mod, "write_context_json", new=lambda: None
+            ):
+                loop = db.create_loop(
+                    name="streaming loop",
+                    prompt="ignored prompt",
+                    interval_seconds=300,
+                    command="printf ok",
+                )
+                observed["loop_id"] = loop.id
+
+                run = loops.run_loop(loop, timeout=5)
+
+            text = Path(run.output_path).read_text(encoding="utf-8")
+            self.assertEqual(observed["running_status"], "running")
+            self.assertTrue(observed["output_exists_during_run"])
+            self.assertEqual(run.status, "success")
+            self.assertIn("Summary: streamed while running.", run.summary)
+            self.assertIn("Summary: streamed while running.", text)
+            self.assertIn("[loop success; exit=0]", text)
+
     def test_loop_lifecycle_helpers_update_target_history_and_delete(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)

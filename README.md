@@ -344,10 +344,13 @@ From the cockpit, press `l` to create a loop. If a mission is selected, loop
 results route back to that mission as `loop_output` events and `loop-output`
 artifacts; otherwise they report to the ticker/context only. Loops are visible
 as project-scoped `LOOP` rows, and `Shift+L` / `L` opens the loop manager for
-edit/pause/resume/delete/join controls plus recent run history. Selecting a
+edit/output/run/pause/target/delete controls plus recent run history. Selecting a
 `LOOP` row shows its prompt/config/history in the right-side card; `Enter`
-opens the manager on that loop, `e` opens its editor, and `r` runs it once
-immediately. The dashboard does not run long loop commands inline; first-run and
+opens the manager on that loop, `e` opens its editor, `o` opens/follows the
+latest captured output file, and `r` runs it once immediately. `t` targets the
+loop to the mission selected before opening the loop manager; if no candidate was
+selected and the loop already has a target, it focuses that target mission
+instead. The dashboard does not run long loop commands inline; first-run and
 run-now actions happen in a background task, while recurring runs should still
 come from the loop runner LaunchAgent, another launchd/cron entry, or
 `morpheus loops run-due`. Loop runs are captured command executions today, not

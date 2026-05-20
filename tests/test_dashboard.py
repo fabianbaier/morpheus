@@ -17,6 +17,7 @@ from morpheus.dashboard import (
     LoopActionRequest,
     LoopEditScreen,
     LoopManagerScreen,
+    LoopOutputScreen,
     LoopRequest,
     LoopScreen,
     MissionCardWidget,
@@ -2238,7 +2239,9 @@ class DashboardTest(unittest.IsolatedAsyncioTestCase):
                 self.assertIn("market scan", str(detail))
                 self.assertIn("recent runs (1 total", str(detail))
                 self.assertIn("WMT disciplined zone", str(detail))
+                self.assertIn("o output", str(actions))
                 self.assertIn("r run now", str(actions))
+                self.assertIn("t target", str(actions))
                 self.assertIn("d delete", str(actions))
 
     async def test_uppercase_loop_key_opens_manager(self) -> None:
@@ -2444,6 +2447,66 @@ class DashboardTest(unittest.IsolatedAsyncioTestCase):
             app._handle_loop_action_result(LoopActionRequest(action="run", loop_id=loop.id))
 
         self.assertEqual(captured["run"], (7, "manual"))
+
+    async def test_loop_manager_output_action_opens_output_screen(self) -> None:
+        app = DashboardHarness()
+        loop = dashboard.db.PromptLoop(
+            id=7,
+            name="market scan",
+            prompt="summarize catalysts",
+            interval_seconds=900,
+            command="codex exec",
+            next_run_at=0,
+        )
+
+        with isolated_dashboard_runtime(), patch.object(
+            dashboard.db, "get_loop", new=lambda loop_id: loop if loop_id == loop.id else None
+        ):
+            async with app.run_test(size=(120, 40)) as pilot:
+                app._handle_loop_action_result(LoopActionRequest(action="output", loop_id=loop.id))
+                await pilot.pause()
+
+                self.assertIsInstance(app.screen, LoopOutputScreen)
+
+    async def test_loop_target_key_focuses_existing_target_when_no_candidate(self) -> None:
+        app = DashboardHarness()
+        loop = dashboard.db.PromptLoop(
+            id=7,
+            name="market scan",
+            prompt="summarize catalysts",
+            interval_seconds=900,
+            command="codex exec",
+            target_mission_id="m_target",
+            next_run_at=0,
+        )
+        mission = dashboard.db.Mission(
+            tab_id="tab-target",
+            mission_id="m_target",
+            goal="target mission",
+            state="working",
+        )
+
+        with isolated_dashboard_runtime(), patch.object(
+            dashboard.db, "all_loops", new=lambda include_paused=True, tenant_id="": [loop]
+        ), patch.object(
+            dashboard.db, "all_missions", new=lambda tenant_id=None: [mission]
+        ), patch.object(
+            dashboard.db, "get_loop", new=lambda loop_id: loop if loop_id == loop.id else None
+        ), patch.object(
+            dashboard.db, "loop_runs", new=lambda loop_id, limit=5: []
+        ), patch.object(
+            dashboard.db, "loop_run_count", new=lambda loop_id: 0
+        ):
+            async with app.run_test(size=(120, 40)) as pilot:
+                app.action_manage_loops()
+                await pilot.pause()
+
+                await pilot.press("t")
+                await pilot.pause()
+
+                table = app.query_one(dashboard.MissionsTable)
+                self.assertEqual(table.selected_mission_id(), "m_target")
+                self.assertIn("focused loop target", app.alerts[0].text)
 
     async def test_background_loop_run_records_history_without_freezing_app(self) -> None:
         app = DashboardHarness()
