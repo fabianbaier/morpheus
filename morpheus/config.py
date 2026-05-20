@@ -85,6 +85,13 @@ DEFAULTS: dict[str, Any] = {
         "state_finished": "color(244)",
         "flash_duration_secs": 3.0,
     },
+    "intro": {
+        "enabled": True,
+        "mode": "default",            # default | short | cinematic
+        "duration_seconds": 7.5,      # clamped to 5-24 seconds
+        "geolocation": True,          # default-on; opt out with false or MORPHEUS_INTRO_GEO=0
+        "location": "",              # optional "lat,lon,label" override
+    },
 }
 
 
@@ -181,6 +188,19 @@ gh_repos = []
 #   query = "what's new with x402 protocol this week?"
 #   interval_minutes = 1440
 watchers = []
+
+[intro]
+# Cinematic Matrix boot animation before the dashboard.
+enabled = true
+# default | short | cinematic
+mode = "default"
+# Duration is clamped to 5-24 seconds. Env override: MORPHEUS_INTRO_SECONDS.
+duration_seconds = 7.5
+# Default-on IP geolocation for the Earth lock-on effect.
+# Opt out with geolocation = false or MORPHEUS_INTRO_GEO=0.
+geolocation = true
+# Optional manual override: "lat,lon,label". Env override: MORPHEUS_INTRO_LOCATION.
+location = ""
 """
     CONFIG_PATH.write_text(text)
 

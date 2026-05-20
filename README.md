@@ -92,6 +92,10 @@ morpheus
 
 The cockpit has four main areas:
 
+- **Startup intro** - A skippable Matrix boot sequence with terminal Earth,
+  rain, and sunglasses. IP geolocation is on by default for the Earth lock-on;
+  opt out with `MORPHEUS_INTRO_GEO=0`, `MORPHEUS_NO_INTRO=1`, or
+  `[intro] geolocation = false` in `~/.morpheus/config.toml`.
 - **Left: live Matrix stream** - A rain view made from recent terminal output
   across active sessions. The selected session and urgent sessions show up more
   brightly.
@@ -373,13 +377,14 @@ newest-first ready tickers, prompt loops foundation, nonblocking/Markdown PRD
 picker, edit mission flow, selected mission briefs, PRD parent cleanup, and an
 output-first mission card, plus a user PATH install target, resume-fresh, and
 MCP mission graph update tools, direct terminal broadcast, dense always-alive
-Matrix rain, a low-FPS rain render path, a zoom-safe compact cockpit layout,
-exact Codex closed-session provider resume, closed-row dismissal, and idle
-ticker reconciliation. Success-only focus and closed-row dismiss/prune actions
-stay out of the white-rabbit ticker, and `morpheus activity` exposes the cached
-live activity snapshot without reconnecting to iTerm. `morpheus graph recall-eval`
-scores stale mission recall readiness, and PRD parent rows remember collapsed
-tree state across dashboard restarts.
+Matrix rain, live status rain pulses, a low-FPS rain render path, a zoom-safe
+compact cockpit layout, exact Codex closed-session provider resume, closed-row
+dismissal, idle ticker reconciliation, and a skippable Matrix Earth startup
+intro. Success-only focus and closed-row dismiss/prune actions stay out of the
+white-rabbit ticker, and `morpheus activity` exposes the cached live activity
+snapshot without reconnecting to iTerm. `morpheus graph recall-eval` scores
+stale mission recall readiness, and PRD parent rows remember collapsed tree
+state across dashboard restarts.
 
 Next implementation phases:
 

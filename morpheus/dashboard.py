@@ -4208,6 +4208,9 @@ class MorpheusApp(App):
 # ── public entry ──────────────────────────────────────────────────────────
 
 def run(show_all: bool = False) -> None:
+    from morpheus import intro as intro_mod
+
+    intro_mod.maybe_play_intro()
     tenant_mod.backfill_known_tenants()
     project = None if show_all else tenant_mod.ensure_project_tenant(Path.cwd())
     MorpheusApp(project=project, show_all=show_all).run()
