@@ -1170,12 +1170,28 @@ class DashboardTest(unittest.IsolatedAsyncioTestCase):
         def fake_upsert_memory(updated):
             captured["memory"] = updated
 
-        def fake_update_mission_details(tab_id, *, goal, linked_pr, linked_worktree):
+        project = dashboard.db.ProjectTenant(
+            tenant_id="p_edit",
+            name="edit",
+            root_path="/tmp/new",
+        )
+
+        def fake_update_mission_details(
+            tab_id,
+            *,
+            goal,
+            linked_pr,
+            linked_worktree,
+            tenant_id="",
+            project_root="",
+        ):
             captured["live"] = {
                 "tab_id": tab_id,
                 "goal": goal,
                 "linked_pr": linked_pr,
                 "linked_worktree": linked_worktree,
+                "tenant_id": tenant_id,
+                "project_root": project_root,
             }
             return True
 
@@ -1201,6 +1217,8 @@ class DashboardTest(unittest.IsolatedAsyncioTestCase):
             dashboard.db, "update_mission_details", new=fake_update_mission_details
         ), patch.object(
             dashboard.db, "add_event", new=fake_add_event
+        ), patch.object(
+            dashboard.tenant_mod, "ensure_project_tenant", new=lambda path=None: project
         ):
             async with app.run_test(size=(120, 40)) as pilot:
                 app._refresh_table()
@@ -1233,6 +1251,8 @@ class DashboardTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(captured["memory"].next_step, "write tests")
         self.assertEqual(captured["memory"].claimed_paths, '["src/a.py", "tests/test_a.py"]')
         self.assertEqual(captured["memory"].topic, "mission-edit")
+        self.assertEqual(captured["memory"].tenant_id, "p_edit")
+        self.assertEqual(captured["memory"].project_root, "/tmp/new")
         self.assertEqual(
             captured["live"],
             {
@@ -1240,6 +1260,8 @@ class DashboardTest(unittest.IsolatedAsyncioTestCase):
                 "goal": "new goal",
                 "linked_pr": 225,
                 "linked_worktree": "/tmp/new",
+                "tenant_id": "p_edit",
+                "project_root": "/tmp/new",
             },
         )
         self.assertEqual(captured["event"]["kind"], "mission_edit")
@@ -1476,6 +1498,11 @@ class DashboardTest(unittest.IsolatedAsyncioTestCase):
         app = DashboardHarness()
         done = asyncio.Event()
         captured = {}
+        project = dashboard.db.ProjectTenant(
+            tenant_id="p_test",
+            name="test",
+            root_path="/tmp/test-project",
+        )
 
         async def fake_spawn_tab(connection, *, command, goal):
             captured["spawn"] = (connection, command, goal)
@@ -1487,7 +1514,9 @@ class DashboardTest(unittest.IsolatedAsyncioTestCase):
 
         with isolated_dashboard_runtime(), patch.object(
             dashboard.iterm_client, "spawn_tab", new=fake_spawn_tab
-        ), patch.object(dashboard.db, "upsert", new=fake_upsert):
+        ), patch.object(dashboard.db, "upsert", new=fake_upsert), patch.object(
+            dashboard.tenant_mod, "ensure_project_tenant", new=lambda path=None: project
+        ):
             async with app.run_test(size=(120, 40)) as pilot:
                 await pilot.press("n")
                 await pilot.pause()
@@ -1502,17 +1531,24 @@ class DashboardTest(unittest.IsolatedAsyncioTestCase):
 
         connection, command, goal = captured["spawn"]
         self.assertIs(connection, app.iterm_conn)
-        self.assertEqual(command, "codex")
+        self.assertEqual(command, "cd /tmp/test-project && codex")
         self.assertEqual(goal, "review a PR")
         self.assertEqual(captured["mission"].tab_id, "tab-123456")
         self.assertEqual(captured["mission"].session_id, "session-123456")
         self.assertEqual(captured["mission"].goal, "review a PR")
-        self.assertEqual(captured["mission"].cmd, "codex")
+        self.assertEqual(captured["mission"].cmd, "cd /tmp/test-project && codex")
+        self.assertEqual(captured["mission"].tenant_id, "p_test")
+        self.assertEqual(captured["mission"].project_root, "/tmp/test-project")
 
     async def test_new_session_result_refreshes_visible_missions_immediately(self) -> None:
         app = DashboardHarness()
         app.iterm_conn = object()
         missions = []
+        project = dashboard.db.ProjectTenant(
+            tenant_id="p_test",
+            name="test",
+            root_path="/tmp/test-project",
+        )
 
         async def fake_spawn_tab(connection, *, command, goal):
             return SimpleNamespace(tab_id="tab-123456", session_id="session-123456")
@@ -1524,6 +1560,7 @@ class DashboardTest(unittest.IsolatedAsyncioTestCase):
             patch.object(dashboard.iterm_client, "spawn_tab", new=fake_spawn_tab),
             patch.object(dashboard.db, "upsert", new=fake_upsert),
             patch.object(dashboard.db, "all_missions", new=lambda: list(missions)),
+            patch.object(dashboard.tenant_mod, "ensure_project_tenant", new=lambda path=None: project),
             patch.object(app, "_refresh_table") as refresh_table,
         ):
             await app._handle_new_session_result(NewSessionRequest(
@@ -1541,10 +1578,15 @@ class DashboardTest(unittest.IsolatedAsyncioTestCase):
         app.iterm_conn = object()
         done = asyncio.Event()
         captured = {}
+        project = dashboard.db.ProjectTenant(
+            tenant_id="p_prd",
+            name="prd",
+            root_path="/tmp",
+        )
         run = SimpleNamespace(
             parent_id="m_parent",
             title="PRD Runs",
-            prd_path="/tmp/PRD.md",
+            prd_path=Path("/tmp/PRD.md"),
             status_path="/tmp/status.md",
             prompt_path="/tmp/prompt.md",
         )
@@ -1569,6 +1611,8 @@ class DashboardTest(unittest.IsolatedAsyncioTestCase):
             dashboard.prd_runs, "attach_coordinator", new=fake_attach
         ), patch.object(
             dashboard.iterm_client, "spawn_tab", new=fake_spawn_tab
+        ), patch.object(
+            dashboard.tenant_mod, "ensure_project_tenant", new=lambda path=None: project
         ), patch.object(dashboard.db, "upsert", new=fake_upsert):
             await app._handle_new_session_result(
                 NewSessionRequest(goal="", command="codex", prd_path="/tmp/PRD.md")
@@ -1577,20 +1621,27 @@ class DashboardTest(unittest.IsolatedAsyncioTestCase):
 
         connection, command, goal = captured["spawn"]
         self.assertIs(connection, app.iterm_conn)
-        self.assertEqual(command, "codex --coordinator")
+        self.assertEqual(command, "cd /tmp && codex --coordinator")
         self.assertEqual(goal, "PRD Runs coordinator")
         self.assertEqual(captured["mission"].goal, "PRD Runs coordinator")
-        self.assertEqual(captured["mission"].cmd, "codex --coordinator")
+        self.assertEqual(captured["mission"].cmd, "cd /tmp && codex --coordinator")
+        self.assertEqual(captured["mission"].tenant_id, "p_prd")
+        self.assertEqual(captured["mission"].project_root, "/tmp")
         self.assertEqual(captured["attach"], (run, captured["mission"]))
 
     async def test_worker_result_spawns_child_under_prd_parent(self) -> None:
         app = DashboardHarness()
         app.iterm_conn = object()
         captured = {}
+        project = dashboard.db.ProjectTenant(
+            tenant_id="p_worker",
+            name="worker",
+            root_path="/tmp",
+        )
         run = SimpleNamespace(
             parent_id="m_parent",
             title="PRD Runs",
-            prd_path=SimpleNamespace(parent="/tmp"),
+            prd_path=Path("/tmp/PRD.md"),
             status_path="/tmp/status.md",
             prompt_path="/tmp/prompt.md",
         )
@@ -1615,6 +1666,8 @@ class DashboardTest(unittest.IsolatedAsyncioTestCase):
         ), patch.object(
             dashboard.iterm_client, "spawn_tab", new=fake_spawn_tab
         ), patch.object(
+            dashboard.tenant_mod, "ensure_project_tenant", new=lambda path=None: project
+        ), patch.object(
             dashboard.db, "upsert", new=fake_upsert
         ), patch.object(
             dashboard.ledger_mod, "log_action", new=lambda *args, **kwargs: 1
@@ -1633,9 +1686,11 @@ class DashboardTest(unittest.IsolatedAsyncioTestCase):
 
         connection, command, goal = captured["spawn"]
         self.assertIs(connection, app.iterm_conn)
-        self.assertEqual(command, "codex --worker")
+        self.assertEqual(command, "cd /tmp && codex --worker")
         self.assertEqual(goal, "implement worker tree")
         self.assertEqual(captured["mission"].mission_id, "m_worker")
+        self.assertEqual(captured["mission"].tenant_id, "p_worker")
+        self.assertEqual(captured["mission"].project_root, "/tmp")
         self.assertEqual(captured["attach"][0], run)
         self.assertEqual(captured["attach"][2], "morpheus/dashboard.py")
         self.assertEqual(captured["attach"][3], "pytest tests/test_dashboard.py")
