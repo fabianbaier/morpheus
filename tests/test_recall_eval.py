@@ -208,6 +208,8 @@ class RecallEvalLogicTest(unittest.TestCase):
             "10 passed, 0 errors",
             "tests passed with no failures",
             "tests passed with no failures or errors",
+            "Tests: 0 failed, 12 passed",
+            "no tests failed",
             "error handling tests passed",
             "error-handling tests passed",
         ):

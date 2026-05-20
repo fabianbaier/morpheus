@@ -30,7 +30,9 @@ FAIL_RE = re.compile(
     r"|\bunverified\b"
 )
 NO_FAILURE_RE = re.compile(
-    r"\b(?:0|zero|no)\s+(?:failures?|errors?)(?:\s+(?:or|and)\s+(?:failures?|errors?))*\b"
+    r"\b(?:0|zero|no)\s+(?:tests?\s+)?"
+    r"(?:failed|failing|failures?|errored|errors?)"
+    r"(?:\s+(?:or|and)\s+(?:failed|failing|failures?|errored|errors?))*\b"
 )
 POSITIVE_FAILURE_COUNT_RE = re.compile(r"\b(?:[1-9]\d*|some|multiple)\s+(?:failures?|errors?)\b")
 FAILURE_WORD_RE = re.compile(r"\bfailures?\b")
@@ -354,13 +356,13 @@ def _event_passed(event: db.MissionEvent) -> bool:
     summary = _clean(event.summary).lower()
     if _summary_failed(summary):
         return False
-    return bool(PASS_RE.search(summary))
+    return bool(PASS_RE.search(summary) or NO_FAILURE_RE.search(summary))
 
 
 def _summary_failed(summary: str) -> bool:
-    if FAIL_RE.search(summary):
-        return True
     without_zero_counts = NO_FAILURE_RE.sub("", summary)
+    if FAIL_RE.search(without_zero_counts):
+        return True
     if POSITIVE_FAILURE_COUNT_RE.search(without_zero_counts):
         return True
     if FAILURE_WORD_RE.search(without_zero_counts):
