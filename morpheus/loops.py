@@ -144,6 +144,11 @@ def run_loop(
     cwd: Optional[Path] = None,
 ) -> db.PromptLoopRun:
     started = time.time()
+    db.mark_loop_running(
+        loop.id,
+        started_at=started,
+        next_run_at=started + loop.interval_seconds,
+    )
     command = build_command(loop.command, loop.prompt)
     output_path = _output_path(loop.id, started)
     output_path.parent.mkdir(parents=True, exist_ok=True)

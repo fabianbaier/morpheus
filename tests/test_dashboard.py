@@ -2163,6 +2163,8 @@ class DashboardTest(unittest.IsolatedAsyncioTestCase):
             dashboard.ctx_mod, "write_context_json", new=lambda: None
         ), patch.object(
             app, "_refresh_table", new=lambda: None
+        ), patch.object(
+            app, "_start_loop_run", new=lambda loop_id, reason="manual": captured.setdefault("run", (loop_id, reason))
         ):
             async with app.run_test(size=(120, 40)) as pilot:
                 await pilot.press("l")
@@ -2187,6 +2189,7 @@ class DashboardTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(captured["loop"]["project_root"], "/tmp/test-project")
         self.assertEqual(captured["loop"]["target_mission_id"], "")
         self.assertIsNone(captured["loop"]["target_tab_id"])
+        self.assertEqual(captured["run"], (7, "created"))
 
     async def test_manage_loops_action_opens_manager_with_history(self) -> None:
         app = DashboardHarness()
@@ -2413,6 +2416,74 @@ class DashboardTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(captured["update"][1]["command"], "codex exec --search")
         self.assertEqual(captured["ledger"][0][0], "loop_edit")
         self.assertIn("updated loop", app.alerts[0].text)
+
+    async def test_loop_manager_run_now_action_starts_background_run(self) -> None:
+        app = DashboardHarness()
+        captured = {}
+        loop = dashboard.db.PromptLoop(
+            id=7,
+            name="market scan",
+            prompt="summarize catalysts",
+            interval_seconds=900,
+            command="codex exec",
+            next_run_at=0,
+        )
+
+        with patch.object(
+            dashboard.db, "get_loop", new=lambda loop_id: loop if loop_id == loop.id else None
+        ), patch.object(
+            app, "_start_loop_run", new=lambda loop_id, reason="manual": captured.setdefault("run", (loop_id, reason))
+        ):
+            app._handle_loop_action_result(LoopActionRequest(action="run", loop_id=loop.id))
+
+        self.assertEqual(captured["run"], (7, "manual"))
+
+    async def test_background_loop_run_records_history_without_freezing_app(self) -> None:
+        app = DashboardHarness()
+        done = asyncio.Event()
+        loop = dashboard.db.PromptLoop(
+            id=7,
+            name="market scan",
+            prompt="summarize catalysts",
+            interval_seconds=900,
+            command="codex exec",
+            project_root="/tmp",
+            next_run_at=0,
+        )
+        run = dashboard.db.PromptLoopRun(
+            id=3,
+            loop_id=loop.id,
+            started_at=1,
+            finished_at=2,
+            status="success",
+            exit_code=0,
+            output_path="/tmp/loop.txt",
+            summary="WMT disciplined zone",
+        )
+        event_loop = asyncio.get_running_loop()
+
+        def fake_run_loop(loop_arg, *, timeout, cwd=None):
+            self.assertEqual(loop_arg.id, loop.id)
+            self.assertEqual(cwd, Path("/tmp"))
+            event_loop.call_soon_threadsafe(done.set)
+            return run
+
+        with isolated_dashboard_runtime(), patch.object(
+            dashboard.db, "get_loop", new=lambda loop_id: loop if loop_id == loop.id else None
+        ), patch.object(
+            dashboard.loops_mod, "run_loop", new=fake_run_loop
+        ), patch.object(
+            app, "_refresh_table", new=lambda: None
+        ), patch.object(
+            app, "_refresh_mission_card", new=lambda missions=None: None
+        ):
+            async with app.run_test(size=(120, 40)) as pilot:
+                app._start_loop_run(loop.id, reason="manual")
+                await asyncio.wait_for(done.wait(), timeout=1)
+                await pilot.pause()
+
+        self.assertNotIn(loop.id, app.running_loop_ids)
+        self.assertIn("WMT disciplined zone", app.alerts[0].text)
 
     async def test_refresh_table_renders_project_loop_rows(self) -> None:
         app = DashboardHarness()

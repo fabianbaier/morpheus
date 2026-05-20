@@ -1238,7 +1238,7 @@ class MissionCardWidget(Static):
                     text.append(f"  output {run.output_path}\n", style=COL_DIMMER)
         else:
             text.append("none yet\n", style=COL_DIMMER)
-            text.append("run `morpheus loops run-due` from launchd/cron/manual to create run history\n", style=COL_DIMMER)
+            text.append("press Shift+L then r to run now; launchd/cron handles recurring runs\n", style=COL_DIMMER)
 
         if not self.details_expanded:
             return text
@@ -2398,6 +2398,7 @@ class LoopManagerScreen(ModalScreen[Optional[LoopActionRequest]]):
         Binding("up", "cursor_up", "prev", show=False),
         Binding("enter", "edit_selected", "edit"),
         Binding("e", "edit_selected", "edit"),
+        Binding("r", "run_selected", "run now"),
         Binding("p", "toggle_selected", "pause/resume"),
         Binding("t", "join_selected", "join"),
         Binding("d", "delete_selected", "delete"),
@@ -2437,6 +2438,7 @@ class LoopManagerScreen(ModalScreen[Optional[LoopActionRequest]]):
             yield Static("", id="loop_detail")
             with Horizontal():
                 yield Button("edit", variant="primary", id="loop_edit")
+                yield Button("run now", variant="primary", id="loop_run")
                 yield Button("join target", variant="primary", id="loop_join")
                 yield Button("pause/resume", id="loop_toggle")
                 yield Button("delete", variant="error", id="loop_delete")
@@ -2472,6 +2474,8 @@ class LoopManagerScreen(ModalScreen[Optional[LoopActionRequest]]):
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "loop_edit":
             self.action_edit_selected()
+        elif event.button.id == "loop_run":
+            self.action_run_selected()
         elif event.button.id == "loop_join":
             self.action_join_selected()
         elif event.button.id == "loop_toggle":
@@ -2505,6 +2509,12 @@ class LoopManagerScreen(ModalScreen[Optional[LoopActionRequest]]):
         if loop is None:
             return
         self.dismiss(LoopActionRequest(action="edit", loop_id=loop.id))
+
+    def action_run_selected(self) -> None:
+        loop = self._selected_loop()
+        if loop is None:
+            return
+        self.dismiss(LoopActionRequest(action="run", loop_id=loop.id))
 
     def action_join_selected(self) -> None:
         loop = self._selected_loop()
@@ -2560,7 +2570,7 @@ class LoopManagerScreen(ModalScreen[Optional[LoopActionRequest]]):
             f"status {loop.status} · every {loops_mod.format_interval(loop.interval_seconds)} · next {loops_mod.format_due(loop.next_run_at)}",
             f"target {_loop_target_label(loop)} · command {loop.command}",
             f"prompt {loop.prompt}",
-            "keys Enter/e edit · p pause/resume · t join selected mission · d delete",
+            "keys Enter/e edit · r run now · p pause/resume · t join selected mission · d delete",
         ]
         runs = self.runs_by_loop.get(loop.id, [])
         if runs:
@@ -2573,7 +2583,7 @@ class LoopManagerScreen(ModalScreen[Optional[LoopActionRequest]]):
                 )
         else:
             lines.append("recent runs: none yet")
-            lines.append("execution is external: run `morpheus loops run-due` manually or from launchd/cron")
+            lines.append("press r to run now; recurring runs still come from launchd/cron or `morpheus loops run-due`")
         if confirm_delete:
             lines.append("")
             lines.append("Press delete again to remove this loop. Output files remain on disk.")
@@ -2855,6 +2865,7 @@ class MorpheusApp(App):
         self.self_session_id: Optional[str] = None
         self.current_missions: list[db.Mission] = []
         self.prd_collapsed_ids: set[str] = set()
+        self.running_loop_ids: set[int] = set()
         self._rain_backoff_until = 0.0
         self.log_handle = None
 
@@ -3828,9 +3839,10 @@ class MorpheusApp(App):
         self._push_alert(Alert(
             time.time(),
             "spawn",
-            f"loop [{loop.name}] every {loops_mod.format_interval(loop.interval_seconds)}{target} · Shift+L manages loops",
+            f"loop [{loop.name}] every {loops_mod.format_interval(loop.interval_seconds)}{target} · first run starting now",
         ))
         self._refresh_table()
+        self._start_loop_run(loop.id, reason="created")
 
     def _handle_loop_action_result(self, result: Optional[LoopActionRequest]) -> None:
         if result is None:
@@ -3841,6 +3853,9 @@ class MorpheusApp(App):
             return
         if result.action == "edit":
             self._open_loop_editor(loop.id)
+            return
+        if result.action == "run":
+            self._start_loop_run(loop.id, reason="manual")
             return
 
         try:
@@ -3922,6 +3937,55 @@ class MorpheusApp(App):
             self._push_alert(Alert(time.time(), "error", f"loop #{loop_id} not found"))
             return
         self.push_screen(LoopEditScreen(loop), self._handle_loop_edit_result)
+
+    def _start_loop_run(self, loop_id: int, *, reason: str = "manual") -> None:
+        loop = db.get_loop(loop_id)
+        if loop is None:
+            self._push_alert(Alert(time.time(), "error", f"loop #{loop_id} not found"))
+            return
+        if loop.status != "active":
+            self._push_alert(Alert(time.time(), "error", f"loop [{loop.name}] is {loop.status}"))
+            return
+        if loop_id in self.running_loop_ids:
+            self._push_alert(Alert(time.time(), "summary", f"loop [{loop.name}] already running"))
+            return
+        self.running_loop_ids.add(loop_id)
+        prefix = "first run" if reason == "created" else "run"
+        self._push_alert(Alert(time.time(), "spawn", f"{prefix} started for loop [{loop.name}]"))
+        self._refresh_table()
+        asyncio.create_task(self._run_loop_once(loop_id))
+
+    async def _run_loop_once(self, loop_id: int) -> None:
+        loop = db.get_loop(loop_id)
+        if loop is None:
+            self.running_loop_ids.discard(loop_id)
+            self._push_alert(Alert(time.time(), "error", f"loop #{loop_id} not found"))
+            return
+        cwd: Optional[Path] = None
+        if loop.project_root:
+            candidate = Path(loop.project_root).expanduser()
+            if candidate.exists():
+                cwd = candidate
+        try:
+            run = await asyncio.to_thread(
+                loops_mod.run_loop,
+                loop,
+                timeout=loops_mod.DEFAULT_TIMEOUT_SECONDS,
+                cwd=cwd,
+            )
+        except Exception as e:
+            self._push_alert(Alert(time.time(), "error", f"loop [{loop.name}] run failed: {e}"))
+        else:
+            kind = "summary" if run.status == "success" else "error"
+            self._push_alert(Alert(
+                time.time(),
+                kind,
+                f"loop [{loop.name}] {run.status}: {run.summary}",
+            ))
+        finally:
+            self.running_loop_ids.discard(loop_id)
+            self._refresh_table()
+            self._refresh_mission_card(self._all_missions())
 
     def _handle_loop_edit_result(self, result: Optional[LoopActionRequest]) -> None:
         if result is None:

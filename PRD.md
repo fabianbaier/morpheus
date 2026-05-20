@@ -513,6 +513,9 @@ Required behavior:
 
 - `l` opens a cockpit loop form. The selected mission becomes the default target
   when one exists; otherwise the loop reports to ticker/context only.
+- New loops are due immediately and the cockpit starts the first run in a
+  background task after creation. The UI must remain responsive while the
+  command runs.
 - Each loop stores: name, prompt, interval, command, owning project tenant/root,
   target mission/tab, active/paused state, next run time, last run status, and
   last summary.
@@ -533,7 +536,7 @@ Required behavior:
   the rabbit ticker newest-first.
 - The dashboard must not synchronously execute due loops. Long-running Codex or
   Claude calls belong in `morpheus loops run-due` invoked by launchd/cron or run
-  manually.
+  manually, or in the cockpit's nonblocking one-shot runner.
 - Minimum interval is 60 seconds to avoid accidental runaway spend.
 
 Implemented cockpit controls:
@@ -542,6 +545,7 @@ Implemented cockpit controls:
   run history plus edit/pause/resume/delete/join controls. If a `LOOP` row is
   already selected, the manager opens on that loop. Editing can change name,
   prompt, interval, and command without leaving the cockpit.
+- Pressing `r` in the loop manager runs the selected loop once immediately.
 
 Future work:
 
@@ -894,6 +898,7 @@ This table is the source of truth for where the product stands right now.
 | Prompt loop cockpit visibility | Implemented in v0.8.0a27 | Loops now store owning project tenant/root, render as `LOOP` rows in the mission table, and `Shift+L`/`L` opens the current project's loop manager so active/due/last-run state is visible without running loop commands inside the dashboard |
 | Prompt loop cockpit editing/history | Implemented in v0.8.0a28 | The loop manager shows run counts and recent run history, explains when no runner has executed yet, edits name/prompt/interval/command in-cockpit, and backfills legacy targeted loops into their project tenant |
 | Loop row inspect/edit UX | Implemented in v0.8.0a29 | Selecting a `LOOP` row renders a loop card with prompt/config/history; `Enter` opens the loop manager preselected to that loop, and `e` edits the loop instead of falling into mission-edit errors |
+| Immediate loop first run | Implemented in v0.8.0a30 | New loops are due at creation and the cockpit starts the first run in a background task; the loop manager also exposes `r`/run-now for existing loops while recurring execution remains cron/launchd-friendly |
 | PRD Runs foundation | Implemented in v0.8.0a1 | PRD finder, new-session PRD selector, parent mission creation, coordinator prompt/status files, `morpheus run start`, and coordinator graph edge shipped |
 | PRD run tree UI | Partially implemented in v0.8.0a5 | Shows virtual PRD parent rows with coordinator/worker sessions rendered underneath them; collapse/expand remains future polish |
 | PRD child worker spawn | Implemented in v0.8.0a5 | `w` spawns a manual child worker under the selected PRD parent/coordinator/worker with scope and verification prompts |

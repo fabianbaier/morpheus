@@ -1857,7 +1857,7 @@ def create_loop(
     next_run_at: Optional[float] = None,
 ) -> PromptLoop:
     now = time.time()
-    next_at = next_run_at if next_run_at is not None else now + interval_seconds
+    next_at = next_run_at if next_run_at is not None else now
     with _connect() as conn:
         cur = conn.execute(
             """
@@ -1966,6 +1966,30 @@ def update_loop_after_run(
              WHERE id = ?
             """,
             (last_run_at, next_run_at, last_run_status, last_summary, now, loop_id),
+        )
+        row = conn.execute("SELECT * FROM prompt_loops WHERE id = ?", (loop_id,)).fetchone()
+    return _row_to_prompt_loop(row) if row else None
+
+
+def mark_loop_running(
+    loop_id: int,
+    *,
+    started_at: float,
+    next_run_at: float,
+) -> Optional[PromptLoop]:
+    now = time.time()
+    with _connect() as conn:
+        conn.execute(
+            """
+            UPDATE prompt_loops
+               SET last_run_at = ?,
+                   next_run_at = ?,
+                   last_run_status = 'running',
+                   last_summary = 'run started',
+                   updated_at = ?
+             WHERE id = ?
+            """,
+            (started_at, next_run_at, now, loop_id),
         )
         row = conn.execute("SELECT * FROM prompt_loops WHERE id = ?", (loop_id,)).fetchone()
     return _row_to_prompt_loop(row) if row else None

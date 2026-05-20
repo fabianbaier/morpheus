@@ -21,6 +21,22 @@ class LoopsTest(unittest.TestCase):
 
         self.assertEqual(command, "codex exec 'what'\"'\"'s new & why?'")
 
+    def test_create_loop_defaults_first_run_due_immediately(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            with patch.object(db, "DB_DIR", tmp_path), patch.object(
+                db, "DB_PATH", tmp_path / "morpheus.db"
+            ):
+                loop = db.create_loop(
+                    name="news",
+                    prompt="summarize news",
+                    interval_seconds=300,
+                    command="printf ok",
+                )
+
+                self.assertLessEqual(loop.next_run_at, loop.created_at + 1)
+                self.assertEqual(db.due_loops(limit=5), [loop])
+
     def test_run_loop_publishes_note_event_and_artifact(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)

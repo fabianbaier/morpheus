@@ -136,7 +136,8 @@ catalysts." Loop results show up in the ticker, and targeted loops also attach
 events/artifacts to the selected mission. Project loops appear as `LOOP` rows
 in the cockpit; use `Shift+L` or `L` to inspect recent runs and edit/manage
 them. You can also select a `LOOP` row and press `Enter` to inspect it, or `e`
-to edit its prompt/config directly.
+to edit its prompt/config directly. New loops start their first run immediately
+in the background, and `r` in the loop manager runs an existing loop now.
 
 ### Key Shortcuts
 
@@ -339,9 +340,11 @@ artifacts; otherwise they report to the ticker/context only. Loops are visible
 as project-scoped `LOOP` rows, and `Shift+L` / `L` opens the loop manager for
 edit/pause/resume/delete/join controls plus recent run history. Selecting a
 `LOOP` row shows its prompt/config/history in the right-side card; `Enter`
-opens the manager on that loop and `e` opens its editor. The dashboard does not
-run long loop commands inline; use launchd/cron or `morpheus loops run-due`.
-Loop runs are captured command executions today, not reusable live tab sessions.
+opens the manager on that loop, `e` opens its editor, and `r` runs it once
+immediately. The dashboard does not run long loop commands inline; first-run and
+run-now actions happen in a background task, while recurring runs should still
+come from launchd/cron or `morpheus loops run-due`. Loop runs are captured
+command executions today, not reusable live tab sessions.
 
 ## State Files
 
