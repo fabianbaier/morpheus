@@ -301,12 +301,12 @@ make daemon
 
 ## Roadmap
 
-Current status: v0.8.0a17 has PRD Runs foundation, PRD tree/manual workers,
+Current status: v0.8.0a18 has PRD Runs foundation, PRD tree/manual workers,
 newest-first ready tickers, prompt loops foundation, nonblocking/Markdown PRD
 picker, edit mission flow, selected mission briefs, PRD parent cleanup, and an
 output-first mission card, plus a user PATH install target, resume-fresh, and
 MCP mission graph update tools, direct terminal broadcast, dense always-alive
-Matrix rain, and an adaptive low-load rain animation path.
+Matrix rain, and a low-FPS rain render path that avoids table-refresh repaints.
 
 Next implementation phases:
 
@@ -336,6 +336,7 @@ Next implementation phases:
 23. Dense Matrix rain baseline. Done in `0.8.0a15`.
 24. Rain performance path. Done in `0.8.0a16`.
 25. Adaptive low-load rain cadence and shard caching. Done in `0.8.0a17`.
-26. 48-hour recall eval.
+26. Low-FPS rain repaint guard. Done in `0.8.0a18`.
+27. 48-hour recall eval.
 
 > "I can only show you the door. You're the one that has to walk through it."

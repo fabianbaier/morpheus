@@ -344,6 +344,42 @@ class DashboardTest(unittest.IsolatedAsyncioTestCase):
         sync_shards.assert_not_called()
         render_live.assert_not_called()
 
+    def test_refresh_live_stream_can_update_without_rendering_rain(self) -> None:
+        app = DashboardHarness()
+        stream = dashboard.LiveStreamWidget()
+
+        with (
+            patch.object(app, "query_one", return_value=stream),
+            patch.object(app, "_selected_tab_id", return_value="tab-123456"),
+            patch.object(stream, "update_buffers") as update_buffers,
+        ):
+            app._refresh_live_stream(render=False)
+
+        update_buffers.assert_called_once_with(
+            app.live_buffers,
+            "tab-123456",
+            render=False,
+            sync=True,
+        )
+
+    def test_refresh_table_does_not_repaint_rain(self) -> None:
+        app = DashboardHarness()
+        fake_table = SimpleNamespace(refresh_rows=lambda *args: None)
+
+        with (
+            patch.object(dashboard.db, "all_missions", return_value=[]),
+            patch.object(app, "_prd_tree_context", return_value=([], [])),
+            patch.object(app, "query_one", return_value=fake_table),
+            patch.object(app, "_refresh_mission_card"),
+            patch.object(app, "_refresh_live_stream") as refresh_live_stream,
+        ):
+            app._refresh_table()
+
+        refresh_live_stream.assert_called_once_with(render=False, sync=False)
+
+    def test_rain_cadence_is_low_fps_by_default(self) -> None:
+        self.assertGreaterEqual(dashboard.RAIN_INTERVAL_SECONDS, 2.0)
+
     def test_sync_shards_only_when_buffer_signature_changes(self) -> None:
         stream = dashboard.LiveStreamWidget()
         stream.buffers = {

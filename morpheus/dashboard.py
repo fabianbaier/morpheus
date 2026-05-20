@@ -60,8 +60,9 @@ COL_MUTED   = "color(244)"
 COL_DIMMER  = "bright_black"
 COL_BODY    = "color(252)"
 COL_ACCENT  = "bright_cyan"
-RAIN_INTERVAL_SECONDS = 0.5
+RAIN_INTERVAL_SECONDS = 2.0
 RAIN_SLOW_FRAME_SECONDS = 0.14
+TABLE_REFRESH_SECONDS = 1.0
 TERMINAL_TAIL_SCAN_CHARS = 20_000
 
 STATE_TEXT_STYLE = {
@@ -2103,10 +2104,11 @@ class MorpheusApp(App):
 
         # Heavy tick: enumerate iTerm tabs, detect state, write DB + titles + context.
         self.set_interval(2.0, self._do_tick)
-        # Light tick: animate rain.
+        # Light tick: animate rain. The render path is intentionally low-FPS:
+        # full Rich/Textual rain repaints are the expensive part of the cockpit.
         self.set_interval(RAIN_INTERVAL_SECONDS, self._do_rain_animate)
         # Table re-render (catches flash-expiry without waiting for next heavy tick).
-        self.set_interval(0.5, self._refresh_table)
+        self.set_interval(TABLE_REFRESH_SECONDS, self._refresh_table)
 
     async def _claim_self_tab(self) -> None:
         app = await iterm2.async_get_app(self.iterm_conn)
@@ -2197,7 +2199,7 @@ class MorpheusApp(App):
             table = self.query_one(MissionsTable)
             table.refresh_rows(missions, self.flashing, prd_parents, prd_edges)
             self._refresh_mission_card(missions)
-            self._refresh_live_stream()
+            self._refresh_live_stream(render=False, sync=False)
         except Exception:
             pass
 
@@ -2217,12 +2219,17 @@ class MorpheusApp(App):
         except Exception:
             return None
 
-    def _refresh_live_stream(self) -> None:
+    def _refresh_live_stream(self, *, render: bool = True, sync: bool = True) -> None:
         try:
             stream = self.query_one(RainWidget)
         except Exception:
             return
-        stream.update_buffers(self.live_buffers, self._selected_tab_id())
+        stream.update_buffers(
+            self.live_buffers,
+            self._selected_tab_id(),
+            render=render,
+            sync=sync,
+        )
 
     def _refresh_mission_card(self, missions: Optional[list[db.Mission]] = None) -> None:
         try:
