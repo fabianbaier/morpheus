@@ -608,6 +608,90 @@ class DashboardTest(unittest.IsolatedAsyncioTestCase):
 
                 self.assertIsInstance(app.screen, dashboard.ProjectSwitchScreen)
 
+    async def test_project_switcher_shows_action_legend(self) -> None:
+        project = dashboard.db.ProjectTenant(
+            tenant_id="p_current",
+            name="current",
+            root_path="/tmp/current",
+        )
+        app = DashboardHarness(project=project)
+
+        with (
+            isolated_dashboard_runtime(),
+            patch.object(dashboard.tenant_mod, "backfill_known_tenants", new=lambda: 0),
+            patch.object(dashboard.db, "all_project_tenants", new=lambda include_archived=False: [project]),
+            patch.object(dashboard.db, "all_missions", new=lambda tenant_id=None: []),
+        ):
+            async with app.run_test(size=(120, 40)) as pilot:
+                await pilot.press("t")
+                await pilot.pause()
+
+                legend = app.screen.query_one("#project_legend", dashboard.Static).content
+
+        self.assertIn("p prune empty", str(legend))
+        self.assertIn("d delete stored graph", str(legend))
+        self.assertIn("n nuke active", str(legend))
+
+    async def test_project_nuke_closes_live_tabs_and_purges_project(self) -> None:
+        project = dashboard.db.ProjectTenant(
+            tenant_id="p_active",
+            name="active",
+            root_path="/tmp/active",
+        )
+        mission_a = dashboard.db.Mission(tab_id="tab-a", tenant_id=project.tenant_id)
+        mission_b = dashboard.db.Mission(tab_id="tab-b", tenant_id=project.tenant_id)
+        app = DashboardHarness(project=project)
+        app.iterm_conn = object()
+        app.live_buffers = {
+            "tab-a": dashboard.LiveBuffer("tab-a", "a", "working", "", "", 0),
+            "tab-b": dashboard.LiveBuffer("tab-b", "b", "working", "", "", 0),
+        }
+        closed: list[str] = []
+        captured = {}
+        cleanup = dashboard.db.ProjectCleanupResult(
+            tenant_id=project.tenant_id,
+            name=project.name,
+            root_path=project.root_path,
+            deleted={"project_tenants": 1, "missions": 2, "mission_memory": 2},
+        )
+
+        async def fake_close_tab(connection, tab_id):
+            closed.append(tab_id)
+            return True
+
+        def fake_all_missions(tenant_id=None):
+            if tenant_id == project.tenant_id:
+                return [mission_a, mission_b]
+            return []
+
+        def fake_delete_project_tenant(tenant_id, allow_live=False):
+            captured["delete"] = (tenant_id, allow_live)
+            return cleanup
+
+        def fake_log_action(action, tab_id=None, details=None):
+            captured["ledger"] = (action, tab_id, details)
+            return 1
+
+        with (
+            patch.object(dashboard.db, "get_project_tenant", new=lambda tenant_id: project),
+            patch.object(dashboard.db, "all_missions", new=fake_all_missions),
+            patch.object(dashboard.iterm_client, "close_tab", new=fake_close_tab),
+            patch.object(dashboard.db, "delete_project_tenant", new=fake_delete_project_tenant),
+            patch.object(dashboard.ledger_mod, "log_action", new=fake_log_action),
+            patch.object(app, "_refresh_table", new=lambda: None),
+        ):
+            await app._handle_project_nuke_result(dashboard.ProjectSwitchRequest("p_active", action="nuke"))
+
+        self.assertEqual(closed, ["tab-a", "tab-b"])
+        self.assertEqual(captured["delete"], ("p_active", True))
+        self.assertEqual(captured["ledger"][0], "project_nuke")
+        self.assertEqual(captured["ledger"][2]["closed_tabs"], 2)
+        self.assertIsNone(app.project)
+        self.assertTrue(app.show_all)
+        self.assertEqual(app.tenant_id, "")
+        self.assertEqual(app.live_buffers, {})
+        self.assertIn("nuked project", app.alerts[-1].text)
+
     async def test_finished_session_pushes_summary_ticker_and_event(self) -> None:
         app = DashboardHarness()
         captured = {}

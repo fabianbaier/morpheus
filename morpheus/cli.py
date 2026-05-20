@@ -949,6 +949,15 @@ def projects_delete(
     )
 
 
+@projects_app.command("nuke")
+def projects_nuke(
+    project: str = typer.Argument(..., help="Project tenant id, id prefix, name, or root path."),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Nuke without prompting."),
+):
+    """Close live tabs for one project, then purge all related Morpheus DB rows."""
+    projects_delete(project=project, yes=yes, close_live=True)
+
+
 # ───────── prune ─────────
 
 @app.command()

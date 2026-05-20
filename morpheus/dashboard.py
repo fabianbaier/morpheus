@@ -1766,7 +1766,7 @@ class ProjectSwitchScreen(ModalScreen[Optional[ProjectSwitchRequest]]):
     ProjectSwitchScreen { align: center middle; }
     #project-dialog {
         width: 106;
-        height: 31;
+        height: 34;
         border: round ansi_bright_green;
         background: black;
         padding: 1 2;
@@ -1780,8 +1780,13 @@ class ProjectSwitchScreen(ModalScreen[Optional[ProjectSwitchRequest]]):
         color: grey;
         margin-bottom: 1;
     }
+    #project_legend {
+        height: 3;
+        color: ansi_bright_green;
+        margin-bottom: 1;
+    }
     #project_table {
-        height: 12;
+        height: 11;
         margin-bottom: 1;
     }
     #project_detail {
@@ -1804,6 +1809,7 @@ class ProjectSwitchScreen(ModalScreen[Optional[ProjectSwitchRequest]]):
         Binding("up", "cursor_up", "prev", show=False),
         Binding("p", "prune_selected", "prune empty"),
         Binding("d", "delete_selected", "delete"),
+        Binding("n", "nuke_selected", "nuke"),
     ]
 
     def __init__(
@@ -1829,13 +1835,19 @@ class ProjectSwitchScreen(ModalScreen[Optional[ProjectSwitchRequest]]):
     def compose(self) -> ComposeResult:
         with Container(id="project-dialog"):
             yield Label(f"{RABBIT}  PROJECTS", classes="title")
-            yield Label("Enter selects a cockpit scope. Global shows every project.", classes="hint")
+            yield Label("Project tenant controls", classes="hint")
+            yield Static(
+                "Keys: Enter switch · p prune empty · d delete stored graph · n nuke active · q/Esc close\n"
+                "Prune only removes empty rows. Delete purges non-live graph state. Nuke closes live tabs first.",
+                id="project_legend",
+            )
             yield DataTable(id="project_table")
             yield Static("", id="project_detail")
             with Horizontal():
                 yield Button("select", variant="primary", id="project_select")
                 yield Button("prune empty", id="project_prune")
                 yield Button("delete", variant="error", id="project_delete")
+                yield Button("nuke", variant="error", id="project_nuke")
                 yield Button("close", id="project_close")
 
     def on_mount(self) -> None:
@@ -1871,6 +1883,8 @@ class ProjectSwitchScreen(ModalScreen[Optional[ProjectSwitchRequest]]):
             self.action_prune_selected()
         elif event.button.id == "project_delete":
             self.action_delete_selected()
+        elif event.button.id == "project_nuke":
+            self.action_nuke_selected()
         else:
             self.action_close()
 
@@ -1933,6 +1947,22 @@ class ProjectSwitchScreen(ModalScreen[Optional[ProjectSwitchRequest]]):
             return
         self.dismiss(ProjectSwitchRequest(tenant_id=tenant.tenant_id, action="delete"))
 
+    def action_nuke_selected(self) -> None:
+        request = self._selected_request()
+        if request is None or request.show_all:
+            self.query_one("#project_detail", Static).update("Global fleet is not a project tenant.")
+            return
+        tenant = self._tenant_for_request(request)
+        if tenant is None:
+            self.query_one("#project_detail", Static).update("Project no longer exists.")
+            return
+        usage = self._usage(tenant.tenant_id)
+        if self.confirm_action != ("nuke", tenant.tenant_id):
+            self.confirm_action = ("nuke", tenant.tenant_id)
+            self.query_one("#project_detail", Static).update(self._detail(tenant, usage, confirm_nuke=True))
+            return
+        self.dismiss(ProjectSwitchRequest(tenant_id=tenant.tenant_id, action="nuke"))
+
     def action_close(self) -> None:
         self.dismiss(None)
 
@@ -1973,6 +2003,7 @@ class ProjectSwitchScreen(ModalScreen[Optional[ProjectSwitchRequest]]):
         *,
         confirm_prune: bool = False,
         confirm_delete: bool = False,
+        confirm_nuke: bool = False,
         blocked_prune: bool = False,
         blocked_delete: bool = False,
     ) -> str:
@@ -1992,10 +2023,12 @@ class ProjectSwitchScreen(ModalScreen[Optional[ProjectSwitchRequest]]):
             lines.append("Press prune again to remove this empty project tenant row.")
         elif confirm_delete:
             lines.append("Press delete again to purge this tenant's stored graph rows.")
+        elif confirm_nuke:
+            lines.append(f"Press nuke again to close {usage.live_sessions} live tabs and purge all stored graph rows.")
         elif usage.is_empty:
             lines.append("Empty project tenant; prune can remove it.")
         else:
-            lines.append("Delete removes missions, memory, events, artifacts, edges, notes, and loops.")
+            lines.append("Delete removes non-live graph rows. Nuke closes live tabs first, then purges.")
         return "\n".join(lines)
 
 
@@ -3078,6 +3111,9 @@ class MorpheusApp(App):
     def _handle_project_switch_result(self, result: Optional[ProjectSwitchRequest]) -> None:
         if result is None:
             return
+        if result.action == "nuke":
+            asyncio.create_task(self._handle_project_nuke_result(result))
+            return
         if result.action in {"prune", "delete"}:
             self._handle_project_cleanup_result(result)
             return
@@ -3106,6 +3142,74 @@ class MorpheusApp(App):
             pass
         self._refresh_table()
         self._push_alert(Alert(time.time(), "summary", f"project scope: {self._scope_text()}"))
+
+    async def _handle_project_nuke_result(self, result: ProjectSwitchRequest) -> None:
+        if result.show_all or not result.tenant_id:
+            self._push_alert(Alert(time.time(), "error", "global fleet cannot be nuked"))
+            return
+        if self.iterm_conn is None:
+            self._push_alert(Alert(time.time(), "error", "cannot nuke project without iTerm connection"))
+            return
+
+        project = db.get_project_tenant(result.tenant_id)
+        label = project.name if project else result.tenant_id
+        missions = db.all_missions(tenant_id=result.tenant_id)
+        closed = 0
+        failed: list[str] = []
+        for mission in missions:
+            ok = await iterm_client.close_tab(self.iterm_conn, mission.tab_id)
+            if ok:
+                closed += 1
+            else:
+                failed.append(mission.tab_id)
+
+        if failed:
+            self._push_alert(
+                Alert(
+                    time.time(),
+                    "error",
+                    f"nuke aborted for project [{label}]: failed to close {len(failed)} live tabs",
+                )
+            )
+            return
+
+        cleanup = db.delete_project_tenant(result.tenant_id, allow_live=True)
+        if cleanup.blocked_reason:
+            self._push_alert(Alert(time.time(), "error", cleanup.blocked_reason))
+            return
+
+        ledger_mod.log_action(
+            "project_nuke",
+            details={
+                "tenant_id": cleanup.tenant_id,
+                "root_path": cleanup.root_path,
+                "closed_tabs": closed,
+                "deleted": cleanup.deleted,
+            },
+        )
+
+        if result.tenant_id == self.tenant_id:
+            self.project = None
+            self.show_all = True
+            self.tenant_id = ""
+        try:
+            self.query_one("#header", Static).update(self._header_text(compact="compact" in self.screen.classes))
+        except Exception:
+            pass
+        closed_tab_ids = {mission.tab_id for mission in missions}
+        self.live_buffers = {
+            tab_id: live for tab_id, live in self.live_buffers.items()
+            if tab_id not in closed_tab_ids
+        }
+        self.last_seen_tabs = {mission.tab_id for mission in self._all_missions()}
+        self._refresh_table()
+        self._push_alert(
+            Alert(
+                time.time(),
+                "close",
+                f"nuked project [{cleanup.name or cleanup.tenant_id}]: closed {closed} tabs, removed {cleanup.total_deleted} DB rows",
+            )
+        )
 
     def _handle_project_cleanup_result(self, result: ProjectSwitchRequest) -> None:
         if result.show_all or not result.tenant_id:

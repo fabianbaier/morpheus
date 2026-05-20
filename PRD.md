@@ -369,7 +369,7 @@ The CLI remains the scriptable surface for the same mission model:
 | `morpheus snapshot <tab_prefix>` | Dump a tab's mission + buffer to markdown |
 | `morpheus context [--format md/json/short]` | Print the shared cross-session snapshot |
 | `morpheus activity [--format table/json/short] [--refresh]` | Print cached live per-session headlines and transcript tails; `--refresh` forces an iTerm poll |
-| `morpheus projects list/prune/delete` | Inspect known project tenants and remove empty or explicitly deleted tenant graph state |
+| `morpheus projects list/prune/delete/nuke` | Inspect known project tenants, remove empty tenants, or force-close and purge a project |
 | `morpheus note "<text>"` | Post a cross-session note attached to the current tab |
 | `morpheus notes [--limit 15]` | List recent cross-session notes |
 | `morpheus brief` | Produce a morning/evening operational digest |
@@ -466,6 +466,11 @@ Required behavior:
   non-live tenant graph state with confirmation. Live sessions remain
   ask-first: close or prune live tabs before deleting the project tenant, or
   use an explicit CLI flag that closes live tabs first.
+- The cockpit project switcher must show an explicit legend for project actions:
+  `Enter` switches, `p` prunes empty tenants, `d` deletes non-live graph state,
+  and `n` nukes an active project by closing its live tabs before purging all
+  related Morpheus DB rows. Nuke requires a second confirmation inside the
+  palette.
 
 Non-goals for the first tenant implementation:
 
@@ -492,6 +497,9 @@ Implementation status:
   switcher prune/delete controls, and focused cleanup tests passed in
   `make test`. Dogfood pruned two empty `/private/tmp` tenants from the real
   Morpheus DB.
+- 2026-05-20: Follow-up UX fix 100% complete locally. The project switcher now
+  shows a visible action legend and supports `n` nuke for force-closing live
+  project tabs before tenant cleanup; CLI also exposes `morpheus projects nuke`.
 
 ### 6.7 Prompt Loops
 
