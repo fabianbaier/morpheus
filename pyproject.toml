@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "morpheus-mc"
-version = "0.8.0a4"
+version = "0.8.0a6"
 description = "Mission graph cockpit for your terminal — keeps track of parallel agent sessions running in iTerm."
 readme = "README.md"
 requires-python = ">=3.10"

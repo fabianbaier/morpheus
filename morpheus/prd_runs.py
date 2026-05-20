@@ -177,6 +177,89 @@ def attach_coordinator(run: PRDRun, mission: db.Mission) -> None:
     write_status_file(run, coordinator=mission)
 
 
+def attach_worker(
+    run: PRDRun,
+    mission: db.Mission,
+    *,
+    scope: str = "",
+    verification: str = "",
+) -> None:
+    db.add_edge(
+        run.parent_id,
+        mission.mission_id,
+        relation="worker",
+        reason=scope or "Worker session for PRD run",
+    )
+    db.add_event(
+        run.parent_id,
+        kind="worker_spawned",
+        actor="morpheus",
+        summary=f"Worker spawned: {mission.goal or mission.tab_id}",
+        source_ref=f"tab:{mission.tab_id}",
+        metadata={
+            "child_mission_id": mission.mission_id,
+            "scope": scope,
+            "verification": verification,
+        },
+    )
+    db.add_event(
+        mission.mission_id,
+        kind="assigned",
+        actor="morpheus",
+        summary=f"Assigned as worker for {run.title}",
+        source_ref=str(run.prd_path),
+        metadata={
+            "parent_mission_id": run.parent_id,
+            "role": "worker",
+            "scope": scope,
+            "verification": verification,
+        },
+    )
+
+
+def parent_for_child(mission_id: str) -> Optional[str]:
+    for edge in db.edges_to_id(mission_id, limit=20):
+        if edge.relation in {"coordinator", "worker"}:
+            return edge.from_id
+    return None
+
+
+def run_from_parent(parent_id: str) -> PRDRun:
+    memory = db.get_memory(parent_id)
+    if memory is None:
+        raise ValueError(f"PRD parent mission not found: {parent_id}")
+    prd_path = Path(memory.source_ref).expanduser() if memory.source_ref else Path("")
+    run_dir = RUNS_DIR / parent_id
+    return PRDRun(
+        parent_id=parent_id,
+        title=memory.title or parent_id,
+        prd_path=prd_path,
+        status_path=run_dir / "status.md",
+        prompt_path=run_dir / "coordinator_prompt.md",
+    )
+
+
+def worker_command(
+    base_command: str,
+    run: PRDRun,
+    *,
+    worker_goal: str,
+    scope: str = "",
+    verification: str = "",
+) -> str:
+    cmd = (base_command or "codex").strip()
+    prompt = (
+        f"You are a worker for Morpheus PRD run {run.parent_id}. "
+        f"Goal: {worker_goal}. "
+        f"Read {run.prd_path} as source of truth and inspect {run.status_path} for current run status. "
+        f"Coordinate through Morpheus mission events/artifacts. "
+        f"Owned scope: {scope or 'ask the coordinator/user to confirm write scope before editing'}. "
+        f"Verification required: {verification or 'record proof before declaring done'}. "
+        f"Do not revert unrelated edits or other workers' changes."
+    )
+    return f"{cmd} {shlex.quote(prompt)}"
+
+
 def write_status_file(run: PRDRun, coordinator: Optional[db.Mission] = None) -> None:
     run.status_path.parent.mkdir(parents=True, exist_ok=True)
     coordinator_line = "unset"

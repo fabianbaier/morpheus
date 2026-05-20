@@ -74,9 +74,9 @@ sessions: recent terminal output appears as bright falling shards inside the
 rain, with selected and urgent sessions rendered more prominently. The mission
 table controls selection, and the right card shows the selected mission's graph
 memory plus the latest terminal tail. Use `j`/`k` or arrows to move, then press
-`b` for a cited graph/transcript brief, or `Enter` to jump into the real iTerm
-tab when you need to respond directly. Use `n` to spawn a new session without
-leaving Morpheus. The bottom white-rabbit
+`b` for a cited graph/transcript brief, `e` to correct mission memory, or
+`Enter` to jump into the real iTerm tab when you need to respond directly. Use
+`n` to spawn a new session without leaving Morpheus. The bottom white-rabbit
 strip acts like a ticker: blocked prompts, collisions, spawns, notes,
 completed-session headlines, and ready-response headlines roll in there.
 Ready/completed headlines summarize the latest assistant answer block instead
@@ -84,7 +84,9 @@ of blindly using the last terminal line, so Codex prompt chrome and separator
 rules do not become ticker text. The ticker renders newest-first, with the
 freshest item at the top. Press `l` to create a recurring prompt loop; loop
 outputs appear as ticker items and, when targeted, as graph events/artifacts for
-the selected mission.
+the selected mission. For PRD runs, parent rows appear in the mission table and
+coordinator/worker tabs nest underneath; press `w` on a PRD parent/coordinator
+to spawn a manually scoped worker.
 
 Core commands:
 
@@ -202,6 +204,11 @@ The coordinator is responsible for reading the PRD, proposing safe child-worker
 slices, and recording status in Morpheus events/artifacts. Automatic fan-out is
 intentionally not enabled yet.
 
+In the cockpit, PRD runs render as a small tree: the virtual parent row first,
+then the coordinator and worker tabs underneath. Select the parent/coordinator
+and press `w` to spawn a manual child worker with explicit scope and
+verification.
+
 ## Prompt Loops
 
 Loops are recurring prompts for periodic checks or status feeds. They are
@@ -257,8 +264,9 @@ make daemon
 
 ## Roadmap
 
-Current status: v0.8.0a6 has PRD Runs foundation, newest-first ready tickers,
-prompt loops foundation, edit mission flow, and selected mission briefs.
+Current status: v0.8.0a6 has PRD Runs foundation, PRD tree/manual workers,
+newest-first ready tickers, prompt loops foundation, edit mission flow, and
+selected mission briefs.
 
 Next implementation phases:
 
@@ -272,9 +280,9 @@ Next implementation phases:
 8. Newest-first rabbit ticker. Done in `0.8.0a3`.
 9. Prompt loops foundation. Done in `0.8.0a4`.
 10. PRD Runs foundation. Done in `0.8.0a1`.
-11. Collapsible PRD run tree in the cockpit.
-12. Manual child-worker spawn under a PRD run.
-13. Edit mission flow for why/plan/next/provenance/proof fields. Done in `0.8.0a5`.
+11. PRD run tree in the cockpit. Done in `0.8.0a5`.
+12. Manual child-worker spawn under a PRD run. Done in `0.8.0a5`.
+13. Edit mission flow for why/plan/next/provenance/proof fields. Done in `0.8.0a6`.
 14. `b` brief-selected using mission graph plus transcript tail. Done in `0.8.0a6`.
 15. Resume-fresh flow that snapshots, archives old attachment, and spawns a new
    session linked by a `spawned_from` edge.

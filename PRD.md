@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| **Status** | v0.8.0a6 implemented (brief selected); next: PRD run tree UI |
+| **Status** | v0.8.0a6 implemented (edit mission + selected brief); next: resume fresh |
 | **Author** | Fabian Baier |
 | **Last updated** | 2026-05-20 |
 | **Target platform** | macOS + iTerm2 |
@@ -323,6 +323,7 @@ attach.
 | `r` | Resume fresh | Spawns a new session seeded with the snapshot + mission card |
 | `/` | Note / claim | Posts a note or path/worktree claim |
 | `l` | Loop control | Creates a recurring prompt loop routed to ticker/context or the selected mission |
+| `w` | Worker | Spawns a manual child worker under the selected PRD run/coordinator/worker |
 | `p` | Prune | Archives stale/finished sessions after confirmation |
 | `d` | Dismiss / close | Closes selected live tab or archives an already-dead mission |
 | `g` | Go to alert | Cycles through current 🐇 alerts |
@@ -393,13 +394,17 @@ Conservative v1 behavior:
 - Child workers are manual in v0.8. Automatic decomposition belongs in v0.9
   after the tree model and ownership boundaries feel correct.
 
-Future v0.8 work:
+Remaining v0.8 work:
 
-- Show parent/child PRD runs as collapsible trees in the mission table.
-- Add explicit `spawn child worker` under selected PRD run.
-- Record per-child ownership, file paths, proof requirements, and blockers.
+- Add collapse/expand affordance and persisted tree state for PRD run rows.
+- Improve per-child ownership, file paths, proof requirements, and blockers.
 - Add a run status updater that writes mission events and keeps the status file
   aligned with the graph.
+
+Implemented v0.8.0a5 behavior: PRD parent rows render as virtual rows in the
+mission table, coordinator/worker sessions render underneath them, and `w`
+spawns a manually scoped worker linked to the same parent mission with a
+`worker` edge plus assignment events.
 
 ### 6.6 Prompt Loops
 
@@ -760,9 +765,9 @@ This table is the source of truth for where the product stands right now.
 | Newest-first rabbit ticker | Implemented in v0.8.0a3 | Bottom alert strip redraws from the newest-first alert deque so fresh session headlines stay at the top instead of appending chronologically |
 | Prompt loops foundation | Implemented in v0.8.0a4 | `l` creates recurring prompt loops; `morpheus loops run-due` runs due prompts, captures output, publishes ticker notes, and routes graph events/artifacts to target missions |
 | PRD Runs foundation | Implemented in v0.8.0a1 | PRD finder, new-session PRD selector, parent mission creation, coordinator prompt/status files, `morpheus run start`, and coordinator graph edge shipped |
-| PRD run tree UI | Not implemented | Show parent PRD rows with collapsible coordinator/worker children in the mission table |
-| PRD child worker spawn | Not implemented | Manual worker spawn under selected parent with file/path ownership and proof requirements |
-| Edit mission flow | Implemented in v0.8.0a5 | `e` opens a dashboard editor for goal/title/why/done/criteria/plan/next/phase/blocker/source/issue/PR/worktree/claimed paths/topic, saves graph memory + live fields, and records a `mission_edit` event |
+| PRD run tree UI | Partially implemented in v0.8.0a5 | Shows virtual PRD parent rows with coordinator/worker sessions rendered underneath them; collapse/expand remains future polish |
+| PRD child worker spawn | Implemented in v0.8.0a5 | `w` spawns a manual child worker under the selected PRD parent/coordinator/worker with scope and verification prompts |
+| Edit mission flow | Implemented in v0.8.0a6 | `e` opens a dashboard editor for goal/title/why/done/criteria/plan/next/phase/blocker/source/issue/PR/worktree/claimed paths/topic, saves graph memory + live fields, and records a `mission_edit` event |
 | Brief selected | Implemented in v0.8.0a6 | `b` opens a cited local brief for the selected mission using graph memory, recent events, artifacts, and transcript tail |
 | Resume fresh | Not implemented | `r` snapshots, archives old attachment, spawns replacement with mission context |
 | MCP mission tools | Partially shipped | Read-only session tools exist; graph read/update tools remain v0.7 |
