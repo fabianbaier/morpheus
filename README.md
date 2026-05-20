@@ -187,10 +187,11 @@ mission memory is archived instead of forgotten.
 
 ## PRD Runs
 
-v0.8 starts a conservative PRD Run workflow. From the cockpit, `n` shows PRD/spec
-candidates from the selected worktree; picking one creates a parent mission from
-the PRD, writes a status file under `~/.morpheus/runs/<mission>/`, and spawns one
-coordinator tab linked by a graph edge.
+v0.8 starts a conservative PRD Run workflow. From the cockpit, `n` shows
+Markdown source files from the selected worktree, with PRD/spec-looking files
+sorted first; picking one creates a parent mission from that source, writes a
+status file under `~/.morpheus/runs/<mission>/`, and spawns one coordinator tab
+linked by a graph edge.
 The PRD picker uses a bounded scan and refuses broad roots like `$HOME`, so a
 session whose cwd is your home directory will fall back to the dashboard/project
 cwd instead of freezing the cockpit.
@@ -266,7 +267,7 @@ make daemon
 
 ## Roadmap
 
-Current status: v0.8.0a6 has PRD Runs foundation, PRD tree/manual workers,
+Current status: v0.8.0a7 has PRD Runs foundation, PRD tree/manual workers,
 newest-first ready tickers, and prompt loops foundation.
 
 Next implementation phases:
@@ -284,9 +285,10 @@ Next implementation phases:
 11. PRD run tree in the cockpit. Done in `0.8.0a5`.
 12. Manual child-worker spawn under a PRD run. Done in `0.8.0a5`.
 13. Nonblocking PRD picker. Done in `0.8.0a6`.
-14. Edit mission flow for why/plan/next/provenance/proof fields.
-15. `b` brief-selected using mission graph plus transcript tail.
-16. Resume-fresh flow that snapshots, archives old attachment, and spawns a new
+14. Markdown source picker. Done in `0.8.0a7`.
+15. Edit mission flow for why/plan/next/provenance/proof fields.
+16. `b` brief-selected using mission graph plus transcript tail.
+17. Resume-fresh flow that snapshots, archives old attachment, and spawns a new
    session linked by a `spawned_from` edge.
 
 > "I can only show you the door. You're the one that has to walk through it."

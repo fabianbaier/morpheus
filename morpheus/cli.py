@@ -154,7 +154,7 @@ app.add_typer(run_app, name="run")
 
 @run_app.command("start")
 def run_start(
-    prd: Path = typer.Argument(..., help="PRD/spec file to use as the parent mission."),
+    prd: Path = typer.Argument(..., help="Markdown source file to use as the parent mission."),
     command: str = typer.Option("codex", "--cmd", "-c", help="Coordinator command, e.g. 'codex' or 'claude'."),
     title: Optional[str] = typer.Option(None, "--title", "-t", help="Override the PRD title."),
 ):
@@ -200,12 +200,12 @@ def run_start(
 def run_find_prds(
     root: Path = typer.Argument(Path.cwd(), help="Worktree/root directory to scan."),
 ):
-    """List PRD/spec-like files Morpheus can use for PRD runs."""
+    """List Markdown source files Morpheus can use for PRD runs."""
     candidates = prd_runs.find_prds(root)
     if not candidates:
-        console.print("[yellow]no PRD-like files found[/yellow]")
+        console.print("[yellow]no Markdown files found[/yellow]")
         return
-    table = Table(title=f"PRDs in {Path(root).resolve()}", header_style="bold green")
+    table = Table(title=f"Markdown sources in {Path(root).resolve()}", header_style="bold green")
     table.add_column("#", style="cyan")
     table.add_column("path")
     for i, candidate in enumerate(candidates, start=1):

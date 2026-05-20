@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| **Status** | v0.8.0a6 implemented (nonblocking PRD picker); next: edit/brief flows |
+| **Status** | v0.8.0a7 implemented (Markdown source picker); next: edit/brief flows |
 | **Author** | Fabian Baier |
 | **Last updated** | 2026-05-20 |
 | **Target platform** | macOS + iTerm2 |
@@ -370,7 +370,7 @@ The CLI remains the scriptable surface for the same mission model:
 | `morpheus ask "<query>"` | Ask questions over current Morpheus state |
 | `morpheus poll-prs` | One-shot PR review queue poll and optional draft spawn |
 | `morpheus ledger costs/actions` | Inspect cost and action ledgers |
-| `morpheus run find-prds [root]` | List PRD/spec candidates in a worktree |
+| `morpheus run find-prds [root]` | List Markdown source candidates in a worktree |
 | `morpheus run start <prd> [--cmd codex]` | Create a PRD parent mission, spawn one coordinator tab, and link it |
 | `morpheus loops add/list/run/run-due/pause/resume` | Configure recurring prompt loops and execute due loops from cron/launchd |
 | `morpheus mcp serve` | Expose Morpheus state to agent tools |
@@ -383,9 +383,9 @@ or spec file, with coordinator and worker sessions linked underneath it.
 
 Conservative v1 behavior:
 
-- The new-session flow shows PRD/spec candidates from the selected worktree or
-  current working directory.
-- PRD/spec discovery must be bounded and must not recursively scan broad roots
+- The new-session flow shows Markdown source files from the selected worktree or
+  current working directory, with PRD/spec-looking files sorted first.
+- Markdown source discovery must be bounded and must not recursively scan broad roots
   such as `$HOME`, `/Users`, or `/`. If a selected tab reports a broad cwd,
   Morpheus falls back to the dashboard/project cwd before opening the modal.
 - Choosing a PRD creates a parent `mission_memory` row with `source_kind=prd`,
@@ -772,6 +772,7 @@ This table is the source of truth for where the product stands right now.
 | PRD run tree UI | Partially implemented in v0.8.0a5 | Shows virtual PRD parent rows with coordinator/worker sessions rendered underneath them; collapse/expand remains future polish |
 | PRD child worker spawn | Implemented in v0.8.0a5 | `w` spawns a manual child worker under the selected PRD parent/coordinator/worker with scope and verification prompts |
 | Nonblocking PRD picker | Implemented in v0.8.0a6 | `n` uses a bounded PRD scan and refuses broad roots like `$HOME`, preventing the dashboard from freezing before the new-session modal opens |
+| Markdown source picker | Implemented in v0.8.0a7 | The `n` picker shows all discovered `.md`/`.markdown` files rather than only PRD-named files, while sorting PRD/spec candidates first |
 | Edit mission flow | Not implemented | `e` opens goal/why/plan/next/criteria/source/proof editor |
 | Brief selected | Not implemented | `b` renders a cited why/status/next card from graph + transcript tail |
 | Resume fresh | Not implemented | `r` snapshots, archives old attachment, spawns replacement with mission context |
