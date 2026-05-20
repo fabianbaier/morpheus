@@ -200,7 +200,15 @@ class RecallEvalLogicTest(unittest.TestCase):
                 )
                 self.assertFalse(recall_eval._event_passed(event))
 
-        for summary in ("verified", "ok", "tests passed", "build succeeded"):
+        for summary in (
+            "verified",
+            "ok",
+            "tests passed",
+            "build succeeded",
+            "10 passed, 0 errors",
+            "tests passed with no failures",
+            "error handling tests passed",
+        ):
             with self.subTest(summary=summary):
                 event = db.MissionEvent(
                     id=1,
@@ -323,12 +331,19 @@ class RecallEvalLogicTest(unittest.TestCase):
 class RecallEvalCliTest(unittest.TestCase):
     def test_graph_recall_eval_outputs_status_and_can_record_event(self) -> None:
         runner = CliRunner()
+        project = db.ProjectTenant("p_cli", "cli", "/tmp/cli")
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            with patch.object(db, "DB_DIR", root), patch.object(db, "DB_PATH", root / "morpheus.db"):
+            with (
+                patch.object(db, "DB_DIR", root),
+                patch.object(db, "DB_PATH", root / "morpheus.db"),
+                patch.object(cli.tenant_mod, "backfill_known_tenants", new=lambda: 0),
+                patch.object(cli.tenant_mod, "ensure_project_tenant", new=lambda path=None: project),
+            ):
                 mission = db.Mission(
                     tab_id="tab-recall",
                     mission_id="m_cli_recall",
+                    tenant_id=project.tenant_id,
                     goal="CLI recall eval",
                     state="idle",
                     buffer_changed_at=time.time() - recall_eval.DEFAULT_STALE_SECONDS - 60,
@@ -338,6 +353,7 @@ class RecallEvalCliTest(unittest.TestCase):
                 db.upsert_memory(
                     db.MissionMemory(
                         mission_id=mission.mission_id,
+                        tenant_id=project.tenant_id,
                         title="CLI recall eval",
                         why="prove the command can score stale recall data",
                         done_definition="CLI prints PASS and records an event on request",
@@ -377,12 +393,19 @@ class RecallEvalCliTest(unittest.TestCase):
 
     def test_graph_recall_eval_json_reports_missing_fields(self) -> None:
         runner = CliRunner()
+        project = db.ProjectTenant("p_cli", "cli", "/tmp/cli")
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            with patch.object(db, "DB_DIR", root), patch.object(db, "DB_PATH", root / "morpheus.db"):
+            with (
+                patch.object(db, "DB_DIR", root),
+                patch.object(db, "DB_PATH", root / "morpheus.db"),
+                patch.object(cli.tenant_mod, "backfill_known_tenants", new=lambda: 0),
+                patch.object(cli.tenant_mod, "ensure_project_tenant", new=lambda path=None: project),
+            ):
                 mission = db.Mission(
                     tab_id="tab-sparse",
                     mission_id="m_cli_sparse",
+                    tenant_id=project.tenant_id,
                     goal="Sparse recall eval",
                     state="idle",
                     buffer_changed_at=time.time() - recall_eval.DEFAULT_STALE_SECONDS - 60,
@@ -454,6 +477,8 @@ class RecallEvalCliTest(unittest.TestCase):
 
                 scoped = runner.invoke(cli.app, ["graph", "recall-eval", "--json"])
                 global_result = runner.invoke(cli.app, ["graph", "recall-eval", "--all", "--json"])
+                scoped_ref = runner.invoke(cli.app, ["graph", "recall-eval", "m_other", "--json"])
+                global_ref = runner.invoke(cli.app, ["graph", "recall-eval", "--all", "m_other", "--json"])
 
         self.assertEqual(scoped.exit_code, 0, scoped.output)
         scoped_payload = json.loads(scoped.output)
@@ -462,18 +487,41 @@ class RecallEvalCliTest(unittest.TestCase):
         self.assertEqual(global_result.exit_code, 0, global_result.output)
         global_ids = {item["mission_id"] for item in json.loads(global_result.output)}
         self.assertEqual(global_ids, {"m_current", "m_other"})
+        self.assertNotEqual(scoped_ref.exit_code, 0)
+        self.assertIn("no mission matching", scoped_ref.output)
+        self.assertEqual(global_ref.exit_code, 0, global_ref.output)
+        self.assertEqual(json.loads(global_ref.output)[0]["mission_id"], "m_other")
 
     def test_graph_recall_eval_rejects_ambiguous_prefix(self) -> None:
         runner = CliRunner()
+        project = db.ProjectTenant("p_cli", "cli", "/tmp/cli")
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            with patch.object(db, "DB_DIR", root), patch.object(db, "DB_PATH", root / "morpheus.db"):
+            with (
+                patch.object(db, "DB_DIR", root),
+                patch.object(db, "DB_PATH", root / "morpheus.db"),
+                patch.object(cli.tenant_mod, "backfill_known_tenants", new=lambda: 0),
+                patch.object(cli.tenant_mod, "ensure_project_tenant", new=lambda path=None: project),
+            ):
                 for mission_id, tab_id in (
                     ("m_shared_alpha", "tab-alpha"),
                     ("m_shared_beta", "tab-beta"),
                 ):
-                    db.upsert(db.Mission(tab_id=tab_id, mission_id=mission_id, goal=mission_id))
-                    db.upsert_memory(db.MissionMemory(mission_id=mission_id, title=mission_id))
+                    db.upsert(
+                        db.Mission(
+                            tab_id=tab_id,
+                            mission_id=mission_id,
+                            tenant_id=project.tenant_id,
+                            goal=mission_id,
+                        )
+                    )
+                    db.upsert_memory(
+                        db.MissionMemory(
+                            mission_id=mission_id,
+                            tenant_id=project.tenant_id,
+                            title=mission_id,
+                        )
+                    )
 
                 result = runner.invoke(cli.app, ["graph", "recall-eval", "m_shared"])
 

@@ -1452,7 +1452,7 @@ def graph_recall_eval(
         raise typer.Exit(1)
 
     tenant_mod.backfill_known_tenants()
-    project = None if refs or all_projects else tenant_mod.ensure_project_tenant(Path.cwd())
+    project = None if all_projects else tenant_mod.ensure_project_tenant(Path.cwd())
 
     try:
         results = _recall_eval_results(
@@ -1503,7 +1503,7 @@ def _recall_eval_results(
     memories: list[db.MissionMemory] = []
     if refs:
         for ref in refs:
-            resolved = _resolve_recall_ref(ref)
+            resolved = _resolve_recall_ref(ref, tenant_id=tenant_id)
             if resolved is None:
                 raise ValueError(f"no mission matching '{ref}'")
             memories.append(resolved.memory)
@@ -1533,14 +1533,17 @@ def _recall_eval_results(
     return results
 
 
-def _resolve_recall_ref(ref: str) -> Optional[graph_mod.ResolvedMission]:
+def _resolve_recall_ref(
+    ref: str,
+    tenant_id: Optional[str] = None,
+) -> Optional[graph_mod.ResolvedMission]:
     """Resolve one ref for recall eval, rejecting ambiguous prefixes."""
     needle = ref.strip()
     if not needle:
         return None
 
-    live = db.all_missions()
-    memories = db.all_memory(include_archived=True)
+    live = db.all_missions(tenant_id=tenant_id)
+    memories = db.all_memory(include_archived=True, tenant_id=tenant_id)
     memory_by_id = {memory.mission_id: memory for memory in memories}
 
     exact_ids = {
@@ -1572,7 +1575,9 @@ def _resolve_recall_ref(ref: str) -> Optional[graph_mod.ResolvedMission]:
         raise ValueError(f"ambiguous mission ref '{ref}' matches: {choices}")
 
     mission_id = next(iter(candidate_ids))
-    memory = memory_by_id.get(mission_id) or db.get_memory(mission_id)
+    memory = memory_by_id.get(mission_id)
+    if memory is None and tenant_id is None:
+        memory = db.get_memory(mission_id)
     if memory is None:
         return None
     return graph_mod.ResolvedMission(

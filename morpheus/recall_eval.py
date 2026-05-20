@@ -24,11 +24,15 @@ PROOF_ARTIFACT_STATUSES = {"pass"}
 PROOF_ARTIFACT_KINDS = {"test", "build", "proof", "diff", "pr", "log", "screenshot"}
 PASS_RE = re.compile(r"\b(pass(?:ed)?|success(?:ful)?|succeeded|ok|verified)\b")
 FAIL_RE = re.compile(
-    r"\b(fail(?:ed|ure|ures|ing)?|error(?:ed|s)?|timeout|timed out)\b"
+    r"\b(failed|failing|errored|timeout|timed out)\b"
     r"|\b(?:did\s+not|does\s+not|do\s+not|is\s+not|are\s+not|was\s+not|were\s+not|not|never|no)\s+"
     r"(?:pass(?:ed|ing)?|succeed(?:ed)?|success(?:ful)?|ok|verified)\b"
     r"|\bunverified\b"
 )
+NO_FAILURE_RE = re.compile(r"\b(?:0|zero|no)\s+(?:failures?|errors?)\b")
+POSITIVE_FAILURE_COUNT_RE = re.compile(r"\b(?:[1-9]\d*|some|multiple)\s+(?:failures?|errors?)\b")
+FAILURE_WORD_RE = re.compile(r"\bfailures?\b")
+ERROR_WORD_RE = re.compile(r"\berrors?\b(?!\s+handling\b)")
 
 
 @dataclass(frozen=True)
@@ -346,9 +350,20 @@ def _event_passed(event: db.MissionEvent) -> bool:
     if status:
         return status in PASS_STATUSES
     summary = _clean(event.summary).lower()
-    if FAIL_RE.search(summary):
+    if _summary_failed(summary):
         return False
     return bool(PASS_RE.search(summary))
+
+
+def _summary_failed(summary: str) -> bool:
+    if FAIL_RE.search(summary):
+        return True
+    without_zero_counts = NO_FAILURE_RE.sub("", summary)
+    if POSITIVE_FAILURE_COUNT_RE.search(without_zero_counts):
+        return True
+    if FAILURE_WORD_RE.search(without_zero_counts):
+        return True
+    return bool(ERROR_WORD_RE.search(without_zero_counts))
 
 
 def _latest_proof_artifact(
