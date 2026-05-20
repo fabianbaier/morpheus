@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "morpheus-mc"
+version = "0.1.0"
+description = "Mission control for your terminal — keeps track of every agent session running in your iTerm tabs."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Fabian Baier" }]
+keywords = ["iterm", "tmux", "agents", "claude", "codex", "tui", "matrix"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Operating System :: MacOS :: MacOS X",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Terminals",
+    "Topic :: Software Development :: Tools",
+]
+
+dependencies = [
+    "iterm2>=2.7",
+    "rich>=13.7",
+    "typer>=0.12",
+]
+
+[project.scripts]
+morpheus = "morpheus.cli:app"
+
+[project.urls]
+Homepage = "https://github.com/fabianbaier/morpheus"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["morpheus*"]
