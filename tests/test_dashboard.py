@@ -855,6 +855,48 @@ class DashboardTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(archived, ["m_parent"])
         self.assertIn("killed PRD run", app.alerts[0].text)
 
+    async def test_focus_selected_session_does_not_pollute_ticker(self) -> None:
+        app = DashboardHarness()
+        mission = dashboard.db.Mission(
+            tab_id="tab-live",
+            mission_id="m_live",
+            goal="live codex",
+            state="working",
+            buffer_changed_at=1,
+        )
+        actions: list[str] = []
+
+        class FakeWindow:
+            window_id = "window-live"
+
+            async def async_activate(self):
+                actions.append("window")
+
+        class FakeTab:
+            tab_id = "tab-live"
+
+            async def async_select(self):
+                actions.append("tab")
+
+        window = FakeWindow()
+        window.tabs = [FakeTab()]
+
+        async def fake_get_app(connection):
+            return SimpleNamespace(windows=[window])
+
+        with isolated_dashboard_runtime(missions=[mission], memories=[]), patch.object(
+            dashboard.iterm2, "async_get_app", new=fake_get_app
+        ):
+            async with app.run_test(size=(120, 40)) as pilot:
+                app._refresh_table()
+                await pilot.pause()
+                app.alerts.clear()
+                await pilot.press("enter")
+                await pilot.pause()
+
+        self.assertEqual(actions, ["window", "tab"])
+        self.assertEqual(list(app.alerts), [])
+
     async def test_kill_closed_row_dismisses_it_from_dashboard(self) -> None:
         app = DashboardHarness()
         memory = dashboard.db.MissionMemory(
@@ -883,12 +925,13 @@ class DashboardTest(unittest.IsolatedAsyncioTestCase):
                 await pilot.pause()
                 table = app.query_one(dashboard.MissionsTable)
                 self.assertEqual(table.selected_ref().role, "closed")
+                app.alerts.clear()
                 await pilot.press("d")
                 await pilot.pause()
                 final_row_count = table.row_count
 
         self.assertEqual(dismissed, ["m_closed"])
-        self.assertIn("dismissed closed", app.alerts[0].text)
+        self.assertEqual(list(app.alerts), [])
         self.assertEqual(final_row_count, 0)
 
     async def test_prune_archives_orphan_prd_parent_rows(self) -> None:
@@ -969,12 +1012,13 @@ class DashboardTest(unittest.IsolatedAsyncioTestCase):
                 await pilot.pause()
                 table = app.query_one(dashboard.MissionsTable)
                 self.assertEqual(table.selected_ref().role, "closed")
+                app.alerts.clear()
                 await pilot.press("p")
                 await pilot.pause()
                 final_row_count = table.row_count
 
         self.assertEqual(dismissed, ["m_closed"])
-        self.assertIn("pruned closed", app.alerts[0].text)
+        self.assertEqual(list(app.alerts), [])
         self.assertEqual(final_row_count, 0)
 
     async def test_edit_mission_without_selection_pushes_alert(self) -> None:

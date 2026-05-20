@@ -2569,10 +2569,6 @@ class MorpheusApp(App):
                             await tab.async_activate()
                         except Exception:
                             pass
-                    self._push_alert(Alert(
-                        time.time(), "spawn",
-                        f"focused [{tab_id.split('-')[0]}]"
-                    ))
                     return
 
     def action_new_session(self) -> None:
@@ -3106,10 +3102,6 @@ class MorpheusApp(App):
             return
         if ref and ref.virtual and ref.role == "closed" and ref.mission_id:
             if db.dismiss_closed_resume(ref.mission_id, "closed mission dismissed from dashboard"):
-                self._push_alert(Alert(
-                    time.time(), "close",
-                    f"dismissed closed [{ref.mission_id.split('_')[-1]}]"
-                ))
                 self._refresh_table()
             else:
                 self._push_alert(Alert(
@@ -3136,10 +3128,6 @@ class MorpheusApp(App):
         ref = table.selected_ref()
         if ref and ref.virtual and ref.role == "closed" and ref.mission_id:
             if db.dismiss_closed_resume(ref.mission_id, "closed mission pruned from dashboard"):
-                self._push_alert(Alert(
-                    time.time(), "close",
-                    f"pruned closed [{ref.mission_id.split('_')[-1]}]",
-                ))
                 self._refresh_table()
             else:
                 self._push_alert(Alert(

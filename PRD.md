@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| **Status** | v0.8.0a23 implemented (idle ticker reconciliation); cwd project tenancy planned; implementation in progress |
+| **Status** | v0.8.0a24 implemented (ticker noise reduction); cwd project tenancy planned; implementation in progress |
 | **Author** | Fabian Baier |
 | **Last updated** | 2026-05-20 |
 | **Target platform** | macOS + iTerm2 |
@@ -826,6 +826,7 @@ This table is the source of truth for where the product stands right now.
 | Robust self-tab exclusion | Implemented in v0.7.0a6 | Dashboard passes its own tab/session IDs into the watcher; core also recognizes the Morpheus screen by buffer if iTerm leaves the title as `Python"` |
 | Ready-response rabbit ticker | Implemented in v0.8.0a2 | `working → idle` now emits a `ready [...]` headline by extracting the latest assistant answer block, skipping Codex chrome/separators/source URLs, and compressing it to one sentence |
 | Idle ticker reconciliation | Implemented in v0.8.0a23 | The dashboard reconciles recently idle observed sessions into the white-rabbit ticker even if another watcher updated SQLite before the cockpit saw the state transition |
+| White-rabbit ticker noise reduction | Implemented in v0.8.0a24 | Successful focus actions and closed-row dismiss/prune bookkeeping stay silent so the ticker remains reserved for work signals, failures, collisions, spawns, loops, and ready/completed summaries |
 | Newest-first rabbit ticker | Implemented in v0.8.0a3 | Bottom alert strip redraws from the newest-first alert deque so fresh session headlines stay at the top instead of appending chronologically |
 | Prompt loops foundation | Implemented in v0.8.0a4 | `l` creates recurring prompt loops; `morpheus loops run-due` runs due prompts, captures output, publishes ticker notes, and routes graph events/artifacts to target missions |
 | PRD Runs foundation | Implemented in v0.8.0a1 | PRD finder, new-session PRD selector, parent mission creation, coordinator prompt/status files, `morpheus run start`, and coordinator graph edge shipped |
