@@ -380,6 +380,41 @@ class DashboardTest(unittest.IsolatedAsyncioTestCase):
     def test_rain_cadence_is_low_fps_by_default(self) -> None:
         self.assertGreaterEqual(dashboard.RAIN_INTERVAL_SECONDS, 2.0)
 
+    async def test_zoomed_terminal_uses_compact_in_bounds_layout(self) -> None:
+        app = DashboardHarness()
+
+        with isolated_dashboard_runtime():
+            async with app.run_test(size=(70, 20)) as pilot:
+                await pilot.pause()
+
+                self.assertTrue(app.screen.has_class("compact"))
+                header = app.query_one("#header")
+                body = app.query_one("#body")
+                rain = app.query_one("#rain-panel")
+                missions = app.query_one("#missions-panel")
+                card = app.query_one("#mission-card-panel")
+                alerts = app.query_one("#alerts-panel")
+
+                self.assertGreaterEqual(header.region.y, 0)
+                self.assertGreaterEqual(body.region.height, 6)
+                self.assertEqual(rain.region.height, body.region.height)
+                self.assertEqual(missions.region.height, body.region.height)
+                self.assertEqual(card.region.height, body.region.height)
+                self.assertLessEqual(alerts.region.y + alerts.region.height, app.size.height)
+
+    async def test_standard_terminal_panels_fill_body_region(self) -> None:
+        app = DashboardHarness()
+
+        with isolated_dashboard_runtime():
+            async with app.run_test(size=(120, 40)) as pilot:
+                await pilot.pause()
+
+                self.assertFalse(app.screen.has_class("compact"))
+                body = app.query_one("#body")
+                self.assertEqual(app.query_one("#rain-panel").region.height, body.region.height)
+                self.assertEqual(app.query_one("#missions-panel").region.height, body.region.height)
+                self.assertEqual(app.query_one("#mission-card-panel").region.height, body.region.height)
+
     def test_sync_shards_only_when_buffer_signature_changes(self) -> None:
         stream = dashboard.LiveStreamWidget()
         stream.buffers = {
@@ -1147,6 +1182,33 @@ class DashboardTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(captured["mission"].session_id, "session-123456")
         self.assertEqual(captured["mission"].goal, "review a PR")
         self.assertEqual(captured["mission"].cmd, "codex")
+
+    async def test_new_session_result_refreshes_visible_missions_immediately(self) -> None:
+        app = DashboardHarness()
+        app.iterm_conn = object()
+        missions = []
+
+        async def fake_spawn_tab(connection, *, command, goal):
+            return SimpleNamespace(tab_id="tab-123456", session_id="session-123456")
+
+        def fake_upsert(mission):
+            missions.append(mission)
+
+        with (
+            patch.object(dashboard.iterm_client, "spawn_tab", new=fake_spawn_tab),
+            patch.object(dashboard.db, "upsert", new=fake_upsert),
+            patch.object(dashboard.db, "all_missions", new=lambda: list(missions)),
+            patch.object(app, "_refresh_table") as refresh_table,
+        ):
+            await app._handle_new_session_result(NewSessionRequest(
+                goal="review a PR",
+                command="codex",
+            ))
+
+        self.assertEqual([m.tab_id for m in app.current_missions], ["tab-123456"])
+        self.assertEqual(app.last_seen_tabs, {"tab-123456"})
+        self.assertIn("new session [review a PR]", app.alerts[0].text)
+        refresh_table.assert_called_once()
 
     async def test_new_session_with_prd_creates_run_and_coordinator(self) -> None:
         app = DashboardHarness()
