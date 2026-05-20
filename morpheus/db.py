@@ -672,6 +672,32 @@ def edges_for_id(node_id: str, limit: int = 20) -> list[MissionEdge]:
     return [_row_to_edge(r) for r in rows]
 
 
+def edges_from_id(node_id: str, relation: str = "", limit: int = 50) -> list[MissionEdge]:
+    query = "SELECT * FROM mission_edges WHERE from_id = ?"
+    params: list[Any] = [node_id]
+    if relation:
+        query += " AND relation = ?"
+        params.append(relation)
+    query += " ORDER BY created_at DESC LIMIT ?"
+    params.append(limit)
+    with _connect() as conn:
+        rows = conn.execute(query, params).fetchall()
+    return [_row_to_edge(r) for r in rows]
+
+
+def edges_to_id(node_id: str, relation: str = "", limit: int = 50) -> list[MissionEdge]:
+    query = "SELECT * FROM mission_edges WHERE to_id = ?"
+    params: list[Any] = [node_id]
+    if relation:
+        query += " AND relation = ?"
+        params.append(relation)
+    query += " ORDER BY created_at DESC LIMIT ?"
+    params.append(limit)
+    with _connect() as conn:
+        rows = conn.execute(query, params).fetchall()
+    return [_row_to_edge(r) for r in rows]
+
+
 def graph_counts() -> dict[str, int]:
     with _connect() as conn:
         return {

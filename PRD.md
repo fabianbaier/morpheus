@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| **Status** | v0.8.0a4 implemented (prompt loops foundation); next: child-worker tree UI |
+| **Status** | v0.8.0a5 implemented (PRD tree + manual workers); next: edit/brief flows |
 | **Author** | Fabian Baier |
 | **Last updated** | 2026-05-20 |
 | **Target platform** | macOS + iTerm2 |
@@ -323,6 +323,7 @@ attach.
 | `r` | Resume fresh | Spawns a new session seeded with the snapshot + mission card |
 | `/` | Note / claim | Posts a note or path/worktree claim |
 | `l` | Loop control | Creates a recurring prompt loop routed to ticker/context or the selected mission |
+| `w` | Worker | Spawns a manual child worker under the selected PRD run/coordinator/worker |
 | `p` | Prune | Archives stale/finished sessions after confirmation |
 | `d` | Dismiss / close | Closes selected live tab or archives an already-dead mission |
 | `g` | Go to alert | Cycles through current 🐇 alerts |
@@ -400,6 +401,11 @@ Future v0.8 work:
 - Record per-child ownership, file paths, proof requirements, and blockers.
 - Add a run status updater that writes mission events and keeps the status file
   aligned with the graph.
+
+Implemented v0.8.0a5 behavior: PRD parent rows render as virtual rows in the
+mission table, coordinator/worker sessions render underneath them, and `w`
+spawns a manually scoped worker linked to the same parent mission with a
+`worker` edge plus assignment events.
 
 ### 6.6 Prompt Loops
 
@@ -760,8 +766,8 @@ This table is the source of truth for where the product stands right now.
 | Newest-first rabbit ticker | Implemented in v0.8.0a3 | Bottom alert strip redraws from the newest-first alert deque so fresh session headlines stay at the top instead of appending chronologically |
 | Prompt loops foundation | Implemented in v0.8.0a4 | `l` creates recurring prompt loops; `morpheus loops run-due` runs due prompts, captures output, publishes ticker notes, and routes graph events/artifacts to target missions |
 | PRD Runs foundation | Implemented in v0.8.0a1 | PRD finder, new-session PRD selector, parent mission creation, coordinator prompt/status files, `morpheus run start`, and coordinator graph edge shipped |
-| PRD run tree UI | Not implemented | Show parent PRD rows with collapsible coordinator/worker children in the mission table |
-| PRD child worker spawn | Not implemented | Manual worker spawn under selected parent with file/path ownership and proof requirements |
+| PRD run tree UI | Partially implemented in v0.8.0a5 | Shows virtual PRD parent rows with coordinator/worker sessions rendered underneath them; collapse/expand remains future polish |
+| PRD child worker spawn | Implemented in v0.8.0a5 | `w` spawns a manual child worker under the selected PRD parent/coordinator/worker with scope and verification prompts |
 | Edit mission flow | Not implemented | `e` opens goal/why/plan/next/criteria/source/proof editor |
 | Brief selected | Not implemented | `b` renders a cited why/status/next card from graph + transcript tail |
 | Resume fresh | Not implemented | `r` snapshots, archives old attachment, spawns replacement with mission context |

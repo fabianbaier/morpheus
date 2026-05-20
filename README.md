@@ -83,7 +83,9 @@ of blindly using the last terminal line, so Codex prompt chrome and separator
 rules do not become ticker text. The ticker renders newest-first, with the
 freshest item at the top. Press `l` to create a recurring prompt loop; loop
 outputs appear as ticker items and, when targeted, as graph events/artifacts for
-the selected mission.
+the selected mission. For PRD runs, parent rows appear in the mission table and
+coordinator/worker tabs nest underneath; press `w` on a PRD parent/coordinator
+to spawn a manually scoped worker.
 
 Core commands:
 
@@ -201,6 +203,11 @@ The coordinator is responsible for reading the PRD, proposing safe child-worker
 slices, and recording status in Morpheus events/artifacts. Automatic fan-out is
 intentionally not enabled yet.
 
+In the cockpit, PRD runs render as a small tree: the virtual parent row first,
+then the coordinator and worker tabs underneath. Select the parent/coordinator
+and press `w` to spawn a manual child worker with explicit scope and
+verification.
+
 ## Prompt Loops
 
 Loops are recurring prompts for periodic checks or status feeds. They are
@@ -256,8 +263,8 @@ make daemon
 
 ## Roadmap
 
-Current status: v0.8.0a4 has PRD Runs foundation, newest-first ready tickers,
-and prompt loops foundation.
+Current status: v0.8.0a5 has PRD Runs foundation, PRD tree/manual workers,
+newest-first ready tickers, and prompt loops foundation.
 
 Next implementation phases:
 
@@ -271,8 +278,8 @@ Next implementation phases:
 8. Newest-first rabbit ticker. Done in `0.8.0a3`.
 9. Prompt loops foundation. Done in `0.8.0a4`.
 10. PRD Runs foundation. Done in `0.8.0a1`.
-11. Collapsible PRD run tree in the cockpit.
-12. Manual child-worker spawn under a PRD run.
+11. PRD run tree in the cockpit. Done in `0.8.0a5`.
+12. Manual child-worker spawn under a PRD run. Done in `0.8.0a5`.
 13. Edit mission flow for why/plan/next/provenance/proof fields.
 14. `b` brief-selected using mission graph plus transcript tail.
 15. Resume-fresh flow that snapshots, archives old attachment, and spawns a new

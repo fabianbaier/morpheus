@@ -16,6 +16,8 @@ from morpheus.dashboard import (
     NewSessionRequest,
     NewSessionScreen,
     NoteScreen,
+    WorkerRequest,
+    WorkerScreen,
     _session_headline,
     _stream_shard_text,
     _tail_lines,
@@ -58,6 +60,8 @@ def isolated_dashboard_runtime():
         patch.object(dashboard.core, "setup_logging", new=lambda: FakeLogger()),
         patch.object(dashboard.db, "recent_notes", new=lambda limit=1: []),
         patch.object(dashboard.db, "all_missions", new=lambda: []),
+        patch.object(dashboard.db, "all_memory", new=lambda include_archived=False: []),
+        patch.object(dashboard.db, "edges_from_id", new=lambda *args, **kwargs: []),
     ):
         yield
 
@@ -340,6 +344,13 @@ class DashboardTest(unittest.IsolatedAsyncioTestCase):
                 await pilot.pause()
                 self.assertIsInstance(app.screen, LoopScreen)
 
+                await app.pop_screen()
+                await pilot.pause()
+
+                await app.push_screen(WorkerScreen(parent_id="m_parent", run_title="PRD Run"))
+                await pilot.pause()
+                self.assertIsInstance(app.screen, WorkerScreen)
+
     async def test_new_session_key_opens_modal_without_worker_crash(self) -> None:
         app = DashboardHarness()
 
@@ -433,6 +444,63 @@ class DashboardTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(captured["mission"].goal, "PRD Runs coordinator")
         self.assertEqual(captured["mission"].cmd, "codex --coordinator")
         self.assertEqual(captured["attach"], (run, captured["mission"]))
+
+    async def test_worker_result_spawns_child_under_prd_parent(self) -> None:
+        app = DashboardHarness()
+        app.iterm_conn = object()
+        captured = {}
+        run = SimpleNamespace(
+            parent_id="m_parent",
+            title="PRD Runs",
+            prd_path=SimpleNamespace(parent="/tmp"),
+            status_path="/tmp/status.md",
+            prompt_path="/tmp/prompt.md",
+        )
+
+        async def fake_spawn_tab(connection, *, command, goal):
+            captured["spawn"] = (connection, command, goal)
+            return SimpleNamespace(tab_id="tab-worker", session_id="session-worker")
+
+        def fake_upsert(mission):
+            mission.mission_id = "m_worker"
+            captured["mission"] = mission
+
+        def fake_attach(created_run, mission, *, scope="", verification=""):
+            captured["attach"] = (created_run, mission, scope, verification)
+
+        with patch.object(
+            dashboard.prd_runs, "run_from_parent", new=lambda parent_id: run
+        ), patch.object(
+            dashboard.prd_runs, "worker_command", new=lambda cmd, run, worker_goal, scope="", verification="": f"{cmd} --worker"
+        ), patch.object(
+            dashboard.prd_runs, "attach_worker", new=fake_attach
+        ), patch.object(
+            dashboard.iterm_client, "spawn_tab", new=fake_spawn_tab
+        ), patch.object(
+            dashboard.db, "upsert", new=fake_upsert
+        ), patch.object(
+            dashboard.ledger_mod, "log_action", new=lambda *args, **kwargs: 1
+        ), patch.object(
+            dashboard.ctx_mod, "write_context_file", new=lambda: None
+        ), patch.object(
+            dashboard.ctx_mod, "write_context_json", new=lambda: None
+        ):
+            await app._handle_worker_result(WorkerRequest(
+                parent_id="m_parent",
+                goal="implement worker tree",
+                command="codex",
+                scope="morpheus/dashboard.py",
+                verification="pytest tests/test_dashboard.py",
+            ))
+
+        connection, command, goal = captured["spawn"]
+        self.assertIs(connection, app.iterm_conn)
+        self.assertEqual(command, "codex --worker")
+        self.assertEqual(goal, "implement worker tree")
+        self.assertEqual(captured["mission"].mission_id, "m_worker")
+        self.assertEqual(captured["attach"][0], run)
+        self.assertEqual(captured["attach"][2], "morpheus/dashboard.py")
+        self.assertEqual(captured["attach"][3], "pytest tests/test_dashboard.py")
 
     async def test_post_note_key_opens_modal_and_records_note(self) -> None:
         app = DashboardHarness()

@@ -153,6 +153,24 @@ class LoopRequest:
 
 
 @dataclass
+class WorkerRequest:
+    parent_id: str
+    goal: str
+    command: str
+    scope: str = ""
+    verification: str = ""
+
+
+@dataclass
+class MissionRowRef:
+    tab_id: str = ""
+    mission_id: str = ""
+    parent_id: str = ""
+    role: str = ""
+    virtual: bool = False
+
+
+@dataclass
 class StreamShard:
     tab_id: str
     text: str
@@ -552,6 +570,7 @@ class MissionsTable(DataTable):
         self.cursor_type = "row"
         self.zebra_stripes = False
         self.row_tab_ids: list[str] = []
+        self.row_refs: list[MissionRowRef] = []
 
     def on_mount(self) -> None:
         self.add_columns("ID", "ST", "GOAL", "AGE", "LAST EVENT")
@@ -560,32 +579,104 @@ class MissionsTable(DataTable):
         self,
         missions: list[db.Mission],
         flashing: dict[str, tuple[float, str]],
+        prd_parents: Optional[list[db.MissionMemory]] = None,
+        prd_edges: Optional[list[db.MissionEdge]] = None,
     ) -> None:
-        # Preserve cursor position by tab_id across refreshes when possible.
-        prior_tab = self.row_tab_ids[self.cursor_row] if (
-            self.row_tab_ids and 0 <= self.cursor_row < len(self.row_tab_ids)
+        # Preserve cursor position by live tab or virtual mission across refreshes.
+        prior_ref = self.row_refs[self.cursor_row] if (
+            self.row_refs and 0 <= self.cursor_row < len(self.row_refs)
         ) else None
 
         self.clear()
         self.row_tab_ids = []
+        self.row_refs = []
 
         sorted_m = sorted(missions, key=_sort_key)
+        missions_by_id = {m.mission_id: m for m in missions if m.mission_id}
+        child_ids: set[str] = set()
+        rows: list[tuple[MissionRowRef, Optional[db.Mission], Optional[db.MissionMemory], str]] = []
+
+        parents = sorted(
+            prd_parents or [],
+            key=lambda mem: mem.updated_at,
+            reverse=True,
+        )
+        edges = prd_edges or []
+        children_by_parent: dict[str, list[db.MissionEdge]] = {}
+        for edge in edges:
+            if edge.relation in {"coordinator", "worker"}:
+                children_by_parent.setdefault(edge.from_id, []).append(edge)
+
+        for parent in parents:
+            rows.append((
+                MissionRowRef(mission_id=parent.mission_id, role="prd", virtual=True),
+                None,
+                parent,
+                "",
+            ))
+            children = sorted(
+                children_by_parent.get(parent.mission_id, []),
+                key=lambda edge: (0 if edge.relation == "coordinator" else 1, edge.created_at),
+            )
+            for edge in children:
+                child = missions_by_id.get(edge.to_id)
+                if child is None:
+                    continue
+                child_ids.add(child.mission_id)
+                rows.append((
+                    MissionRowRef(
+                        tab_id=child.tab_id,
+                        mission_id=child.mission_id,
+                        parent_id=parent.mission_id,
+                        role=edge.relation,
+                    ),
+                    child,
+                    None,
+                    "  └ " if edge == children[-1] else "  ├ ",
+                ))
+
+        for mission in sorted_m:
+            if mission.mission_id and mission.mission_id in child_ids:
+                continue
+            rows.append((
+                MissionRowRef(tab_id=mission.tab_id, mission_id=mission.mission_id),
+                mission,
+                None,
+                "",
+            ))
+
         now = time.time()
 
-        for m in sorted_m:
-            self.row_tab_ids.append(m.tab_id)
-            emoji = naming.STATE_EMOJI.get(m.state, "⚪")
-            age = naming.format_age(naming.now_minus(m.buffer_changed_at))
-            tab_short = (m.tab_id or "?").split("-")[0]
-            goal_disp = m.goal or "(untitled)"
-            last_evt = m.last_event or "—"
+        for row_ref, mission, parent, prefix in rows:
+            self.row_refs.append(row_ref)
+            self.row_tab_ids.append(row_ref.tab_id)
+            if parent is not None:
+                emoji = "▣"
+                age = naming.format_age(naming.now_minus(parent.updated_at))
+                tab_short = "PRD"
+                goal_disp = parent.title or parent.mission_id
+                last_evt = parent.next_step or "PRD run"
+                cell_style = "bold bright_green"
+            else:
+                assert mission is not None
+                emoji = naming.STATE_EMOJI.get(mission.state, "⚪")
+                age = naming.format_age(naming.now_minus(mission.buffer_changed_at))
+                tab_short = (mission.tab_id or "?").split("-")[0]
+                role = f"{row_ref.role}: " if row_ref.role else ""
+                goal_disp = f"{prefix}{role}{mission.goal or '(untitled)'}"
+                last_evt = mission.last_event or "—"
 
-            flash = flashing.get(m.tab_id)
+                flash = flashing.get(mission.tab_id)
+                if flash and flash[0] > now:
+                    bg = FLASH_BG.get(flash[1], "color(238)")
+                    cell_style = f"bold bright_white on {bg}"
+                else:
+                    cell_style = STATE_TEXT_STYLE.get(mission.state, COL_BODY)
+
+            flash = flashing.get(row_ref.tab_id)
             if flash and flash[0] > now:
                 bg = FLASH_BG.get(flash[1], "color(238)")
                 cell_style = f"bold bright_white on {bg}"
-            else:
-                cell_style = STATE_TEXT_STYLE.get(m.state, COL_BODY)
 
             self.add_row(
                 Text(tab_short, style=cell_style),
@@ -595,18 +686,32 @@ class MissionsTable(DataTable):
                 Text(last_evt, style=cell_style),
             )
 
-        # Restore cursor to the same tab if it still exists.
-        if prior_tab and prior_tab in self.row_tab_ids:
-            self.move_cursor(row=self.row_tab_ids.index(prior_tab))
+        # Restore cursor to the same tab/mission if it still exists.
+        if prior_ref:
+            for idx, row_ref in enumerate(self.row_refs):
+                if prior_ref.tab_id and row_ref.tab_id == prior_ref.tab_id:
+                    self.move_cursor(row=idx)
+                    break
+                if prior_ref.virtual and row_ref.virtual and row_ref.mission_id == prior_ref.mission_id:
+                    self.move_cursor(row=idx)
+                    break
 
     def selected_tab_id(self) -> Optional[str]:
-        if not self.row_tab_ids:
+        ref = self.selected_ref()
+        return ref.tab_id if ref and ref.tab_id else None
+
+    def selected_mission_id(self) -> Optional[str]:
+        ref = self.selected_ref()
+        return ref.mission_id if ref and ref.mission_id else None
+
+    def selected_ref(self) -> Optional[MissionRowRef]:
+        if not self.row_refs:
             return None
         if self.cursor_row is None or self.cursor_row < 0:
             return None
-        if self.cursor_row >= len(self.row_tab_ids):
+        if self.cursor_row >= len(self.row_refs):
             return None
-        return self.row_tab_ids[self.cursor_row]
+        return self.row_refs[self.cursor_row]
 
 
 # ── selected mission card ─────────────────────────────────────────────────
@@ -1001,6 +1106,96 @@ class LoopScreen(ModalScreen[Optional[LoopRequest]]):
         self.dismiss(None)
 
 
+class WorkerScreen(ModalScreen[Optional[WorkerRequest]]):
+    """Spawn a manual child worker under a PRD run."""
+
+    CSS = """
+    WorkerScreen { align: center middle; }
+    #dialog {
+        width: 82;
+        height: 20;
+        border: round ansi_bright_green;
+        background: black;
+        padding: 1 2;
+    }
+    #dialog Label.title {
+        color: ansi_bright_green;
+        text-style: bold;
+        margin-bottom: 1;
+    }
+    #dialog Label.hint {
+        color: grey;
+        margin-bottom: 1;
+    }
+    Input {
+        background: black;
+        color: ansi_bright_green;
+        border: round green;
+        margin-bottom: 1;
+    }
+    Input:focus { border: round ansi_bright_green; }
+    Button { margin-right: 2; }
+    """
+
+    BINDINGS = [
+        Binding("escape", "cancel", "cancel"),
+    ]
+
+    def __init__(self, *, parent_id: str, run_title: str):
+        super().__init__()
+        self.parent_id = parent_id
+        self.run_title = run_title
+
+    def compose(self) -> ComposeResult:
+        with Container(id="dialog"):
+            yield Label(f"{RABBIT}  NEW PRD WORKER", classes="title")
+            yield Label(f"parent: {self.run_title}", classes="hint")
+            yield Input(placeholder="worker goal, e.g. implement loop run table", id="worker_goal")
+            yield Input(value="codex", placeholder="command, e.g. codex", id="worker_command")
+            yield Input(placeholder="owned scope/files, e.g. morpheus/dashboard.py only", id="worker_scope")
+            yield Input(placeholder="verification, e.g. pytest tests/test_dashboard.py", id="worker_verify")
+            with Horizontal():
+                yield Button("spawn", variant="primary", id="worker_spawn")
+                yield Button("cancel", id="worker_cancel")
+
+    def on_mount(self) -> None:
+        self.query_one("#worker_goal", Input).focus()
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        order = ["worker_goal", "worker_command", "worker_scope", "worker_verify"]
+        if event.input.id in order:
+            idx = order.index(event.input.id)
+            if idx < len(order) - 1:
+                self.query_one(f"#{order[idx + 1]}", Input).focus()
+            else:
+                self.action_submit()
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "worker_spawn":
+            self.action_submit()
+        else:
+            self.action_cancel()
+
+    def action_submit(self) -> None:
+        goal = self.query_one("#worker_goal", Input).value.strip()
+        command = self.query_one("#worker_command", Input).value.strip() or "codex"
+        scope = self.query_one("#worker_scope", Input).value.strip()
+        verification = self.query_one("#worker_verify", Input).value.strip()
+        if not goal:
+            self.query_one("#worker_goal", Input).focus()
+            return
+        self.dismiss(WorkerRequest(
+            parent_id=self.parent_id,
+            goal=goal,
+            command=command,
+            scope=scope,
+            verification=verification,
+        ))
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
 # ── main app ──────────────────────────────────────────────────────────────
 
 FOOTER_BINDINGS = [
@@ -1015,6 +1210,7 @@ FOOTER_BINDINGS = [
     Binding("s", "snapshot_session", "snapshot"),
     Binding("slash", "post_note", "note"),
     Binding("l", "new_loop", "loop"),
+    Binding("w", "new_worker", "worker"),
     Binding("r", "refresh_now", "refresh"),
     Binding("q", "quit", "quit"),
     Binding("ctrl+c", "quit", "quit", show=False),
@@ -1219,6 +1415,7 @@ class MorpheusApp(App):
     def _refresh_table(self) -> None:
         try:
             missions = db.all_missions()
+            prd_parents, prd_edges = self._prd_tree_context()
         except Exception:
             return
         # Expire old flashes.
@@ -1226,11 +1423,21 @@ class MorpheusApp(App):
         self.flashing = {k: v for k, v in self.flashing.items() if v[0] > now}
         try:
             table = self.query_one(MissionsTable)
-            table.refresh_rows(missions, self.flashing)
+            table.refresh_rows(missions, self.flashing, prd_parents, prd_edges)
             self._refresh_mission_card(missions)
             self._refresh_live_stream()
         except Exception:
             pass
+
+    def _prd_tree_context(self) -> tuple[list[db.MissionMemory], list[db.MissionEdge]]:
+        parents = [
+            mem for mem in db.all_memory()
+            if mem.topic == "prd-run" or mem.source_kind == "prd"
+        ]
+        edges: list[db.MissionEdge] = []
+        for parent in parents:
+            edges.extend(db.edges_from_id(parent.mission_id, limit=50))
+        return parents, edges
 
     def _selected_tab_id(self) -> Optional[str]:
         try:
@@ -1253,15 +1460,28 @@ class MorpheusApp(App):
             return
 
         tab_id = table.selected_tab_id()
-        if not tab_id:
-            card.update_card(None)
-            return
+        mission_id = table.selected_mission_id()
 
         mission = None
-        if missions is not None:
+        if tab_id and missions is not None:
             mission = next((m for m in missions if m.tab_id == tab_id), None)
-        if mission is None:
+        if tab_id and mission is None:
             mission = db.get(tab_id)
+        if mission is None and mission_id:
+            memory = db.get_memory(mission_id)
+            if memory is not None:
+                mission = db.Mission(
+                    tab_id="",
+                    mission_id=memory.mission_id,
+                    goal=memory.title,
+                    state=memory.phase or "planning",
+                    cmd="prd-run",
+                    buffer_changed_at=memory.updated_at,
+                    last_event=memory.next_step or "PRD run",
+                )
+        if mission is None:
+            card.update_card(None)
+            return
         card.update_card(mission, self.live_buffers.get(tab_id))
 
     # ── change detection / alerts ──────────────────────────────────────────
@@ -1459,6 +1679,16 @@ class MorpheusApp(App):
             if mission and mission.mission_id:
                 target_mission_id = mission.mission_id
                 target_label = f"{mission.goal or target_tab_id.split('-')[0]} ({target_tab_id.split('-')[0]})"
+        else:
+            try:
+                mission_id = self.query_one(MissionsTable).selected_mission_id()
+            except Exception:
+                mission_id = None
+            if mission_id:
+                memory = db.get_memory(mission_id)
+                if memory is not None:
+                    target_mission_id = memory.mission_id
+                    target_label = memory.title or memory.mission_id
         self.push_screen(
             LoopScreen(
                 target_label=target_label,
@@ -1467,6 +1697,42 @@ class MorpheusApp(App):
             ),
             self._handle_loop_result,
         )
+
+    def action_new_worker(self) -> None:
+        if self.iterm_conn is None:
+            return
+        parent_id = self._selected_prd_parent_id()
+        if not parent_id:
+            self._push_alert(Alert(
+                time.time(),
+                "error",
+                "select a PRD run parent/coordinator/worker before spawning a worker",
+            ))
+            return
+        try:
+            run = prd_runs.run_from_parent(parent_id)
+        except Exception as e:
+            self._push_alert(Alert(time.time(), "error", f"worker spawn failed: {e}"))
+            return
+        self.push_screen(
+            WorkerScreen(parent_id=run.parent_id, run_title=run.title),
+            self._handle_worker_result,
+        )
+
+    def _selected_prd_parent_id(self) -> Optional[str]:
+        try:
+            ref = self.query_one(MissionsTable).selected_ref()
+        except Exception:
+            return None
+        if ref is None:
+            return None
+        if ref.virtual and ref.role == "prd":
+            return ref.mission_id
+        if ref.parent_id:
+            return ref.parent_id
+        if ref.mission_id:
+            return prd_runs.parent_for_child(ref.mission_id)
+        return None
 
     def _handle_loop_result(self, result: Optional[LoopRequest]) -> None:
         if result is None:
@@ -1511,6 +1777,72 @@ class MorpheusApp(App):
             time.time(),
             "spawn",
             f"loop [{loop.name}] every {loops_mod.format_interval(loop.interval_seconds)}{target}",
+        ))
+
+    async def _handle_worker_result(self, result: Optional[WorkerRequest]) -> None:
+        if result is None:
+            return
+        if self.iterm_conn is None:
+            return
+        try:
+            run = prd_runs.run_from_parent(result.parent_id)
+            cmd = prd_runs.worker_command(
+                result.command,
+                run,
+                worker_goal=result.goal,
+                scope=result.scope,
+                verification=result.verification,
+            )
+        except Exception as e:
+            self._push_alert(Alert(time.time(), "error", f"worker spawn failed: {e}"))
+            return
+        try:
+            info = await iterm_client.spawn_tab(self.iterm_conn, command=cmd, goal=result.goal)
+        except Exception as e:
+            self._push_alert(Alert(time.time(), "error", f"worker spawn failed: {e}"))
+            return
+        if info is None:
+            self._push_alert(Alert(time.time(), "error", "worker spawn failed — is iTerm focused?"))
+            return
+
+        now = time.time()
+        mission = db.Mission(
+            tab_id=info.tab_id,
+            session_id=info.session_id,
+            goal=result.goal,
+            state="working",
+            cmd=cmd,
+            linked_worktree=str(run.prd_path.parent) if run.prd_path else "",
+            buffer_changed_at=now,
+            last_event_at=now,
+            created_at=now,
+        )
+        db.upsert(mission)
+        prd_runs.attach_worker(
+            run,
+            mission,
+            scope=result.scope,
+            verification=result.verification,
+        )
+        ledger_mod.log_action(
+            "worker_spawn",
+            tab_id=mission.tab_id,
+            details={
+                "mission_id": mission.mission_id,
+                "parent_mission_id": run.parent_id,
+                "scope": result.scope,
+                "verification": result.verification,
+            },
+        )
+        try:
+            ctx_mod.write_context_file()
+            ctx_mod.write_context_json()
+        except Exception:
+            pass
+        self._push_alert(Alert(
+            time.time(),
+            "spawn",
+            f"worker [{result.goal}] spawned under {run.title} {info.tab_id.split('-')[0]}",
         ))
 
     async def _handle_new_session_result(self, result: Optional[NewSessionRequest]) -> None:
@@ -1563,6 +1895,13 @@ class MorpheusApp(App):
                 mission = db.get(tab_id)
                 if mission and mission.linked_worktree:
                     return Path(mission.linked_worktree)
+            mission_id = table.selected_mission_id()
+            if mission_id:
+                memory = db.get_memory(mission_id)
+                if memory and memory.source_ref:
+                    source = Path(memory.source_ref).expanduser()
+                    if source.exists():
+                        return source.parent if source.is_file() else source
         except Exception:
             pass
         return Path.cwd()
