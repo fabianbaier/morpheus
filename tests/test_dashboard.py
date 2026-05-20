@@ -180,6 +180,16 @@ class DashboardTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(captured["event"]["actor"], "morpheus")
         self.assertEqual(captured["event"]["summary"], alert.text)
 
+    def test_scan_new_missions_silently_drops_self_tab(self) -> None:
+        app = MorpheusApp()
+        app.self_tab_id = "self-tab"
+        app.last_seen_tabs = {"self-tab"}
+
+        app._scan_new_missions([])
+
+        self.assertEqual(len(app.alerts), 0)
+        self.assertEqual(app.last_seen_tabs, set())
+
     async def test_dashboard_and_modal_css_mounts(self) -> None:
         app = DashboardHarness()
 

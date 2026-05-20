@@ -37,7 +37,9 @@ def setup_logging(verbose: bool = False) -> logging.Logger:
 
 
 async def _tick(connection, log: logging.Logger,
-                on_state_change=None, on_alert=None, on_tab_observed=None) -> int:
+                on_state_change=None, on_alert=None, on_tab_observed=None,
+                ignored_tab_ids: set[str] | None = None,
+                ignored_session_ids: set[str] | None = None) -> int:
     """One observation cycle. Returns count of tabs processed.
 
     `on_alert(kind, mission, text)` fires for v0.4 derived alerts (token guard,
@@ -47,15 +49,18 @@ async def _tick(connection, log: logging.Logger,
     seen_ids = []
     now = time.time()
     cfg = cfg_mod.load()
+    ignored_tab_ids = ignored_tab_ids or set()
+    ignored_session_ids = ignored_session_ids or set()
 
     # tab_id -> cwd  for worktree-collision detection at end of tick.
     cwd_by_tab: dict[str, str] = {}
 
     for tab in tabs:
-        seen_ids.append(tab.tab_id)
-        # Skip the Morpheus tab itself.
-        if naming.is_morpheus_tab(tab.current_name):
+        # Skip Morpheus cockpit tabs before adding them to seen_ids, so any
+        # accidental prior self-mission is reconciled away on this tick.
+        if _should_ignore_tab(tab, ignored_tab_ids, ignored_session_ids):
             continue
+        seen_ids.append(tab.tab_id)
 
         prev = db.get(tab.tab_id) or db.Mission(
             tab_id=tab.tab_id,
@@ -137,7 +142,38 @@ async def _tick(connection, log: logging.Logger,
     # Heartbeat so `morpheus daemon-status` can tell we're alive.
     daemon_mod.write_beacon()
 
-    return len(tabs)
+    return len(seen_ids)
+
+
+def _should_ignore_tab(
+    tab: iterm_client.TabInfo,
+    ignored_tab_ids: set[str] | None = None,
+    ignored_session_ids: set[str] | None = None,
+) -> bool:
+    ignored_tab_ids = ignored_tab_ids or set()
+    ignored_session_ids = ignored_session_ids or set()
+    if tab.tab_id in ignored_tab_ids:
+        return True
+    if tab.session_id in ignored_session_ids:
+        return True
+    if naming.is_morpheus_tab(tab.current_name):
+        return True
+    return _looks_like_morpheus_dashboard(tab.buffer)
+
+
+def _looks_like_morpheus_dashboard(buffer: str) -> bool:
+    normalized = buffer.lower()
+    required = ("morpheus", "mission control", "follow the white rabbit")
+    if not all(marker in normalized for marker in required):
+        return False
+    cockpit_markers = (
+        "mission card",
+        "palette",
+        "snapshot",
+        "prune",
+        "focus tab",
+    )
+    return any(marker in normalized for marker in cockpit_markers)
 
 
 async def _check_token_guard(mission: db.Mission, prev_state: str, new_state: str,

@@ -212,9 +212,10 @@ Next implementation phases:
 3. Live terminal streams in the cockpit. Done in `0.7.0a3`.
 4. Session-end rabbit ticker headlines. Done in `0.7.0a4`.
 5. Matrix rain output shards. Done in `0.7.0a5`.
-6. Edit mission flow for why/plan/next/provenance/proof fields.
-7. `b` brief-selected using mission graph plus transcript tail.
-8. Resume-fresh flow that snapshots, archives old attachment, and spawns a new
+6. Robust self-tab exclusion. Done in `0.7.0a6`.
+7. Edit mission flow for why/plan/next/provenance/proof fields.
+8. `b` brief-selected using mission graph plus transcript tail.
+9. Resume-fresh flow that snapshots, archives old attachment, and spawns a new
    session linked by a `spawned_from` edge.
 
 > "I can only show you the door. You're the one that has to walk through it."

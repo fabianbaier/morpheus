@@ -843,6 +843,8 @@ class MorpheusApp(App):
         self.last_seen_tabs: set[str] = set()
         self.last_seen_note_id: int = 0
         self.live_buffers: dict[str, LiveBuffer] = {}
+        self.self_tab_id: Optional[str] = None
+        self.self_session_id: Optional[str] = None
         self.log_handle = None
 
     # ── compose ────────────────────────────────────────────────────────────
@@ -907,6 +909,8 @@ class MorpheusApp(App):
         tab = window.current_tab
         if tab is None or tab.current_session is None:
             return
+        self.self_tab_id = tab.tab_id
+        self.self_session_id = tab.current_session.session_id
         try:
             await tab.current_session.async_set_name(naming.MORPHEUS_TAB_PREFIX)
         except Exception:
@@ -923,6 +927,8 @@ class MorpheusApp(App):
                 on_state_change=self._on_state_change,
                 on_alert=self._on_alert,
                 on_tab_observed=self._on_tab_observed,
+                ignored_tab_ids={self.self_tab_id} if self.self_tab_id else set(),
+                ignored_session_ids={self.self_session_id} if self.self_session_id else set(),
             )
             missions = db.all_missions()
             self._scan_new_missions(missions)
@@ -1062,6 +1068,9 @@ class MorpheusApp(App):
                 f"new session [{m.goal or '(untitled)'}] {t.split('-')[0]}",
             ))
         for t in closed_tabs:
+            if self._is_self_tab_id(t):
+                self.live_buffers.pop(t, None)
+                continue
             live = self.live_buffers.pop(t, None)
             goal = (live.goal if live else "") or t.split("-")[0]
             headline = _session_headline(live.buffer if live else "")
@@ -1071,6 +1080,9 @@ class MorpheusApp(App):
                 f"closed [{goal}]{detail}",
             ))
         self.last_seen_tabs = current
+
+    def _is_self_tab_id(self, tab_id: str) -> bool:
+        return bool(self.self_tab_id and tab_id == self.self_tab_id)
 
     def _scan_new_notes(self) -> None:
         recent = db.recent_notes(limit=12)
