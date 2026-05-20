@@ -18,12 +18,15 @@ The morpheus tab is your command center; the iTerm tabs are your workers.
 from __future__ import annotations
 
 import asyncio
+import fcntl
 import json
 import random
 import re
 import shlex
+import tempfile
 import time
 from collections import deque
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -110,11 +113,97 @@ MISSION_CARD_OUTPUT_LINES = 18
 MISSION_CARD_EXPANDED_OUTPUT_LINES = 10
 READY_RECONCILE_SECONDS = 5 * 60.0
 SNAPSHOT_DIR = Path.home() / ".morpheus" / "snapshots"
+PRD_TREE_STATE_PATH = Path.home() / ".morpheus" / "dashboard_prd_tree_state.json"
 
 # Sort order for the missions table when there are no flashes pulling
 # things up — newest activity first.
 def _sort_key(m: db.Mission):
     return -m.buffer_changed_at
+
+
+def _load_prd_collapsed_ids(path: Optional[Path] = None) -> set[str]:
+    path = path or PRD_TREE_STATE_PATH
+    if not path.exists():
+        return set()
+    raw = json.loads(path.read_text(encoding="utf-8"))
+
+    ids = raw.get("collapsed_prd_parent_ids", []) if isinstance(raw, dict) else raw
+    if not isinstance(ids, list):
+        raise ValueError("PRD tree state must contain a list of collapsed parent ids")
+    return {item for item in ids if isinstance(item, str) and item}
+
+
+def _save_prd_collapsed_ids(
+    collapsed_ids: set[str],
+    path: Optional[Path] = None,
+) -> bool:
+    path = path or PRD_TREE_STATE_PATH
+    try:
+        with _prd_tree_state_lock(path):
+            _write_prd_collapsed_ids(collapsed_ids, path)
+        return True
+    except Exception:
+        return False
+
+
+def _toggle_prd_collapsed_id(
+    parent_id: str,
+    path: Optional[Path] = None,
+) -> tuple[set[str], str]:
+    path = path or PRD_TREE_STATE_PATH
+    with _prd_tree_state_lock(path):
+        collapsed_ids = _load_prd_collapsed_ids(path)
+        if parent_id in collapsed_ids:
+            collapsed_ids.remove(parent_id)
+            state = "expanded"
+        else:
+            collapsed_ids.add(parent_id)
+            state = "collapsed"
+        _write_prd_collapsed_ids(collapsed_ids, path)
+    return collapsed_ids, state
+
+
+@contextmanager
+def _prd_tree_state_lock(path: Path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = path.with_suffix(path.suffix + ".lock")
+    with lock_path.open("a", encoding="utf-8") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+def _write_prd_collapsed_ids(collapsed_ids: set[str], path: Path) -> None:
+    payload = json.dumps(
+        {
+            "version": 1,
+            "collapsed_prd_parent_ids": sorted(collapsed_ids),
+        },
+        indent=2,
+        sort_keys=True,
+    ) + "\n"
+    tmp_name = ""
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as tmp:
+            tmp.write(payload)
+            tmp_name = tmp.name
+        Path(tmp_name).replace(path)
+    except Exception:
+        if tmp_name:
+            try:
+                Path(tmp_name).unlink(missing_ok=True)
+            except Exception:
+                pass
+        raise
 
 
 @dataclass
@@ -217,6 +306,8 @@ class MissionRowRef:
     parent_id: str = ""
     role: str = ""
     virtual: bool = False
+    expanded: bool = True
+    child_count: int = 0
 
 
 @dataclass
@@ -702,6 +793,7 @@ class MissionsTable(DataTable):
         prd_parents: Optional[list[db.MissionMemory]] = None,
         prd_edges: Optional[list[db.MissionEdge]] = None,
         closed_memories: Optional[list[db.MissionMemory]] = None,
+        collapsed_prd_ids: Optional[set[str]] = None,
     ) -> None:
         # Preserve cursor position by live tab or virtual mission across refreshes.
         prior_ref = self.row_refs[self.cursor_row] if (
@@ -715,6 +807,7 @@ class MissionsTable(DataTable):
         sorted_m = sorted(missions, key=_sort_key)
         missions_by_id = {m.mission_id: m for m in missions if m.mission_id}
         child_ids: set[str] = set()
+        collapsed_prd_ids = collapsed_prd_ids or set()
         rows: list[tuple[MissionRowRef, Optional[db.Mission], Optional[db.MissionMemory], str]] = []
 
         parents = sorted(
@@ -729,21 +822,34 @@ class MissionsTable(DataTable):
                 children_by_parent.setdefault(edge.from_id, []).append(edge)
 
         for parent in parents:
-            rows.append((
-                MissionRowRef(mission_id=parent.mission_id, role="prd", virtual=True),
-                None,
-                parent,
-                "",
-            ))
             children = sorted(
                 children_by_parent.get(parent.mission_id, []),
                 key=lambda edge: (0 if edge.relation == "coordinator" else 1, edge.created_at),
             )
+            live_children: list[tuple[db.MissionEdge, db.Mission]] = []
             for edge in children:
                 child = missions_by_id.get(edge.to_id)
                 if child is None:
                     continue
                 child_ids.add(child.mission_id)
+                live_children.append((edge, child))
+
+            expanded = parent.mission_id not in collapsed_prd_ids
+            rows.append((
+                MissionRowRef(
+                    mission_id=parent.mission_id,
+                    role="prd",
+                    virtual=True,
+                    expanded=expanded,
+                    child_count=len(live_children),
+                ),
+                None,
+                parent,
+                "",
+            ))
+            if not expanded:
+                continue
+            for idx, (edge, child) in enumerate(live_children):
                 rows.append((
                     MissionRowRef(
                         tab_id=child.tab_id,
@@ -753,7 +859,7 @@ class MissionsTable(DataTable):
                     ),
                     child,
                     None,
-                    "  └ " if edge == children[-1] else "  ├ ",
+                    "  └ " if idx == len(live_children) - 1 else "  ├ ",
                 ))
 
         for mission in sorted_m:
@@ -790,11 +896,19 @@ class MissionsTable(DataTable):
                     last_evt = f"resume {provider}{confidence}"
                     cell_style = COL_MUTED
                 else:
-                    emoji = "▣"
+                    emoji = "▾" if row_ref.expanded else "▸"
                     age = naming.format_age(naming.now_minus(parent.updated_at))
                     tab_short = "PRD"
                     goal_disp = parent.title or parent.mission_id
-                    last_evt = parent.next_step or "PRD run"
+                    child_label = (
+                        f"{row_ref.child_count} child"
+                        if row_ref.child_count == 1
+                        else f"{row_ref.child_count} children"
+                    )
+                    state_label = "expanded" if row_ref.expanded else "collapsed"
+                    last_evt = f"{state_label} · {child_label}"
+                    if parent.next_step:
+                        last_evt = f"{last_evt} · {parent.next_step}"
                     cell_style = "bold bright_green"
             else:
                 assert mission is not None
@@ -832,6 +946,9 @@ class MissionsTable(DataTable):
                     self.move_cursor(row=idx)
                     break
                 if prior_ref.virtual and row_ref.virtual and row_ref.mission_id == prior_ref.mission_id:
+                    self.move_cursor(row=idx)
+                    break
+                if prior_ref.parent_id and row_ref.virtual and row_ref.mission_id == prior_ref.parent_id:
                     self.move_cursor(row=idx)
                     break
 
@@ -2026,6 +2143,7 @@ FOOTER_BINDINGS = [
     Binding("slash", "post_note", "note"),
     Binding("l", "new_loop", "loop"),
     Binding("shift+l", "manage_loops", "loops"),
+    Binding("t", "toggle_prd_tree", "tree"),
     Binding("w", "new_worker", "worker"),
     Binding("r", "resume_fresh", "resume"),
     Binding("ctrl+r", "refresh_now", "refresh", show=False),
@@ -2132,6 +2250,7 @@ class MorpheusApp(App):
         self.self_tab_id: Optional[str] = None
         self.self_session_id: Optional[str] = None
         self.current_missions: list[db.Mission] = []
+        self.prd_collapsed_ids: set[str] = set()
         self._rain_backoff_until = 0.0
         self.log_handle = None
 
@@ -2182,6 +2301,10 @@ class MorpheusApp(App):
 
     async def on_mount(self) -> None:
         self.log_handle = core.setup_logging()
+        try:
+            self.prd_collapsed_ids = _load_prd_collapsed_ids()
+        except Exception as e:
+            self._push_alert(Alert(time.time(), "error", f"PRD tree state load failed: {e}"))
         self._apply_layout_mode()
 
         # Watermarks so we don't replay existing notes/sessions as fresh alerts.
@@ -2312,13 +2435,24 @@ class MorpheusApp(App):
             closed_memories = self._closed_resumable_memories(missions)
         except Exception:
             return
+        try:
+            self.prd_collapsed_ids = _load_prd_collapsed_ids()
+        except Exception as e:
+            self._push_alert(Alert(time.time(), "error", f"PRD tree state load failed: {e}"))
         self.current_missions = missions
         # Expire old flashes.
         now = time.time()
         self.flashing = {k: v for k, v in self.flashing.items() if v[0] > now}
         try:
             table = self.query_one(MissionsTable)
-            table.refresh_rows(missions, self.flashing, prd_parents, prd_edges, closed_memories)
+            table.refresh_rows(
+                missions,
+                self.flashing,
+                prd_parents,
+                prd_edges,
+                closed_memories,
+                self.prd_collapsed_ids,
+            )
             self._refresh_mission_card(missions)
             self._refresh_live_stream(render=False, sync=False)
         except Exception:
@@ -2545,7 +2679,49 @@ class MorpheusApp(App):
         except Exception:
             pass
 
+    def _selected_prd_parent_row_id(self) -> Optional[str]:
+        try:
+            ref = self.query_one(MissionsTable).selected_ref()
+        except Exception:
+            return None
+        if ref and ref.virtual and ref.role == "prd" and ref.mission_id:
+            return ref.mission_id
+        return None
+
+    def _selected_prd_tree_parent_id(self) -> Optional[str]:
+        try:
+            ref = self.query_one(MissionsTable).selected_ref()
+        except Exception:
+            return None
+        if ref is None:
+            return None
+        if ref.virtual and ref.role == "prd" and ref.mission_id:
+            return ref.mission_id
+        return ref.parent_id or None
+
+    def _toggle_prd_parent(self, parent_id: str) -> bool:
+        if not parent_id:
+            return False
+        try:
+            self.prd_collapsed_ids, state = _toggle_prd_collapsed_id(parent_id)
+        except Exception as e:
+            self._push_alert(Alert(
+                time.time(),
+                "error",
+                f"PRD tree state save failed: {e}",
+            ))
+            return False
+        self._refresh_table()
+        self._push_alert(Alert(
+            time.time(),
+            "summary",
+            f"{state} PRD run [{parent_id.split('_')[-1]}]",
+        ))
+        return True
+
     async def action_focus_session(self) -> None:
+        if self._toggle_prd_parent(self._selected_prd_parent_row_id() or ""):
+            return
         if self.iterm_conn is None:
             return
         table = self.query_one(MissionsTable)
@@ -2681,6 +2857,17 @@ class MorpheusApp(App):
             self._refresh_mission_card(db.all_missions())
         except Exception:
             return
+
+    def action_toggle_prd_tree(self) -> None:
+        parent_id = self._selected_prd_tree_parent_id()
+        if not parent_id:
+            self._push_alert(Alert(
+                time.time(),
+                "error",
+                "select a PRD run parent/coordinator/worker before toggling tree state",
+            ))
+            return
+        self._toggle_prd_parent(parent_id)
 
     def action_new_worker(self) -> None:
         if self.iterm_conn is None:
