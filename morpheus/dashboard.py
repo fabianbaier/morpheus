@@ -866,6 +866,7 @@ class MissionsTable(DataTable):
         flashing: dict[str, tuple[float, str]],
         prd_parents: Optional[list[db.MissionMemory]] = None,
         prd_edges: Optional[list[db.MissionEdge]] = None,
+        prompt_loops: Optional[list[db.PromptLoop]] = None,
         closed_memories: Optional[list[db.MissionMemory]] = None,
         collapsed_prd_ids: Optional[set[str]] = None,
     ) -> None:
@@ -882,7 +883,15 @@ class MissionsTable(DataTable):
         missions_by_id = {m.mission_id: m for m in missions if m.mission_id}
         child_ids: set[str] = set()
         collapsed_prd_ids = collapsed_prd_ids or set()
-        rows: list[tuple[MissionRowRef, Optional[db.Mission], Optional[db.MissionMemory], str]] = []
+        rows: list[
+            tuple[
+                MissionRowRef,
+                Optional[db.Mission],
+                Optional[db.MissionMemory],
+                Optional[db.PromptLoop],
+                str,
+            ]
+        ] = []
 
         parents = sorted(
             prd_parents or [],
@@ -919,6 +928,7 @@ class MissionsTable(DataTable):
                 ),
                 None,
                 parent,
+                None,
                 "",
             ))
             if not expanded:
@@ -933,8 +943,22 @@ class MissionsTable(DataTable):
                     ),
                     child,
                     None,
+                    None,
                     "  └ " if idx == len(live_children) - 1 else "  ├ ",
                 ))
+
+        for loop in prompt_loops or []:
+            rows.append((
+                MissionRowRef(
+                    mission_id=f"loop:{loop.id}",
+                    role="loop",
+                    virtual=True,
+                ),
+                None,
+                None,
+                loop,
+                "",
+            ))
 
         for mission in sorted_m:
             if mission.mission_id and mission.mission_id in child_ids:
@@ -942,6 +966,7 @@ class MissionsTable(DataTable):
             rows.append((
                 MissionRowRef(tab_id=mission.tab_id, mission_id=mission.mission_id),
                 mission,
+                None,
                 None,
                 "",
             ))
@@ -951,15 +976,26 @@ class MissionsTable(DataTable):
                 MissionRowRef(mission_id=memory.mission_id, role="closed", virtual=True),
                 None,
                 memory,
+                None,
                 "",
             ))
 
         now = time.time()
 
-        for row_ref, mission, parent, prefix in rows:
+        for row_ref, mission, parent, loop, prefix in rows:
             self.row_refs.append(row_ref)
             self.row_tab_ids.append(row_ref.tab_id)
-            if parent is not None:
+            if loop is not None:
+                emoji = "↻" if loop.status == "active" else "Ⅱ"
+                age = loops_mod.format_due(loop.next_run_at)
+                tab_short = "LOOP"
+                goal_disp = f"loop: {loop.name}"
+                target = _loop_target_label(loop)
+                last = loop.last_summary or "no runs yet"
+                last_status = loop.last_run_status or loop.status
+                last_evt = f"{last_status} · {target} · {last}"
+                cell_style = "bold yellow" if loop.status == "active" else COL_MUTED
+            elif parent is not None:
                 if row_ref.role == "closed":
                     emoji = "↻"
                     age = naming.format_age(naming.now_minus(parent.closed_at or parent.archived_at or parent.updated_at))
@@ -2511,6 +2547,7 @@ FOOTER_BINDINGS = [
     Binding("slash", "post_note", "note"),
     Binding("l", "new_loop", "loop"),
     Binding("shift+l", "manage_loops", "loops"),
+    Binding("upper_l", "manage_loops", "loops", show=False),
     Binding("t", "switch_project", "project"),
     Binding("o", "toggle_prd_tree", "tree"),
     Binding("w", "new_worker", "worker"),
@@ -2854,6 +2891,7 @@ class MorpheusApp(App):
         try:
             missions = self._all_missions()
             prd_parents, prd_edges = self._prd_tree_context()
+            prompt_loops = self._visible_loops()
             closed_memories = self._closed_resumable_memories(missions)
         except Exception:
             return
@@ -2872,6 +2910,7 @@ class MorpheusApp(App):
                 self.flashing,
                 prd_parents,
                 prd_edges,
+                prompt_loops,
                 closed_memories,
                 self.prd_collapsed_ids,
             )
@@ -2901,6 +2940,10 @@ class MorpheusApp(App):
         for parent in parents:
             edges.extend(db.edges_from_id(parent.mission_id, limit=50))
         return parents, edges
+
+    def _visible_loops(self) -> list[db.PromptLoop]:
+        tenant_id = "" if self.show_all else self.tenant_id
+        return db.all_loops(include_paused=True, tenant_id=tenant_id)
 
     def _selected_tab_id(self) -> Optional[str]:
         try:
@@ -2946,6 +2989,24 @@ class MorpheusApp(App):
                     cmd="prd-run",
                     buffer_changed_at=memory.updated_at,
                     last_event=memory.next_step or "PRD run",
+                )
+        if mission is None and mission_id and mission_id.startswith("loop:"):
+            try:
+                loop_id = int(mission_id.split(":", 1)[1])
+                loop = db.get_loop(loop_id)
+            except (TypeError, ValueError):
+                loop = None
+            if loop is not None:
+                mission = db.Mission(
+                    tab_id="",
+                    mission_id=mission_id,
+                    tenant_id=loop.tenant_id,
+                    project_root=loop.project_root,
+                    goal=f"loop: {loop.name}",
+                    state=loop.status,
+                    cmd=loop.command,
+                    buffer_changed_at=loop.last_run_at or loop.updated_at,
+                    last_event=loop.last_summary or f"next {loops_mod.format_due(loop.next_run_at)}",
                 )
         if mission is None:
             card.update_card(None)
@@ -3248,6 +3309,27 @@ class MorpheusApp(App):
                     target_label = memory.title or memory.mission_id
         return target_label, target_mission_id, target_tab_id if target_mission_id else None
 
+    def _loop_project_for(self, target_mission_id: str = "", target_tab_id: Optional[str] = None) -> db.ProjectTenant:
+        if target_mission_id:
+            memory = db.get_memory(target_mission_id)
+            if memory is not None:
+                if memory.tenant_id:
+                    project = db.get_project_tenant(memory.tenant_id)
+                    if project is not None:
+                        return project
+                if memory.project_root:
+                    return tenant_mod.ensure_project_tenant(memory.project_root)
+        if target_tab_id:
+            mission = db.get(target_tab_id)
+            if mission is not None:
+                if mission.tenant_id:
+                    project = db.get_project_tenant(mission.tenant_id)
+                    if project is not None:
+                        return project
+                if mission.project_root:
+                    return tenant_mod.ensure_project_tenant(mission.project_root)
+        return self.project or tenant_mod.ensure_project_tenant(Path.cwd())
+
     def action_new_loop(self) -> None:
         target_label, target_mission_id, target_tab_id = self._loop_target_for_selection()
         self.push_screen(
@@ -3261,7 +3343,7 @@ class MorpheusApp(App):
 
     def action_manage_loops(self) -> None:
         target_label, target_mission_id, target_tab_id = self._loop_target_for_selection()
-        loops = db.all_loops(include_paused=True)
+        loops = self._visible_loops()
         runs_by_loop = {loop.id: db.loop_runs(loop.id, limit=5) for loop in loops}
         self.push_screen(
             LoopManagerScreen(
@@ -3491,11 +3573,14 @@ class MorpheusApp(App):
             return
         try:
             interval = loops_mod.parse_interval(result.interval)
+            project = self._loop_project_for(result.target_mission_id, result.target_tab_id)
             loop = db.create_loop(
                 name=result.name,
                 prompt=result.prompt,
                 interval_seconds=interval,
                 command=result.command,
+                tenant_id=project.tenant_id,
+                project_root=project.root_path,
                 target_mission_id=result.target_mission_id,
                 target_tab_id=result.target_tab_id,
             )
@@ -3528,8 +3613,9 @@ class MorpheusApp(App):
         self._push_alert(Alert(
             time.time(),
             "spawn",
-            f"loop [{loop.name}] every {loops_mod.format_interval(loop.interval_seconds)}{target}",
+            f"loop [{loop.name}] every {loops_mod.format_interval(loop.interval_seconds)}{target} · Shift+L manages loops",
         ))
+        self._refresh_table()
 
     def _handle_loop_action_result(self, result: Optional[LoopActionRequest]) -> None:
         if result is None:
@@ -3610,6 +3696,7 @@ class MorpheusApp(App):
             return
 
         self._push_alert(Alert(time.time(), "summary", message))
+        self._refresh_table()
 
     async def _handle_worker_result(self, result: Optional[WorkerRequest]) -> None:
         if result is None:

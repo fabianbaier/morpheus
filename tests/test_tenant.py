@@ -61,6 +61,47 @@ class TenantTest(unittest.TestCase):
         self.assertEqual([mission.tab_id for mission in missions_a], ["tab-a"])
         self.assertEqual([memory.mission_id for memory in memories_a], [mission_a.mission_id])
 
+    def test_db_filters_loops_by_project_tenant(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            db_dir = root / "db"
+            project_a = db.ProjectTenant(
+                tenant_id=tenant.tenant_id_for_root(root / "a"),
+                name="a",
+                root_path=str(root / "a"),
+                root_kind="cwd",
+            )
+            project_b = db.ProjectTenant(
+                tenant_id=tenant.tenant_id_for_root(root / "b"),
+                name="b",
+                root_path=str(root / "b"),
+                root_kind="cwd",
+            )
+
+            with patch.object(db, "DB_DIR", db_dir), patch.object(db, "DB_PATH", db_dir / "morpheus.db"):
+                project_a = db.upsert_project_tenant(project_a)
+                project_b = db.upsert_project_tenant(project_b)
+                db.create_loop(
+                    "project a loop",
+                    "prompt",
+                    60,
+                    "codex exec",
+                    tenant_id=project_a.tenant_id,
+                    project_root=project_a.root_path,
+                )
+                db.create_loop(
+                    "project b loop",
+                    "prompt",
+                    60,
+                    "codex exec",
+                    tenant_id=project_b.tenant_id,
+                    project_root=project_b.root_path,
+                )
+
+                loops_a = db.all_loops(tenant_id=project_a.tenant_id)
+
+        self.assertEqual([loop.name for loop in loops_a], ["project a loop"])
+
     def test_context_can_be_tenant_scoped(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

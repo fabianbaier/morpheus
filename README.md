@@ -133,7 +133,8 @@ If you start a session from a Markdown source file, Morpheus creates a PRD run:
 Press `l` to create a recurring prompt loop. Loops are useful for repeated
 checks such as "scan for new blockers every 30 minutes" or "summarize market
 catalysts." Loop results show up in the ticker, and targeted loops also attach
-events/artifacts to the selected mission.
+events/artifacts to the selected mission. Project loops appear as `LOOP` rows
+in the cockpit; use `Shift+L` or `L` to manage them.
 
 ### Key Shortcuts
 
@@ -144,7 +145,7 @@ events/artifacts to the selected mission.
 | `n` | New session |
 | `w` | New worker under a PRD run |
 | `l` | New recurring prompt loop |
-| `Shift+l` | Manage loops |
+| `Shift+L` / `L` | Manage loops |
 | `b` | Brief the selected mission from graph + transcript |
 | `e` | Edit mission memory |
 | `space` | Expand/collapse mission card details |
@@ -332,7 +333,10 @@ morpheus loops run-due
 
 From the cockpit, press `l` to create a loop. If a mission is selected, loop
 results route back to that mission as `loop_output` events and `loop-output`
-artifacts; otherwise they report to the ticker/context only.
+artifacts; otherwise they report to the ticker/context only. Loops are visible
+as project-scoped `LOOP` rows, and `Shift+L` / `L` opens the loop manager for
+pause/resume/delete/join controls. The dashboard does not run long loop commands
+inline; use launchd/cron or `morpheus loops run-due`.
 
 ## State Files
 
@@ -379,12 +383,12 @@ output-first mission card, plus a user PATH install target, resume-fresh, and
 MCP mission graph update tools, direct terminal broadcast, dense always-alive
 Matrix rain, live status rain pulses, a low-FPS rain render path, a zoom-safe
 compact cockpit layout, exact Codex closed-session provider resume, closed-row
-dismissal, idle ticker reconciliation, and a skippable Matrix Earth startup
-intro. Success-only focus and closed-row dismiss/prune actions stay out of the
-white-rabbit ticker, and `morpheus activity` exposes the cached live activity
-snapshot without reconnecting to iTerm. `morpheus graph recall-eval` scores
-stale mission recall readiness, and PRD parent rows remember collapsed tree
-state across dashboard restarts.
+dismissal, idle ticker reconciliation, project-scoped loop rows, and a skippable
+Matrix Earth startup intro. Success-only focus and closed-row dismiss/prune
+actions stay out of the white-rabbit ticker, and `morpheus activity` exposes the
+cached live activity snapshot without reconnecting to iTerm. `morpheus graph
+recall-eval` scores stale mission recall readiness, and PRD parent rows remember
+collapsed tree state across dashboard restarts.
 
 Next implementation phases:
 

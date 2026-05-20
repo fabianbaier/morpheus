@@ -71,8 +71,13 @@ def isolated_dashboard_runtime(missions=None, memories=None, edges=None):
         patch.object(dashboard.iterm2.Connection, "async_create", new=fake_async_create),
         patch.object(dashboard.core, "setup_logging", new=lambda: FakeLogger()),
         patch.object(dashboard.db, "recent_notes", new=lambda limit=1: []),
-        patch.object(dashboard.db, "all_missions", new=lambda: list(mission_rows)),
-        patch.object(dashboard.db, "all_memory", new=lambda include_archived=False: list(memory_rows)),
+        patch.object(dashboard.db, "all_missions", new=lambda tenant_id=None: list(mission_rows)),
+        patch.object(
+            dashboard.db,
+            "all_memory",
+            new=lambda include_archived=False, tenant_id=None: list(memory_rows),
+        ),
+        patch.object(dashboard.db, "all_loops", new=lambda include_paused=True, tenant_id="": []),
         patch.object(
             dashboard.db,
             "edges_from_id",
@@ -2095,6 +2100,12 @@ class DashboardTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_loop_key_opens_modal_and_records_loop(self) -> None:
         app = DashboardHarness()
+        app.project = dashboard.db.ProjectTenant(
+            tenant_id="p_test",
+            name="test",
+            root_path="/tmp/test-project",
+        )
+        app.tenant_id = app.project.tenant_id
         done = asyncio.Event()
         captured = {}
 
@@ -2111,6 +2122,8 @@ class DashboardTest(unittest.IsolatedAsyncioTestCase):
             dashboard.ctx_mod, "write_context_file", new=lambda: None
         ), patch.object(
             dashboard.ctx_mod, "write_context_json", new=lambda: None
+        ), patch.object(
+            app, "_refresh_table", new=lambda: None
         ):
             async with app.run_test(size=(120, 40)) as pilot:
                 await pilot.press("l")
@@ -2131,6 +2144,8 @@ class DashboardTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(captured["loop"]["prompt"], "summarize tomorrow's market catalysts")
         self.assertEqual(captured["loop"]["interval_seconds"], 15 * 60)
         self.assertEqual(captured["loop"]["command"], "codex exec")
+        self.assertEqual(captured["loop"]["tenant_id"], "p_test")
+        self.assertEqual(captured["loop"]["project_root"], "/tmp/test-project")
         self.assertEqual(captured["loop"]["target_mission_id"], "")
         self.assertIsNone(captured["loop"]["target_tab_id"])
 
@@ -2161,7 +2176,7 @@ class DashboardTest(unittest.IsolatedAsyncioTestCase):
         )
 
         with isolated_dashboard_runtime(), patch.object(
-            dashboard.db, "all_loops", new=lambda include_paused=True: [loop]
+            dashboard.db, "all_loops", new=lambda include_paused=True, tenant_id="": [loop]
         ), patch.object(
             dashboard.db, "loop_runs", new=lambda loop_id, limit=5: [run]
         ):
@@ -2173,6 +2188,63 @@ class DashboardTest(unittest.IsolatedAsyncioTestCase):
                 detail = app.screen._detail(loop)
                 self.assertIn("market scan", str(detail))
                 self.assertIn("WMT disciplined zone", str(detail))
+
+    async def test_uppercase_loop_key_opens_manager(self) -> None:
+        app = DashboardHarness()
+        loop = dashboard.db.PromptLoop(
+            id=7,
+            name="market scan",
+            prompt="summarize catalysts",
+            interval_seconds=900,
+            command="codex exec",
+            next_run_at=0,
+        )
+
+        with isolated_dashboard_runtime(), patch.object(
+            dashboard.db, "all_loops", new=lambda include_paused=True, tenant_id="": [loop]
+        ), patch.object(
+            dashboard.db, "loop_runs", new=lambda loop_id, limit=5: []
+        ):
+            async with app.run_test(size=(120, 40)) as pilot:
+                await pilot.press("upper_l")
+                await pilot.pause()
+
+                self.assertIsInstance(app.screen, LoopManagerScreen)
+
+    async def test_refresh_table_renders_project_loop_rows(self) -> None:
+        app = DashboardHarness()
+        app.tenant_id = "p_project"
+        loop = dashboard.db.PromptLoop(
+            id=7,
+            name="market scan",
+            prompt="summarize catalysts",
+            interval_seconds=900,
+            command="codex exec",
+            tenant_id="p_project",
+            project_root="/tmp/project",
+            last_summary="WMT disciplined zone",
+            last_run_status="success",
+            next_run_at=0,
+        )
+        captured = {}
+
+        def fake_all_loops(include_paused=True, tenant_id=""):
+            captured["tenant_id"] = tenant_id
+            return [loop]
+
+        with isolated_dashboard_runtime(), patch.object(
+            dashboard.db, "all_loops", new=fake_all_loops
+        ):
+            async with app.run_test(size=(120, 40)) as pilot:
+                app._refresh_table()
+                await pilot.pause()
+
+                table = app.query_one(dashboard.MissionsTable)
+                self.assertEqual(captured["tenant_id"], "p_project")
+                self.assertEqual(table.row_refs[0].role, "loop")
+                self.assertEqual(table.get_row_at(0)[0].plain, "LOOP")
+                self.assertIn("loop: market scan", table.get_row_at(0)[2].plain)
+                self.assertIn("success", table.get_row_at(0)[4].plain)
 
     async def test_loop_manager_join_action_updates_target_and_records_event(self) -> None:
         app = DashboardHarness()

@@ -337,6 +337,7 @@ def loops_add(
 
     target_mission_id = ""
     target_tab_id: Optional[str] = None
+    project = tenant_mod.ensure_project_tenant(Path.cwd())
     if target:
         resolved = graph_mod.resolve(target)
         if resolved is None:
@@ -344,12 +345,16 @@ def loops_add(
             raise typer.Exit(1)
         target_mission_id = resolved.mission_id
         target_tab_id = resolved.live[0].tab_id if resolved.live else None
+        if resolved.memory.tenant_id:
+            project = db.get_project_tenant(resolved.memory.tenant_id) or project
 
     loop = db.create_loop(
         name=name,
         prompt=prompt,
         interval_seconds=interval,
         command=command,
+        tenant_id=project.tenant_id,
+        project_root=project.root_path,
         target_mission_id=target_mission_id,
         target_tab_id=target_tab_id,
     )

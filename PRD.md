@@ -327,6 +327,7 @@ attach.
 | `r` | Resume fresh | Spawns a new session seeded with the snapshot + mission card |
 | `/` | Note / claim | Posts a note or path/worktree claim |
 | `l` | Loop control | Creates a recurring prompt loop routed to ticker/context or the selected mission |
+| `Shift+L` / `L` | Manage loops | Opens the current project's loop manager |
 | `w` | Worker | Spawns a manual child worker under the selected PRD run/coordinator/worker |
 | `p` | Prune | Archives stale/finished sessions after confirmation |
 | `d` | Dismiss / close | Closes selected live tab or archives an already-dead mission |
@@ -512,8 +513,12 @@ Required behavior:
 
 - `l` opens a cockpit loop form. The selected mission becomes the default target
   when one exists; otherwise the loop reports to ticker/context only.
-- Each loop stores: name, prompt, interval, command, target mission/tab,
-  active/paused state, next run time, last run status, and last summary.
+- Each loop stores: name, prompt, interval, command, owning project tenant/root,
+  target mission/tab, active/paused state, next run time, last run status, and
+  last summary.
+- Project-scoped loop rows appear in the cockpit as `LOOP` rows so active,
+  paused, due, and last-run state are visible even when a loop is not attached
+  to a live mission.
 - Due loop execution captures stdout/stderr into
   `~/.morpheus/loops/<loop-id>/<timestamp>.txt`.
 - Every run emits a one-line ticker note (`kind=loop`). If targeted, it also
@@ -527,9 +532,14 @@ Required behavior:
   manually.
 - Minimum interval is 60 seconds to avoid accidental runaway spend.
 
+Implemented cockpit controls:
+
+- `Shift+L` / `L` opens the loop manager for the current project, with recent
+  run history plus pause/resume/delete/join controls.
+
 Future work:
 
-- Dedicated loop management screen for pause/resume/delete/edit.
+- Loop edit controls in the cockpit manager.
 - Optional fan-out where a loop result can draft an instruction for a target
   session, with user approval before sending text.
 - Background LLM summarization for long loop outputs, recorded with provenance
@@ -768,6 +778,8 @@ untrusted hints, not as durable truth.
 | `prompt` | TEXT | Prompt passed to command |
 | `interval_seconds` | REAL | Stored interval; minimum 60s |
 | `command` | TEXT | Command prefix/template, e.g. `codex exec` or `claude -p {prompt}` |
+| `tenant_id` | TEXT | Owning project tenant for dashboard visibility and cleanup |
+| `project_root` | TEXT | Owning project root path |
 | `target_mission_id` | TEXT | Optional mission to receive events/artifacts |
 | `target_tab_id` | TEXT | Optional live tab to attach ticker context |
 | `status` | TEXT | active / paused |
@@ -870,6 +882,7 @@ This table is the source of truth for where the product stands right now.
 | Cached activity snapshot | Implemented in v0.8.0a25 | The watch loop writes `~/.morpheus/activity.json` with per-session headline and tail lines so agents can answer what live sessions are doing from a cached file; `morpheus activity` reads that cache instantly and `--refresh` forces a live iTerm poll only when needed |
 | Newest-first rabbit ticker | Implemented in v0.8.0a3 | Bottom alert strip redraws from the newest-first alert deque so fresh session headlines stay at the top instead of appending chronologically |
 | Prompt loops foundation | Implemented in v0.8.0a4 | `l` creates recurring prompt loops; `morpheus loops run-due` runs due prompts, captures output, publishes ticker notes, and routes graph events/artifacts to target missions |
+| Prompt loop cockpit visibility | Implemented in v0.8.0a27 | Loops now store owning project tenant/root, render as `LOOP` rows in the mission table, and `Shift+L`/`L` opens the current project's loop manager so active/due/last-run state is visible without running loop commands inside the dashboard |
 | PRD Runs foundation | Implemented in v0.8.0a1 | PRD finder, new-session PRD selector, parent mission creation, coordinator prompt/status files, `morpheus run start`, and coordinator graph edge shipped |
 | PRD run tree UI | Partially implemented in v0.8.0a5 | Shows virtual PRD parent rows with coordinator/worker sessions rendered underneath them; collapse/expand remains future polish |
 | PRD child worker spawn | Implemented in v0.8.0a5 | `w` spawns a manual child worker under the selected PRD parent/coordinator/worker with scope and verification prompts |

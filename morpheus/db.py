@@ -204,6 +204,8 @@ class PromptLoop:
     prompt: str
     interval_seconds: float
     command: str
+    tenant_id: str = ""
+    project_root: str = ""
     target_mission_id: str = ""
     target_tab_id: Optional[str] = None
     status: str = "active"
@@ -360,6 +362,8 @@ CREATE TABLE IF NOT EXISTS prompt_loops (
     prompt            TEXT NOT NULL,
     interval_seconds  REAL NOT NULL,
     command           TEXT NOT NULL,
+    tenant_id         TEXT NOT NULL DEFAULT '',
+    project_root      TEXT NOT NULL DEFAULT '',
     target_mission_id TEXT NOT NULL DEFAULT '',
     target_tab_id     TEXT,
     status            TEXT NOT NULL DEFAULT 'active',
@@ -421,11 +425,14 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
     _ensure_column(conn, "mission_memory", "resume_confidence", "TEXT NOT NULL DEFAULT ''")
     _ensure_column(conn, "mission_memory", "last_tab_id", "TEXT NOT NULL DEFAULT ''")
     _ensure_column(conn, "mission_memory", "closed_at", "REAL NOT NULL DEFAULT 0")
+    _ensure_column(conn, "prompt_loops", "tenant_id", "TEXT NOT NULL DEFAULT ''")
+    _ensure_column(conn, "prompt_loops", "project_root", "TEXT NOT NULL DEFAULT ''")
     conn.execute("CREATE INDEX IF NOT EXISTS missions_mission_id_idx ON missions(mission_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS missions_tenant_idx ON missions(tenant_id, updated_at DESC)")
     conn.execute("CREATE INDEX IF NOT EXISTS missions_project_root_idx ON missions(project_root)")
     conn.execute("CREATE INDEX IF NOT EXISTS mission_memory_tenant_idx ON mission_memory(tenant_id, updated_at DESC)")
     conn.execute("CREATE INDEX IF NOT EXISTS mission_memory_project_root_idx ON mission_memory(project_root)")
+    conn.execute("CREATE INDEX IF NOT EXISTS prompt_loops_tenant_idx ON prompt_loops(tenant_id, next_run_at)")
 
 
 def _ensure_column(conn: sqlite3.Connection, table: str, column: str, ddl: str) -> None:
@@ -808,7 +815,7 @@ def delete_project_tenant(
             )
 
         mission_ids, tab_ids, session_ids = _project_tenant_related_ids(conn, tenant_id)
-        loop_ids = _project_tenant_loop_ids(conn, mission_ids, tab_ids)
+        loop_ids = _project_tenant_loop_ids(conn, mission_ids, tab_ids, tenant_id=tenant_id)
         deleted: dict[str, int] = {}
 
         deleted["prompt_loop_runs"] = _delete_project_loop_runs(
@@ -860,7 +867,7 @@ def delete_project_tenant(
 
 def _project_tenant_usage(conn: sqlite3.Connection, tenant_id: str) -> ProjectTenantUsage:
     mission_ids, tab_ids, session_ids = _project_tenant_related_ids(conn, tenant_id)
-    loop_ids = _project_tenant_loop_ids(conn, mission_ids, tab_ids)
+    loop_ids = _project_tenant_loop_ids(conn, mission_ids, tab_ids, tenant_id=tenant_id)
     return ProjectTenantUsage(
         tenant_id=tenant_id,
         live_sessions=_count(conn, "missions", "tenant_id = ?", (tenant_id,)),
@@ -912,8 +919,11 @@ def _project_tenant_loop_ids(
     conn: sqlite3.Connection,
     mission_ids: list[str],
     tab_ids: list[str],
+    *,
+    tenant_id: str = "",
 ) -> list[int]:
     where, params = _or_in_conditions([
+        ("tenant_id", [tenant_id] if tenant_id else []),
         ("target_mission_id", mission_ids),
         ("target_tab_id", tab_ids),
     ])
@@ -1755,6 +1765,8 @@ def create_loop(
     prompt: str,
     interval_seconds: float,
     command: str,
+    tenant_id: str = "",
+    project_root: str = "",
     target_mission_id: str = "",
     target_tab_id: Optional[str] = None,
     status: str = "active",
@@ -1766,15 +1778,17 @@ def create_loop(
         cur = conn.execute(
             """
             INSERT INTO prompt_loops (
-                name, prompt, interval_seconds, command, target_mission_id,
-                target_tab_id, status, next_run_at, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                name, prompt, interval_seconds, command, tenant_id, project_root,
+                target_mission_id, target_tab_id, status, next_run_at, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 name,
                 prompt,
                 interval_seconds,
                 command,
+                tenant_id,
+                project_root,
                 target_mission_id,
                 target_tab_id,
                 status,
@@ -1787,15 +1801,31 @@ def create_loop(
     return _row_to_prompt_loop(row)
 
 
-def all_loops(include_paused: bool = True) -> list[PromptLoop]:
-    query = "SELECT * FROM prompt_loops"
-    params: tuple[Any, ...] = ()
-    if not include_paused:
-        query += " WHERE status = ?"
-        params = ("active",)
-    query += " ORDER BY next_run_at ASC, created_at DESC"
+def all_loops(include_paused: bool = True, tenant_id: str = "") -> list[PromptLoop]:
     with _connect() as conn:
-        rows = conn.execute(query, params).fetchall()
+        params: list[Any] = []
+        conditions: list[str] = []
+        if not include_paused:
+            conditions.append("status = ?")
+            params.append("active")
+        if tenant_id:
+            mission_ids, tab_ids, _session_ids = _project_tenant_related_ids(conn, tenant_id)
+            loop_ids = _project_tenant_loop_ids(conn, mission_ids, tab_ids, tenant_id=tenant_id)
+            loop_scope, loop_params = _or_in_conditions([
+                ("tenant_id", [tenant_id]),
+                ("id", loop_ids),
+            ])
+            legacy_scope = "(tenant_id = '' AND target_mission_id = '' AND target_tab_id IS NULL)"
+            if loop_scope:
+                conditions.append(f"({loop_scope} OR {legacy_scope})")
+                params.extend(loop_params)
+            else:
+                conditions.append(legacy_scope)
+        query = "SELECT * FROM prompt_loops"
+        if conditions:
+            query += " WHERE " + " AND ".join(conditions)
+        query += " ORDER BY next_run_at ASC, created_at DESC"
+        rows = conn.execute(query, tuple(params)).fetchall()
     return [_row_to_prompt_loop(row) for row in rows]
 
 
@@ -2054,6 +2084,8 @@ def _row_to_prompt_loop(row: sqlite3.Row) -> PromptLoop:
         prompt=row["prompt"],
         interval_seconds=row["interval_seconds"],
         command=row["command"],
+        tenant_id=row["tenant_id"],
+        project_root=row["project_root"],
         target_mission_id=row["target_mission_id"],
         target_tab_id=row["target_tab_id"],
         status=row["status"],
