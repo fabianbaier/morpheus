@@ -15,6 +15,7 @@ from rich.markup import escape
 from rich.markdown import Markdown
 from rich.table import Table
 
+from morpheus import activity as activity_mod
 from morpheus import ask as ask_mod
 from morpheus import brief as brief_mod
 from morpheus import config as cfg_mod
@@ -973,6 +974,86 @@ def context(
         md = ctx_mod.build_markdown(self_tab, self_session, tenant_id=tenant_id)
         # Render with Rich's markdown for terminal display.
         console.print(Markdown(md))
+
+
+@app.command("activity")
+def activity_snapshot(
+    fmt: str = typer.Option("table", "--format", "-f", help="table | json | short"),
+    refresh: bool = typer.Option(
+        False,
+        "--refresh",
+        "-r",
+        help="Force a live iTerm poll before reading the cached snapshot.",
+    ),
+    all_sessions: bool = typer.Option(
+        False,
+        "--all",
+        help="Show all observed sessions. Reserved for tenant-aware builds; current snapshots are global.",
+    ),
+    tail: int = typer.Option(3, "--tail", min=0, max=10, help="Tail lines to show in table output."),
+):
+    """Show the cached live activity snapshot.
+
+    The default path reads ~/.morpheus/activity.json and does not connect to
+    iTerm, so agents can answer "what is everyone doing?" without reconstructing
+    state from the graph or terminal API.
+    """
+    del all_sessions
+    if refresh:
+        async def _do(connection):
+            log = core.setup_logging()
+            await core._tick(connection, log)
+        try:
+            iterm_client.run(_do)
+        except Exception as e:
+            console.print(f"[yellow]warning: live refresh failed ({e}); falling back to cached.[/yellow]")
+
+    snapshot = activity_mod.read_snapshot()
+    sessions = [item for item in snapshot.get("sessions", []) if isinstance(item, dict)]
+    fmt = fmt.lower()
+    if fmt == "json":
+        console.print_json(json.dumps(snapshot))
+        return
+    if fmt == "short":
+        if not sessions:
+            console.print("0 sessions — no activity snapshot yet")
+            return
+        parts = []
+        for item in sessions:
+            tab = str(item.get("tab_id") or "?").split("-")[0]
+            goal = item.get("goal") or tab
+            headline = item.get("headline") or item.get("last_event") or "no visible activity"
+            parts.append(f"{tab} {goal}: {headline}")
+        console.print(" | ".join(parts))
+        return
+    if fmt != "table":
+        console.print("[red]--format must be table, json, or short[/red]")
+        raise typer.Exit(1)
+
+    generated_at = float(snapshot.get("generated_at") or 0)
+    age = max(0.0, time.time() - generated_at) if generated_at else 0.0
+    title = f"MORPHEUS activity ({len(sessions)} sessions"
+    title += f", {age:.1f}s old)" if generated_at else ", no cache yet)"
+    table = Table(title=title, header_style="bold green", border_style="green")
+    table.add_column("tab", style="cyan", no_wrap=True)
+    table.add_column("state", no_wrap=True)
+    table.add_column("goal")
+    table.add_column("activity")
+    if tail:
+        table.add_column("tail")
+    for item in sessions:
+        tab = str(item.get("tab_id") or "?").split("-")[0]
+        tail_lines = item.get("tail_lines") if isinstance(item.get("tail_lines"), list) else []
+        row = [
+            tab,
+            str(item.get("state") or "unknown"),
+            str(item.get("goal") or "(untitled)"),
+            str(item.get("headline") or item.get("last_event") or "—"),
+        ]
+        if tail:
+            row.append("\n".join(str(line) for line in tail_lines[-tail:]))
+        table.add_row(*row)
+    console.print(table)
 
 
 @app.command()

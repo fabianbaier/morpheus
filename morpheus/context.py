@@ -13,6 +13,7 @@ import time
 from pathlib import Path
 from typing import Optional
 
+from morpheus import activity as activity_mod
 from morpheus import db, naming
 
 CONTEXT_PATH = Path.home() / ".morpheus" / "context.md"
@@ -49,6 +50,7 @@ def build_markdown(
     memories_by_id = {
         mem.mission_id: mem for mem in db.all_memory(include_archived=True, tenant_id=tenant_id)
     }
+    activity_by_tab = activity_mod.activities_by_tab()
 
     def _is_self(m: db.Mission) -> bool:
         if self_tab_id and m.tab_id == self_tab_id:
@@ -78,14 +80,15 @@ def build_markdown(
 
     lines.append("## Sessions")
     lines.append("")
-    lines.append("| State | Tab | Mission | Goal | Phase | Age | Last event | |")
-    lines.append("|-------|-----|---------|------|-------|-----|------------|---|")
+    lines.append("| State | Tab | Mission | Goal | Phase | Age | Activity | |")
+    lines.append("|-------|-----|---------|------|-------|-----|----------|---|")
     for m in sorted_missions:
         emoji = naming.STATE_EMOJI.get(m.state, "⚪")
         age = naming.format_age(naming.now_minus(m.buffer_changed_at))
         you = "**[YOU]**" if _is_self(m) else ""
         goal = m.goal or "(untitled)"
-        last = (m.last_event or "—").replace("|", "\\|")
+        activity = activity_by_tab.get(m.tab_id, {})
+        last = (activity.get("headline") or m.last_event or "—").replace("|", "\\|")
         tab_short = (m.tab_id or "?").split("-")[0]
         mission_short = m.mission_id[:12] if m.mission_id else "?"
         memory = memories_by_id.get(m.mission_id)
@@ -109,6 +112,7 @@ def build_markdown(
     lines.append("")
     lines.append("**Usage from inside an agent session:**")
     lines.append("- Read this file (`cat ~/.morpheus/context.md`) to see the world around you.")
+    lines.append("- Run `morpheus activity -f short` for cached live headlines and transcript tails.")
     lines.append("- Run `morpheus note \"text\"` to post a note other sessions will see.")
     lines.append("- Run `morpheus context --json` for a parseable snapshot.")
     lines.append("- Run `morpheus context --short` for a one-line summary suitable for prompts.")
@@ -125,6 +129,7 @@ def build_json(
     memories_by_id = {
         mem.mission_id: mem for mem in db.all_memory(include_archived=True, tenant_id=tenant_id)
     }
+    activity_by_tab = activity_mod.activities_by_tab()
 
     def _is_self(m: db.Mission) -> bool:
         if self_tab_id and m.tab_id == self_tab_id:
@@ -149,6 +154,7 @@ def build_json(
                 "cmd": m.cmd,
                 "linked_pr": m.linked_pr,
                 "linked_worktree": m.linked_worktree,
+                "activity": activity_by_tab.get(m.tab_id),
                 "tenant_id": m.tenant_id,
                 "project_root": m.project_root,
                 "memory": (

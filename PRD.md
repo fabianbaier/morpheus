@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| **Status** | v0.8.0a24 implemented (ticker noise reduction); cwd project tenancy implemented; next: 48-hour recall eval |
+| **Status** | v0.8.0a25 implemented (cwd project tenancy + cached activity snapshot); next: 48-hour recall eval |
 | **Author** | Fabian Baier |
 | **Last updated** | 2026-05-20 |
 | **Target platform** | macOS + iTerm2 |
@@ -368,6 +368,7 @@ The CLI remains the scriptable surface for the same mission model:
 | `morpheus prune [--older-than 4h]` | Interactively close stale tabs |
 | `morpheus snapshot <tab_prefix>` | Dump a tab's mission + buffer to markdown |
 | `morpheus context [--format md/json/short]` | Print the shared cross-session snapshot |
+| `morpheus activity [--format table/json/short] [--refresh]` | Print cached live per-session headlines and transcript tails; `--refresh` forces an iTerm poll |
 | `morpheus note "<text>"` | Post a cross-session note attached to the current tab |
 | `morpheus notes [--limit 15]` | List recent cross-session notes |
 | `morpheus brief` | Produce a morning/evening operational digest |
@@ -507,6 +508,7 @@ Two files maintained by the tick loop:
 
 - `~/.morpheus/context.md` — human-readable markdown snapshot
 - `~/.morpheus/context.json` — parseable JSON snapshot
+- `~/.morpheus/activity.json` — cached live headline/tail snapshot for fast "what is everyone doing?" reads
 
 Agents inside other tabs can read these to know what every other session is
 doing. They can post notes back via `morpheus note "text"` and those notes
@@ -832,6 +834,7 @@ This table is the source of truth for where the product stands right now.
 | Ready-response rabbit ticker | Implemented in v0.8.0a2 | `working → idle` now emits a `ready [...]` headline by extracting the latest assistant answer block, skipping Codex chrome/separators/source URLs, and compressing it to one sentence |
 | Idle ticker reconciliation | Implemented in v0.8.0a23 | The dashboard reconciles recently idle observed sessions into the white-rabbit ticker even if another watcher updated SQLite before the cockpit saw the state transition |
 | White-rabbit ticker noise reduction | Implemented in v0.8.0a24 | Successful focus actions and closed-row dismiss/prune bookkeeping stay silent so the ticker remains reserved for work signals, failures, collisions, spawns, loops, and ready/completed summaries |
+| Cached activity snapshot | Implemented in v0.8.0a25 | The watch loop writes `~/.morpheus/activity.json` with per-session headline and tail lines so agents can answer what live sessions are doing from a cached file; `morpheus activity` reads that cache instantly and `--refresh` forces a live iTerm poll only when needed |
 | Newest-first rabbit ticker | Implemented in v0.8.0a3 | Bottom alert strip redraws from the newest-first alert deque so fresh session headlines stay at the top instead of appending chronologically |
 | Prompt loops foundation | Implemented in v0.8.0a4 | `l` creates recurring prompt loops; `morpheus loops run-due` runs due prompts, captures output, publishes ticker notes, and routes graph events/artifacts to target missions |
 | PRD Runs foundation | Implemented in v0.8.0a1 | PRD finder, new-session PRD selector, parent mission creation, coordinator prompt/status files, `morpheus run start`, and coordinator graph edge shipped |
@@ -1360,6 +1363,7 @@ claim, defers.
 | `morpheus prune [--older-than 4] [--yes]` | Close stale tabs (idle/finished, age >threshold) |
 | `morpheus snapshot <tab_prefix> [--out FILE]` | Dump tab buffer + mission to markdown |
 | `morpheus context [-f md/json/short] [--refresh]` | Print the shared cross-session snapshot |
+| `morpheus activity [-f table/json/short] [--refresh]` | Print cached live activity headlines and tails |
 | `morpheus note "<text>" [--tab ID] [--kind note/claim/broadcast]` | Post a cross-session note; broadcasts also type into live iTerm sessions |
 | `morpheus notes [--limit 15] [--tab ID]` | List recent cross-session notes |
 | `morpheus brief [--out FILE] [--notify] [--no-llm] [--no-gh]` | Generate digest of current state via claude-p |
