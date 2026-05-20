@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| **Status** | v0.8.0a10 implemented (output-first mission card); next: resume fresh |
+| **Status** | v0.8.0a11 implemented (user PATH CLI install); next: resume fresh |
 | **Author** | Fabian Baier |
 | **Last updated** | 2026-05-20 |
 | **Target platform** | macOS + iTerm2 |
@@ -758,6 +758,7 @@ This table is the source of truth for where the product stands right now.
 | Competitive research | Done in v0.6.2 | CCPM, Claude Code, Karpathy LLM Wiki, and open-source session managers folded into requirements |
 | Local dev launch flow | Implemented in v0.7.0 foundation | `Makefile` creates `.venv`, installs editable checkout, reloads daemon, opens cockpit |
 | Quickstart/architecture README | Implemented in v0.7.0 foundation | README now documents `make start`, architecture, mission graph, state files |
+| User PATH CLI install | Implemented in v0.8.0a11 | `make install-cli` links `~/.local/bin/morpheus` to this repo's editable venv command so `morpheus` can launch from any worktree without activating `.venv` |
 | Stable mission ID design | Implemented in v0.7.0 foundation | `missions.mission_id` added; live tabs attach to durable mission IDs |
 | Mission graph schema | Implemented in v0.7.0 foundation | `mission_memory`, `mission_events`, `mission_artifacts`, `mission_edges` added |
 | Provenance model | Foundation implemented | Graph fields store source kind/ref and confidence; UI trust treatment still pending |
@@ -779,6 +780,7 @@ This table is the source of truth for where the product stands right now.
 | Brief selected | Implemented in v0.8.0a8 | `b` opens a cited local brief for the selected mission using graph memory, recent events, artifacts, and transcript tail |
 | PRD parent cleanup | Implemented in v0.8.0a9 | `d` on a virtual PRD parent archives the run and closes live coordinator/worker tabs; `p` archives orphan PRD parent rows with no live child tabs |
 | Output-first mission card | Implemented in v0.8.0a10 | The selected card shows much more latest terminal output by default and moves mission/graph metadata behind the `Space` details toggle |
+| User PATH CLI install | Implemented in v0.8.0a11 | `make install-cli` installs a safe user shim and prints a PATH hint when `~/.local/bin` is not visible to the shell |
 | Resume fresh | Not implemented | `r` snapshots, archives old attachment, spawns replacement with mission context |
 | MCP mission tools | Partially shipped | Read-only session tools exist; graph read/update tools remain v0.7 |
 | 48-hour recall eval | Not implemented | Add fixture or dogfood checklist: stale mission → press `b` → know next action in <10s |

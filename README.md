@@ -46,6 +46,7 @@ Useful Make targets:
 ```bash
 make start          # reload daemon, then open the cockpit
 make dashboard      # open cockpit only
+make install-cli    # install a user PATH shim for running morpheus anywhere
 make daemon         # install/reload launchd watcher from this checkout
 make status         # daemon health, PID, last beacon, log path
 make watch          # foreground watcher instead of launchd
@@ -60,6 +61,18 @@ Override the daemon poll interval when testing:
 ```bash
 make start POLL=2
 ```
+
+Install the local CLI for other terminals:
+
+```bash
+make install-cli
+```
+
+This creates `~/.local/bin/morpheus` as a shim to this repo's editable
+`.venv/bin/morpheus`. You do not need to activate the venv; launch `morpheus`
+from any worktree and Morpheus will use that terminal's current directory as
+the dashboard cwd and PRD/source-file picker fallback. If `~/.local/bin` is not
+on your `PATH`, the target prints the exact `export PATH=...` line to add.
 
 ## Daily Use
 
@@ -272,10 +285,10 @@ make daemon
 
 ## Roadmap
 
-Current status: v0.8.0a10 has PRD Runs foundation, PRD tree/manual workers,
+Current status: v0.8.0a11 has PRD Runs foundation, PRD tree/manual workers,
 newest-first ready tickers, prompt loops foundation, nonblocking/Markdown PRD
 picker, edit mission flow, selected mission briefs, PRD parent cleanup, and an
-output-first mission card.
+output-first mission card, plus a user PATH install target.
 
 Next implementation phases:
 
@@ -297,7 +310,8 @@ Next implementation phases:
 16. `b` brief-selected using mission graph plus transcript tail. Done in `0.8.0a8`.
 17. PRD parent row kill/prune cleanup. Done in `0.8.0a9`.
 18. Output-first mission card with `space` details toggle. Done in `0.8.0a10`.
-19. Resume-fresh flow that snapshots, archives old attachment, and spawns a new
+19. User PATH CLI install target. Done in `0.8.0a11`.
+20. Resume-fresh flow that snapshots, archives old attachment, and spawns a new
    session linked by a `spawned_from` edge.
 
 > "I can only show you the door. You're the one that has to walk through it."
