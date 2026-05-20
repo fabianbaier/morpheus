@@ -55,13 +55,19 @@ ALERTS_MAX = 12
 STATE_ORDER = {"blocked": 0, "crashed": 1, "working": 2,
                "idle": 3, "finished": 4, "unknown": 5}
 STATE_STYLE = {
-    "blocked":  "bold red",
-    "crashed":  "bold magenta",
+    "blocked":  "bold bright_red",
+    "crashed":  "bold bright_magenta",
     "working":  "bright_green",
-    "idle":     "yellow",
-    "finished": "dim",
-    "unknown":  "white",
+    "idle":     "bright_yellow",
+    "finished": "color(244)",   # readable gray, not invisible-on-black `dim`
+    "unknown":  "color(250)",   # light gray, calmer than pure white
 }
+
+# Color palette for everything else (tuned for true-black backgrounds):
+COL_MUTED  = "color(244)"   # secondary text — clearly legible
+COL_DIMMER = "bright_black"  # tertiary — visible dark gray on most terminals
+COL_BODY   = "color(252)"   # near-white body text
+COL_ACCENT = "bright_cyan"   # call-attention non-alert (spawn etc.)
 
 
 @dataclass
@@ -71,14 +77,14 @@ class Alert:
     text: str
 
     def render(self) -> Text:
-        t = Text(time.strftime("%H:%M:%S", time.localtime(self.ts)), style="dim")
-        t.append(f"  {RABBIT}  ", style="white")
+        t = Text(time.strftime("%H:%M:%S", time.localtime(self.ts)), style=COL_DIMMER)
+        t.append(f"  {RABBIT}  ", style="bright_white")
         style = {
-            "state": "bold",
-            "note": "bright_green",
-            "spawn": "cyan",
-            "close": "dim",
-        }.get(self.kind, "")
+            "state": "bold bright_white",
+            "note":  "bright_green",
+            "spawn": COL_ACCENT,
+            "close": COL_MUTED,
+        }.get(self.kind, COL_BODY)
         t.append(self.text, style=style)
         return t
 
@@ -114,21 +120,21 @@ def _summary_line(missions: list[db.Mission]) -> Text:
     for m in missions:
         counts[m.state] = counts.get(m.state, 0) + 1
 
-    t = Text(f"◉ {len(missions)} mission(s)   ", style="bold")
+    t = Text(f"◉ {len(missions)} mission(s)   ", style="bold bright_white")
     for emoji, key in [("🔴", "blocked"), ("💀", "crashed"), ("🟢", "working"),
                        ("🟡", "idle"), ("⚫", "finished")]:
         c = counts.get(key, 0)
         if c:
-            t.append(f"{emoji} {c} {key}   ", style=STATE_STYLE.get(key, ""))
+            t.append(f"{emoji} {c} {key}   ", style=STATE_STYLE.get(key, COL_BODY))
     return t
 
 
 def _render_header() -> Group:
     return Group(
-        Align.center(Text(BANNER, style="bold green")),
+        Align.center(Text(BANNER, style="bold bright_green")),
         Align.center(Text(
             f"mission control v{__version__}  •  {RABBIT} follow the white rabbit  •  Ctrl-C to exit",
-            style="dim",
+            style=COL_MUTED,
         )),
     )
 
@@ -136,32 +142,33 @@ def _render_header() -> Group:
 def _render_mission_table(missions: list[db.Mission], live_ids: set[str],
                           stale_after_hours: float = 4.0) -> Table:
     table = Table(
-        header_style="bold green",
+        header_style="bold bright_green",
         border_style="green",
         show_header=True,
         expand=True,
         padding=(0, 1),
     )
-    table.add_column("ID",         style="green", no_wrap=True, width=8)
+    table.add_column("ID",         style="bright_green", no_wrap=True, width=8)
     table.add_column("ST",         width=3, justify="center")
     table.add_column("GOAL",       ratio=3)
-    table.add_column("AGE",        justify="right", width=6)
-    table.add_column("LAST EVENT", ratio=3, overflow="fold")
+    table.add_column("AGE",        justify="right", width=6, style=COL_BODY)
+    table.add_column("LAST EVENT", ratio=3, overflow="fold", style=COL_MUTED)
 
     sorted_m = sorted(missions, key=lambda m: (STATE_ORDER.get(m.state, 9), -m.updated_at))
     for m in sorted_m:
         emoji = naming.STATE_EMOJI.get(m.state, "⚪")
         age_secs = naming.now_minus(m.buffer_changed_at)
         age = naming.format_age(age_secs)
-        style = STATE_STYLE.get(m.state, "white")
+        style = STATE_STYLE.get(m.state, COL_BODY)
         goal_disp = m.goal or "(untitled)"
-        if (m.state in ("idle", "finished")) and age_secs >= stale_after_hours * 3600:
-            goal_disp = f"[yellow]({age})[/yellow] {goal_disp}"
+        # Stale tabs get an inline age prefix in bright yellow so they pop.
+        stale = (m.state in ("idle", "finished")) and age_secs >= stale_after_hours * 3600
+        goal_text = Text()
+        if stale:
+            goal_text.append(f"({age}) ", style="bright_yellow")
+        goal_text.append(goal_disp, style=style)
         tab_short = (m.tab_id or "?").split("-")[0]
-        table.add_row(
-            tab_short, emoji, Text(goal_disp, style=style),
-            age, m.last_event or "—",
-        )
+        table.add_row(tab_short, emoji, goal_text, age, m.last_event or "—")
     return table
 
 
@@ -169,7 +176,7 @@ def _render_alerts(state: DashboardState) -> Group:
     if not state.alerts:
         empty = Text(
             f"{RABBIT}  no incoming. waiting for sessions to do interesting things…",
-            style="dim",
+            style=COL_MUTED,
         )
         return Group(empty)
     lines = [a.render() for a in list(state.alerts)]
@@ -190,21 +197,27 @@ def _build_layout(rain: rain_mod.Rain, missions: list[db.Mission],
     )
     layout["header"].update(_render_header())
 
+    rain_title = Text("rain  ", style="bold bright_green")
+    rain_title.append("(state: speed · brightness · color)", style=COL_MUTED)
     layout["rain"].update(Panel(
         rain.render(),
-        title=f"[bold green]rain[/bold green]   [dim](state: speed · brightness · color)[/dim]",
+        title=rain_title,
         border_style="green",
         padding=(0, 0),
     ))
+
     layout["missions"].update(Panel(
         Group(_summary_line(missions), Text(""), _render_mission_table(missions, live_ids)),
-        title="[bold green]missions[/bold green]",
+        title=Text("missions", style="bold bright_green"),
         border_style="green",
     ))
+
+    alerts_title = Text(f"{RABBIT}  alerts  ", style="bold bright_white")
+    alerts_title.append("(state changes · new notes · spawns)", style=COL_MUTED)
     layout["alerts"].update(Panel(
         _render_alerts(state),
-        title=f"[bold white]{RABBIT}  alerts  (state changes · new notes · spawns)[/bold white]",
-        border_style="bright_black",
+        title=alerts_title,
+        border_style="bright_yellow",   # draws the eye — this is where things to follow live
     ))
     return layout
 
@@ -348,11 +361,11 @@ async def _loop(connection):
 
 def run() -> None:
     console.print(
-        f"[bold green]▶ MORPHEUS[/bold green] — launching dashboard "
+        f"[bold bright_green]▶ MORPHEUS[/bold bright_green] — launching dashboard "
         f"(this tab is now the command center; titles sync every 2s)\n"
-        f"[dim]{RABBIT} follow the white rabbit — Ctrl-C to exit.[/dim]"
+        f"[bright_black]{RABBIT} follow the white rabbit — Ctrl-C to exit.[/bright_black]"
     )
     try:
         iterm_client.run_app(_loop)
     except KeyboardInterrupt:
-        console.print("\n[dim]dashboard closed.[/dim]")
+        console.print("\n[bright_black]dashboard closed.[/bright_black]")
