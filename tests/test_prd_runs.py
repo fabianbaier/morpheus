@@ -147,6 +147,31 @@ class PRDRunsTest(unittest.TestCase):
         self.assertIn("scope: morpheus/prd_runs.py", text)
         self.assertIn("verification: python -m unittest tests.test_prd_runs", text)
 
+    def test_create_prd_run_can_belong_to_launching_project(self) -> None:
+        with isolated_prd_runtime() as root:
+            parent = root / "bkeyID"
+            nested = parent / "bkey-devkit"
+            nested.mkdir(parents=True)
+            (parent / ".git").mkdir()
+            (nested / ".git").mkdir()
+            prd = nested / "PRD.md"
+            prd.write_text("# Devkit PRD\n", encoding="utf-8")
+            parent_project = prd_runs.tenant_mod.ensure_project_tenant(parent)
+            nested_project = prd_runs.tenant_mod.ensure_project_tenant(prd)
+
+            run = prd_runs.create_prd_run(prd, project=parent_project)
+            memory = db.get_memory(run.parent_id)
+            owner = prd_runs.project_for_run(run)
+
+        self.assertNotEqual(parent_project.tenant_id, nested_project.tenant_id)
+        self.assertIsNotNone(memory)
+        self.assertEqual(run.tenant_id, parent_project.tenant_id)
+        self.assertEqual(run.project_root, parent_project.root_path)
+        self.assertEqual(memory.tenant_id, parent_project.tenant_id)
+        self.assertEqual(memory.project_root, parent_project.root_path)
+        self.assertEqual(memory.source_ref, str(prd.resolve()))
+        self.assertEqual(owner.tenant_id, parent_project.tenant_id)
+
     def test_status_refresh_for_child_includes_events_and_artifacts(self) -> None:
         with isolated_prd_runtime() as root:
             prd = root / "PRD.md"

@@ -228,8 +228,8 @@ def run_start(
     title: Optional[str] = typer.Option(None, "--title", "-t", help="Override the PRD title."),
 ):
     """Create a PRD parent mission, spawn one coordinator tab, and link it."""
-    run = prd_runs.create_prd_run(prd, title=title)
-    project = tenant_mod.ensure_project_tenant(run.prd_path)
+    project = tenant_mod.ensure_project_tenant(Path.cwd())
+    run = prd_runs.create_prd_run(prd, title=title, project=project)
     coordinator_goal = f"{run.title} coordinator"
     coordinator_cmd = tenant_mod.command_in_project(
         prd_runs.coordinator_command(command, run),

@@ -3612,7 +3612,7 @@ class MorpheusApp(App):
             return
         try:
             run = prd_runs.run_from_parent(result.parent_id)
-            project = tenant_mod.ensure_project_tenant(run.prd_path)
+            project = prd_runs.project_for_run(run)
             cmd = prd_runs.worker_command(
                 result.command,
                 run,
@@ -3688,8 +3688,7 @@ class MorpheusApp(App):
         project = self.project or tenant_mod.ensure_project_tenant(Path.cwd())
         if result.prd_path:
             try:
-                run = prd_runs.create_prd_run(result.prd_path, title=goal or None)
-                project = tenant_mod.ensure_project_tenant(run.prd_path)
+                run = prd_runs.create_prd_run(result.prd_path, title=goal or None, project=project)
                 goal = f"{run.title} coordinator"
                 cmd = prd_runs.coordinator_command(cmd, run)
             except Exception as e:

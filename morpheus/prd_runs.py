@@ -65,6 +65,8 @@ class PRDRun:
     prd_path: Path
     status_path: Path
     prompt_path: Path
+    tenant_id: str = ""
+    project_root: str = ""
 
 
 def find_prds(
@@ -116,7 +118,12 @@ def scan_root_for_worktree(root: Path | str, fallback: Optional[Path | str] = No
     return fallback_candidate
 
 
-def create_prd_run(prd_path: Path | str, title: Optional[str] = None) -> PRDRun:
+def create_prd_run(
+    prd_path: Path | str,
+    title: Optional[str] = None,
+    *,
+    project: Optional[db.ProjectTenant] = None,
+) -> PRDRun:
     path = Path(prd_path).expanduser().resolve()
     if not path.exists() or not path.is_file():
         raise FileNotFoundError(f"PRD not found: {path}")
@@ -124,7 +131,7 @@ def create_prd_run(prd_path: Path | str, title: Optional[str] = None) -> PRDRun:
     now = time.time()
     parent_id = db.new_mission_id(now)
     run_title = title or title_from_prd(path)
-    project = tenant_mod.ensure_project_tenant(path)
+    project = project or tenant_mod.ensure_project_tenant(path)
     run_dir = RUNS_DIR / parent_id
     run_dir.mkdir(parents=True, exist_ok=True)
     status_path = run_dir / "status.md"
@@ -136,6 +143,8 @@ def create_prd_run(prd_path: Path | str, title: Optional[str] = None) -> PRDRun:
         prd_path=path,
         status_path=status_path,
         prompt_path=prompt_path,
+        tenant_id=project.tenant_id,
+        project_root=project.root_path,
     )
 
     db.upsert_memory(
@@ -306,7 +315,28 @@ def run_from_parent(parent_id: str) -> PRDRun:
         prd_path=prd_path,
         status_path=run_dir / "status.md",
         prompt_path=run_dir / "coordinator_prompt.md",
+        tenant_id=memory.tenant_id,
+        project_root=memory.project_root,
     )
+
+
+def project_for_run(run: PRDRun) -> db.ProjectTenant:
+    """Return the owning Morpheus project for a PRD run.
+
+    A PRD file can live inside a nested repo, but the run belongs to the
+    cockpit/command project that launched it. Fall back to the PRD path for
+    older rows that predate explicit PRD-run tenancy.
+    """
+    tenant_id = getattr(run, "tenant_id", "")
+    project_root = getattr(run, "project_root", "")
+    prd_path = getattr(run, "prd_path")
+    if tenant_id:
+        project = db.get_project_tenant(tenant_id)
+        if project is not None:
+            return project
+    if project_root:
+        return tenant_mod.ensure_project_tenant(project_root)
+    return tenant_mod.ensure_project_tenant(prd_path)
 
 
 def worker_command(
