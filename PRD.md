@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| **Status** | v0.8.0a5 implemented (edit mission flow); next: PRD run tree UI |
+| **Status** | v0.8.0a6 implemented (brief selected); next: PRD run tree UI |
 | **Author** | Fabian Baier |
 | **Last updated** | 2026-05-20 |
 | **Target platform** | macOS + iTerm2 |
@@ -763,7 +763,7 @@ This table is the source of truth for where the product stands right now.
 | PRD run tree UI | Not implemented | Show parent PRD rows with collapsible coordinator/worker children in the mission table |
 | PRD child worker spawn | Not implemented | Manual worker spawn under selected parent with file/path ownership and proof requirements |
 | Edit mission flow | Implemented in v0.8.0a5 | `e` opens a dashboard editor for goal/title/why/done/criteria/plan/next/phase/blocker/source/issue/PR/worktree/claimed paths/topic, saves graph memory + live fields, and records a `mission_edit` event |
-| Brief selected | Not implemented | `b` renders a cited why/status/next card from graph + transcript tail |
+| Brief selected | Implemented in v0.8.0a6 | `b` opens a cited local brief for the selected mission using graph memory, recent events, artifacts, and transcript tail |
 | Resume fresh | Not implemented | `r` snapshots, archives old attachment, spawns replacement with mission context |
 | MCP mission tools | Partially shipped | Read-only session tools exist; graph read/update tools remain v0.7 |
 | 48-hour recall eval | Not implemented | Add fixture or dogfood checklist: stale mission → press `b` → know next action in <10s |

@@ -36,7 +36,7 @@ from textual.screen import ModalScreen
 from textual.widgets import Button, DataTable, Footer, Input, Label, RichLog, Select, Static
 
 from morpheus import context as ctx_mod
-from morpheus import core, db, iterm_client, naming, rain as rain_mod
+from morpheus import core, db, iterm_client, mission_brief, naming, rain as rain_mod
 from morpheus import ledger as ledger_mod
 from morpheus import loops as loops_mod
 from morpheus import prd_runs
@@ -173,6 +173,12 @@ class EditMissionRequest:
     linked_worktree: str
     claimed_paths: str
     topic: str
+
+
+@dataclass
+class BriefScreenContent:
+    title: str
+    body: str
 
 
 @dataclass
@@ -1246,6 +1252,60 @@ class LoopScreen(ModalScreen[Optional[LoopRequest]]):
         self.dismiss(None)
 
 
+class SelectedBriefScreen(ModalScreen[None]):
+    """Read-only selected mission brief."""
+
+    CSS = """
+    SelectedBriefScreen { align: center middle; }
+    #brief-dialog {
+        width: 94;
+        height: 32;
+        border: round ansi_bright_green;
+        background: black;
+        padding: 1 2;
+    }
+    #brief-dialog Label.title {
+        color: ansi_bright_green;
+        text-style: bold;
+        margin-bottom: 1;
+    }
+    #brief-body {
+        height: 1fr;
+        color: white;
+        background: black;
+    }
+    #brief-buttons {
+        height: 3;
+        align: center middle;
+    }
+    Button {
+        margin: 0 1;
+    }
+    """
+
+    BINDINGS = [
+        Binding("escape", "close", "close"),
+        Binding("q", "close", "close"),
+    ]
+
+    def __init__(self, brief: BriefScreenContent):
+        super().__init__()
+        self.brief = brief
+
+    def compose(self) -> ComposeResult:
+        with Container(id="brief-dialog"):
+            yield Label(f"{RABBIT}  BRIEF  {self.brief.title}", classes="title")
+            yield Static(self.brief.body, id="brief-body")
+            with Horizontal(id="brief-buttons"):
+                yield Button("close", id="brief_close", variant="success")
+
+    def action_close(self) -> None:
+        self.dismiss(None)
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        self.action_close()
+
+
 # ── main app ──────────────────────────────────────────────────────────────
 
 FOOTER_BINDINGS = [
@@ -1255,6 +1315,7 @@ FOOTER_BINDINGS = [
     Binding("up", "cursor_up", "prev", show=False),
     Binding("enter", "focus_session", "focus tab"),
     Binding("n", "new_session", "new"),
+    Binding("b", "brief_selected", "brief"),
     Binding("e", "edit_mission", "edit"),
     Binding("d", "kill_session", "kill"),
     Binding("p", "prune_stale", "prune"),
@@ -1695,6 +1756,28 @@ class MorpheusApp(App):
         root = self._selected_worktree_or_cwd()
         candidates = prd_runs.find_prds(root)
         self.push_screen(NewSessionScreen(prd_candidates=candidates, root=root), self._handle_new_session_result)
+
+    def action_brief_selected(self) -> None:
+        tab_id = self._selected_tab_id()
+        if not tab_id:
+            self._push_alert(Alert(time.time(), "error", "no mission selected to brief"))
+            return
+        mission = db.get(tab_id)
+        if mission is None:
+            self._push_alert(Alert(time.time(), "error", f"mission [{tab_id.split('-')[0]}] not found"))
+            return
+        memory = db.get_memory(mission.mission_id) if mission.mission_id else None
+        events = db.recent_events(mission.mission_id, limit=5) if mission.mission_id else []
+        artifacts = db.artifacts_for_mission(mission.mission_id, limit=5) if mission.mission_id else []
+        live = self.live_buffers.get(tab_id)
+        brief = mission_brief.build_selected_brief(
+            mission,
+            memory=memory,
+            events=events,
+            artifacts=artifacts,
+            transcript=live.buffer if live else "",
+        )
+        self.push_screen(SelectedBriefScreen(BriefScreenContent(brief.title, brief.body)))
 
     def action_new_loop(self) -> None:
         target_tab_id = self._selected_tab_id()

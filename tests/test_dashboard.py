@@ -6,8 +6,9 @@ from unittest.mock import patch
 
 from textual.widgets import Input
 
-from morpheus import dashboard
+from morpheus import dashboard, mission_brief
 from morpheus.dashboard import (
+    BriefScreenContent,
     EditMissionScreen,
     LiveBuffer,
     LoopRequest,
@@ -17,6 +18,7 @@ from morpheus.dashboard import (
     NewSessionRequest,
     NewSessionScreen,
     NoteScreen,
+    SelectedBriefScreen,
     _session_headline,
     _stream_shard_text,
     _tail_lines,
@@ -66,6 +68,61 @@ def isolated_dashboard_runtime(missions=None):
 
 
 class DashboardTest(unittest.IsolatedAsyncioTestCase):
+    def test_selected_brief_builder_cites_graph_events_artifacts_and_tail(self) -> None:
+        mission = dashboard.db.Mission(
+            tab_id="tab-123456",
+            mission_id="m_20260520000102_abcd1234",
+            goal="ship selected brief",
+            state="working",
+            last_event="tests are running",
+            buffer_changed_at=0,
+        )
+        memory = dashboard.db.MissionMemory(
+            mission_id=mission.mission_id,
+            title="Selected brief",
+            why="recover intent before attaching",
+            current_plan="summarize graph first",
+            next_step="verify the b key modal",
+            phase="testing",
+            source_kind="prd",
+            source_ref="PRD.md",
+        )
+        event = dashboard.db.MissionEvent(
+            id=1,
+            mission_id=mission.mission_id,
+            ts=0,
+            kind="decision",
+            actor="user",
+            summary="brief must be cited",
+            source_ref="PRD.md:934",
+        )
+        artifact = dashboard.db.MissionArtifact(
+            id=7,
+            mission_id=mission.mission_id,
+            kind="test",
+            path_or_url="tests/test_dashboard.py",
+            status="pass",
+            summary="dashboard coverage",
+            created_at=0,
+        )
+
+        brief = mission_brief.build_selected_brief(
+            mission,
+            memory=memory,
+            events=[event],
+            artifacts=[artifact],
+            transcript="old line\nlatest terminal detail",
+            generated_at=0,
+        )
+
+        self.assertEqual(brief.title, "Selected brief")
+        self.assertIn("recover intent before attaching [prd:PRD.md]", brief.body)
+        self.assertIn("State: working; phase: testing", brief.body)
+        self.assertIn("decision/user: brief must be cited [PRD.md:934]", brief.body)
+        self.assertIn("pass test: tests/test_dashboard.py", brief.body)
+        self.assertIn("verify the b key modal [prd:PRD.md]", brief.body)
+        self.assertIn("latest terminal detail [tab:tab-123456]", brief.body)
+
     def test_mission_card_render_includes_graph_memory(self) -> None:
         card = MissionCardWidget()
         mission = dashboard.db.Mission(
@@ -369,6 +426,13 @@ class DashboardTest(unittest.IsolatedAsyncioTestCase):
                 await app.pop_screen()
                 await pilot.pause()
 
+                await app.push_screen(SelectedBriefScreen(BriefScreenContent("Brief", "body")))
+                await pilot.pause()
+                self.assertIsInstance(app.screen, SelectedBriefScreen)
+
+                await app.pop_screen()
+                await pilot.pause()
+
                 mission = dashboard.db.Mission(
                     tab_id="tab-123456",
                     mission_id="m_20260520000102_abcd1234",
@@ -421,6 +485,74 @@ class DashboardTest(unittest.IsolatedAsyncioTestCase):
                 self.assertIsInstance(app.screen, EditMissionScreen)
                 self.assertEqual(app.screen.query_one("#goal_input", Input).value, "edit this mission")
                 self.assertEqual(app.screen.query_one("#why_input", Input).value, "make stale intent recoverable")
+
+    async def test_brief_selected_key_opens_modal_for_selected_mission(self) -> None:
+        app = DashboardHarness()
+        mission = dashboard.db.Mission(
+            tab_id="tab-123456",
+            mission_id="m_20260520000102_abcd1234",
+            goal="brief this mission",
+            state="working",
+            last_event="waiting for tests",
+            buffer_changed_at=1,
+        )
+        memory = dashboard.db.MissionMemory(
+            mission_id=mission.mission_id,
+            title="Brief this mission",
+            why="show stale context fast",
+            next_step="attach only if the brief says so",
+            phase="reviewing",
+            source_kind="user",
+            source_ref="tab:tab-123456",
+        )
+        event = dashboard.db.MissionEvent(
+            id=1,
+            mission_id=mission.mission_id,
+            ts=0,
+            kind="summary",
+            actor="morpheus",
+            summary="ready for review",
+            source_ref="tab:tab-123456",
+        )
+
+        with isolated_dashboard_runtime([mission]), patch.object(
+            dashboard.db, "get", new=lambda tab_id: mission if tab_id == mission.tab_id else None
+        ), patch.object(
+            dashboard.db, "get_memory", new=lambda mission_id: memory if mission_id == memory.mission_id else None
+        ), patch.object(
+            dashboard.db, "recent_events", new=lambda mission_id, limit=5: [event]
+        ), patch.object(
+            dashboard.db, "artifacts_for_mission", new=lambda mission_id, limit=5: []
+        ):
+            async with app.run_test(size=(120, 40)) as pilot:
+                app.live_buffers[mission.tab_id] = LiveBuffer(
+                    tab_id=mission.tab_id,
+                    goal=mission.goal,
+                    state=mission.state,
+                    last_event=mission.last_event,
+                    buffer="first\nlatest output",
+                    observed_at=0,
+                )
+                app._refresh_table()
+                await pilot.pause()
+                await pilot.press("b")
+                await pilot.pause()
+
+                self.assertIsInstance(app.screen, SelectedBriefScreen)
+                self.assertIn("show stale context fast", app.screen.brief.body)
+                self.assertIn("ready for review", app.screen.brief.body)
+                self.assertIn("latest output", app.screen.brief.body)
+
+    async def test_brief_selected_without_selection_pushes_alert(self) -> None:
+        app = DashboardHarness()
+
+        with isolated_dashboard_runtime():
+            async with app.run_test(size=(120, 40)) as pilot:
+                await pilot.press("b")
+                await pilot.pause()
+
+        self.assertEqual(app.alerts[0].kind, "error")
+        self.assertIn("no mission selected", app.alerts[0].text)
 
     async def test_edit_mission_submit_updates_memory_live_fields_and_event(self) -> None:
         app = DashboardHarness()
