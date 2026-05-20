@@ -1147,6 +1147,70 @@ class DashboardTest(unittest.IsolatedAsyncioTestCase):
                 restarted_table = restarted.query_one(dashboard.MissionsTable)
                 self.assertEqual([ref.role for ref in restarted_table.row_refs], ["prd"])
 
+    async def test_refresh_table_preserves_prd_child_selection(self) -> None:
+        app = DashboardHarness()
+        parent = dashboard.db.MissionMemory(
+            mission_id="m_parent",
+            title="kms implementation",
+            topic="prd-run",
+            source_kind="prd",
+            updated_at=100,
+        )
+        coordinator = dashboard.db.Mission(
+            tab_id="tab-coordinator",
+            mission_id="m_coordinator",
+            goal="kms implementation coordinator",
+            state="working",
+            buffer_changed_at=100,
+        )
+        worker = dashboard.db.Mission(
+            tab_id="tab-worker",
+            mission_id="m_worker",
+            goal="tester",
+            state="working",
+            buffer_changed_at=100,
+        )
+        edges = [
+            dashboard.db.MissionEdge(
+                id=1,
+                from_id=parent.mission_id,
+                to_id=coordinator.mission_id,
+                relation="coordinator",
+                reason="coordinator",
+                created_at=100,
+            ),
+            dashboard.db.MissionEdge(
+                id=2,
+                from_id=parent.mission_id,
+                to_id=worker.mission_id,
+                relation="worker",
+                reason="worker",
+                created_at=101,
+            ),
+        ]
+
+        with tempfile.TemporaryDirectory() as tmpdir, isolated_dashboard_runtime(
+            [coordinator, worker], [parent], edges
+        ), patch.object(
+            dashboard, "PRD_TREE_STATE_PATH", new=Path(tmpdir) / "tree-state.json"
+        ):
+            async with app.run_test(size=(120, 40)) as pilot:
+                app._refresh_table()
+                await pilot.pause()
+                table = app.query_one(dashboard.MissionsTable)
+                self.assertEqual([ref.role for ref in table.row_refs], ["prd", "coordinator", "worker"])
+
+                await pilot.press("j")
+                await pilot.press("j")
+                await pilot.pause()
+                self.assertEqual(table.selected_ref().mission_id, worker.mission_id)
+
+                app._refresh_table()
+                await pilot.pause()
+
+                self.assertEqual(table.cursor_row, 2)
+                self.assertEqual(table.selected_ref().mission_id, worker.mission_id)
+
     async def test_prd_tree_toggle_reports_persistence_failure_without_mutating_state(self) -> None:
         app = DashboardHarness()
         app.prd_collapsed_ids = set()

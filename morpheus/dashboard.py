@@ -1013,18 +1013,24 @@ class MissionsTable(DataTable):
                 Text(last_evt, style=cell_style),
             )
 
-        # Restore cursor to the same tab/mission if it still exists.
+        # Restore cursor to the same tab/mission if it still exists. Only fall
+        # back to the parent after exact child matching fails.
         if prior_ref:
+            target_row = None
             for idx, row_ref in enumerate(self.row_refs):
                 if prior_ref.tab_id and row_ref.tab_id == prior_ref.tab_id:
-                    self.move_cursor(row=idx)
+                    target_row = idx
                     break
-                if prior_ref.virtual and row_ref.virtual and row_ref.mission_id == prior_ref.mission_id:
-                    self.move_cursor(row=idx)
+                if prior_ref.mission_id and row_ref.mission_id == prior_ref.mission_id:
+                    target_row = idx
                     break
-                if prior_ref.parent_id and row_ref.virtual and row_ref.mission_id == prior_ref.parent_id:
-                    self.move_cursor(row=idx)
-                    break
+            if target_row is None:
+                for idx, row_ref in enumerate(self.row_refs):
+                    if prior_ref.parent_id and row_ref.virtual and row_ref.mission_id == prior_ref.parent_id:
+                        target_row = idx
+                        break
+            if target_row is not None:
+                self.move_cursor(row=target_row)
 
     def selected_tab_id(self) -> Optional[str]:
         ref = self.selected_ref()
