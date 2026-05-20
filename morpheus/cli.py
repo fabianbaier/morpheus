@@ -29,6 +29,8 @@ app = typer.Typer(
     add_completion=False,
 )
 console = Console()
+projects_app = typer.Typer(help="List, prune, and delete project tenants.")
+app.add_typer(projects_app, name="projects")
 
 
 # ───────── default entry: launch dashboard ─────────
@@ -58,6 +60,62 @@ def dashboard(
 def version():
     """Print the morpheus version."""
     console.print(f"morpheus {__version__}")
+
+
+def _display_path(path: str) -> str:
+    if not path:
+        return ""
+    try:
+        home = Path.home().resolve()
+        resolved = Path(path).expanduser().resolve()
+        return "~/" + str(resolved.relative_to(home)) if resolved != home and home in resolved.parents else str(resolved)
+    except Exception:
+        return path
+
+
+def _resolve_project_ref(ref: str) -> tuple[Optional[db.ProjectTenant], str]:
+    tenants = db.all_project_tenants(include_archived=True)
+    if not tenants:
+        return None, "no project tenants recorded"
+    lowered = ref.lower()
+    resolved_path = ""
+    try:
+        resolved_path = str(Path(ref).expanduser().resolve())
+    except Exception:
+        resolved_path = ""
+
+    exact = [
+        tenant for tenant in tenants
+        if tenant.tenant_id == ref or tenant.root_path == ref or tenant.root_path == resolved_path
+    ]
+    if len(exact) == 1:
+        return exact[0], ""
+    if len(exact) > 1:
+        return None, f"ambiguous project ref '{ref}'"
+
+    named = [tenant for tenant in tenants if tenant.name.lower() == lowered]
+    if len(named) == 1:
+        return named[0], ""
+    if len(named) > 1:
+        names = ", ".join(f"{tenant.name}:{tenant.tenant_id}" for tenant in named)
+        return None, f"ambiguous project name '{ref}' ({names})"
+
+    prefixed = [tenant for tenant in tenants if tenant.tenant_id.startswith(ref)]
+    if len(prefixed) == 1:
+        return prefixed[0], ""
+    if len(prefixed) > 1:
+        ids = ", ".join(tenant.tenant_id for tenant in prefixed)
+        return None, f"ambiguous project id prefix '{ref}' ({ids})"
+
+    return None, f"unknown project '{ref}'"
+
+
+def _usage_cell(usage: db.ProjectTenantUsage) -> str:
+    return (
+        f"{usage.live_sessions} live, "
+        f"{usage.active_memories} active, "
+        f"{usage.archived_memories} archived"
+    )
 
 
 # ───────── watch ─────────
@@ -749,6 +807,148 @@ def list_cmd(
     iterm_client.run(_do)
 
 
+# ───────── projects ─────────
+
+@projects_app.command("list")
+def projects_list(
+    include_archived: bool = typer.Option(False, "--include-archived", help="Include archived project tenants."),
+):
+    """List known project tenants and their related mission graph rows."""
+    tenant_mod.backfill_known_tenants()
+    tenants = db.all_project_tenants(include_archived=include_archived)
+    if not tenants:
+        console.print("[dim]no project tenants recorded yet.[/dim]")
+        return
+
+    table = Table(
+        title=f"MORPHEUS PROJECTS — {len(tenants)} tenant(s)",
+        header_style="bold green",
+        show_lines=False,
+        row_styles=["", "dim"],
+    )
+    table.add_column("ID", style="cyan", no_wrap=True)
+    table.add_column("NAME", no_wrap=True)
+    table.add_column("USAGE")
+    table.add_column("ROWS", justify="right")
+    table.add_column("ROOT")
+
+    for tenant in tenants:
+        usage = db.project_tenant_usage(tenant.tenant_id)
+        status = " [red](archived)[/red]" if tenant.archived_at else ""
+        table.add_row(
+            tenant.tenant_id,
+            f"{tenant.name or '(unnamed)'}{status}",
+            _usage_cell(usage),
+            str(usage.graph_rows),
+            _display_path(tenant.root_path),
+        )
+    console.print(table)
+
+
+@projects_app.command("prune")
+def projects_prune(
+    yes: bool = typer.Option(False, "--yes", "-y", help="Delete empty project tenants without prompting."),
+    include_archived: bool = typer.Option(False, "--include-archived", help="Also prune archived empty tenants."),
+):
+    """Delete project tenant rows that have no related mission graph state."""
+    tenant_mod.backfill_known_tenants()
+    candidates = db.empty_project_tenants(include_archived=include_archived)
+    if not candidates:
+        console.print("[dim]no empty project tenants to prune.[/dim]")
+        return
+
+    console.print("[bold]Empty project tenants:[/bold]")
+    for tenant in candidates:
+        console.print(f"  • [cyan]{tenant.tenant_id}[/cyan] {tenant.name or '(unnamed)'}  [dim]{_display_path(tenant.root_path)}[/dim]")
+
+    if not yes:
+        ans = typer.prompt("\nDelete these empty project tenants? [y/N]", default="N")
+        if ans.strip().lower() != "y":
+            console.print("[dim]aborted.[/dim]")
+            return
+
+    results = db.prune_empty_project_tenants(include_archived=include_archived)
+    ledger_mod.log_action(
+        "project_prune",
+        details={
+            "deleted": [result.tenant_id for result in results],
+            "count": len(results),
+        },
+    )
+    console.print(f"[green]pruned {len(results)} empty project tenant(s)[/green]")
+
+
+@projects_app.command("delete")
+def projects_delete(
+    project: str = typer.Argument(..., help="Project tenant id, id prefix, name, or root path."),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Delete without prompting."),
+    close_live: bool = typer.Option(False, "--close-live", help="Close live iTerm tabs for this project before purging DB rows."),
+):
+    """Delete one project tenant and all related Morpheus-owned DB rows."""
+    tenant_mod.backfill_known_tenants()
+    tenant, error = _resolve_project_ref(project)
+    if tenant is None:
+        console.print(f"[red]{error}[/red]")
+        raise typer.Exit(1)
+
+    usage = db.project_tenant_usage(tenant.tenant_id)
+    console.print(
+        f"[bold]Project:[/bold] {tenant.name or tenant.tenant_id} "
+        f"[dim]{tenant.tenant_id}[/dim]\n"
+        f"[bold]Root:[/bold] {_display_path(tenant.root_path)}\n"
+        f"[bold]Usage:[/bold] {_usage_cell(usage)}; {usage.graph_rows} related DB row(s)"
+    )
+    if usage.live_sessions and not close_live:
+        console.print(
+            "[red]project still has live session rows; use --close-live or switch to it and close/prune sessions first[/red]"
+        )
+        raise typer.Exit(1)
+
+    if not yes:
+        ans = typer.prompt("\nDelete this project tenant and related DB rows? [y/N]", default="N")
+        if ans.strip().lower() != "y":
+            console.print("[dim]aborted.[/dim]")
+            return
+
+    if close_live and usage.live_sessions:
+        async def _close(connection):
+            closed = 0
+            failed: list[str] = []
+            for mission in db.all_missions(tenant_id=tenant.tenant_id):
+                ok = await iterm_client.close_tab(connection, mission.tab_id)
+                if ok:
+                    closed += 1
+                else:
+                    failed.append(mission.tab_id)
+            if failed:
+                console.print(f"[red]failed to close live tabs: {', '.join(failed)}[/red]")
+                raise typer.Exit(1)
+            console.print(f"[green]closed {closed} live tab(s)[/green]")
+
+        iterm_client.run(_close)
+
+    result = db.delete_project_tenant(
+        tenant.tenant_id,
+        allow_live=close_live or usage.live_sessions == 0,
+    )
+    if result.blocked_reason:
+        console.print(f"[red]{result.blocked_reason}[/red]")
+        raise typer.Exit(1)
+
+    ledger_mod.log_action(
+        "project_delete",
+        details={
+            "tenant_id": tenant.tenant_id,
+            "root_path": tenant.root_path,
+            "deleted": result.deleted,
+        },
+    )
+    console.print(
+        f"[green]deleted project tenant {tenant.name or tenant.tenant_id}; "
+        f"removed {result.total_deleted} DB row(s)[/green]"
+    )
+
+
 # ───────── prune ─────────
 
 @app.command()
@@ -879,7 +1079,8 @@ def _tab_id_for_session(session_id: str) -> Optional[str]:
 
 
 def _broadcast_payload(text: str, *, submit: bool) -> str:
-    return f"[morpheus broadcast] {text}" + ("\n" if submit else "")
+    payload = f"[morpheus broadcast] {text}"
+    return iterm_client.text_with_enter(payload) if submit else payload
 
 
 def _resolve_broadcast_targets(

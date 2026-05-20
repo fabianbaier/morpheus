@@ -10,14 +10,14 @@ from morpheus import cli, db, iterm_client
 
 
 class BroadcastCliTest(unittest.TestCase):
-    def test_broadcast_payload_stages_by_default_and_submits_with_newline(self) -> None:
+    def test_broadcast_payload_stages_by_default_and_submits_with_enter(self) -> None:
         self.assertEqual(
             cli._broadcast_payload("check remote commits", submit=False),
             "[morpheus broadcast] check remote commits",
         )
         self.assertEqual(
             cli._broadcast_payload("check remote commits", submit=True),
-            "[morpheus broadcast] check remote commits\n",
+            "[morpheus broadcast] check remote commits\r",
         )
 
     def test_resolve_broadcast_targets_excludes_self_by_default(self) -> None:
@@ -77,7 +77,7 @@ class BroadcastCliTest(unittest.TestCase):
 
         self.assertEqual(result.exit_code, 0, result.output)
         self.assertEqual(captured["send"]["tab_ids"], ["tab-other"])
-        self.assertEqual(captured["send"]["text"], "[morpheus broadcast] verify commits\n")
+        self.assertEqual(captured["send"]["text"], "[morpheus broadcast] verify commits\r")
         self.assertEqual(captured["note"]["text"], "verify commits")
         self.assertEqual(captured["note"]["tab_id"], "tab-self")
         self.assertEqual(captured["note"]["kind"], "broadcast")

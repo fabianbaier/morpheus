@@ -27,7 +27,7 @@ import tempfile
 import time
 from collections import deque
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
@@ -66,6 +66,9 @@ COL_BODY    = "color(252)"
 COL_ACCENT  = "bright_cyan"
 RAIN_INTERVAL_SECONDS = 2.0
 RAIN_SLOW_FRAME_SECONDS = 0.14
+MAX_LIVE_STREAM_SHARDS = 8
+MAX_FALLING_STREAM_SHARDS = 12
+STATUS_IDLE_PULSE_SECONDS = 1.0
 TABLE_REFRESH_SECONDS = 1.0
 TERMINAL_TAIL_SCAN_CHARS = 20_000
 COMPACT_LAYOUT_WIDTH = 120
@@ -267,6 +270,7 @@ class LoopActionRequest:
 class ProjectSwitchRequest:
     tenant_id: str
     show_all: bool = False
+    action: str = "switch"
 
 
 @dataclass
@@ -325,6 +329,8 @@ class StreamShard:
     y: int
     speed_ticks: int
     tick_counter: int = 0
+    last_changed_at: float = field(default_factory=time.monotonic)
+    ambient: bool = False
 
     def tick(self, height: int) -> bool:
         self.tick_counter += 1
@@ -346,6 +352,8 @@ class LiveStreamWidget(Static):
         self.buffers: dict[str, LiveBuffer] = {}
         self.selected_tab_id: Optional[str] = None
         self.shards: dict[str, StreamShard] = {}
+        self.falling_shards: deque[StreamShard] = deque(maxlen=MAX_FALLING_STREAM_SHARDS)
+        self._last_idle_pulse_at: dict[str, float] = {}
         self._has_active_rain = False
         self._idle_placeholder_rendered = False
         self._shard_signature: tuple | None = None
@@ -421,13 +429,19 @@ class LiveStreamWidget(Static):
             self.update(self._grid_to_text(grid))
             return
 
-        for shard in self._ordered_shards():
+        for shard in self.falling_shards:
             if 0 <= shard.y < height:
                 live = self.buffers.get(shard.tab_id)
-                style = self._shard_style(live)
+                style = self._shard_style(live, shard=shard)
                 self._overlay_text(grid, shard.x, shard.y, shard.text, style)
                 if shard.y + 1 < height:
                     self._overlay_text(grid, shard.x, shard.y + 1, self._ghost_text(shard.text), "color(29)")
+
+        for shard in self._ordered_shards():
+            if 0 <= shard.y < height:
+                live = self.buffers.get(shard.tab_id)
+                style = self._shard_style(live, shard=shard)
+                self._overlay_text(grid, shard.x, shard.y, shard.text, style)
 
         self.update(self._grid_to_text(grid))
 
@@ -510,17 +524,19 @@ class LiveStreamWidget(Static):
 
     def _ordered_shards(self) -> list[StreamShard]:
         ordered_tabs = [live.tab_id for live in self._ordered_buffers()]
-        index = {tab_id: i for i, tab_id in enumerate(ordered_tabs)}
-        return sorted(self.shards.values(), key=lambda shard: index.get(shard.tab_id, 99), reverse=True)
+        return [self.shards[tab_id] for tab_id in ordered_tabs if tab_id in self.shards]
 
     def _sync_shards(self) -> None:
         width = max(24, self.size.width - 4)
         height = max(6, self.size.height - 2)
-        ordered = self._ordered_buffers()[:8]
+        ordered = self._ordered_buffers()[:self._top_shard_limit(height)]
         active = {live.tab_id for live in ordered}
         for tab_id in list(self.shards.keys()):
             if tab_id not in active:
-                self.shards.pop(tab_id, None)
+                old = self.shards.pop(tab_id, None)
+                if old is not None:
+                    self._release_falling_shard(old, height)
+                self._last_idle_pulse_at.pop(tab_id, None)
 
         for index, live in enumerate(ordered):
             text = _stream_shard_text(live, width=max(12, width - 2))
@@ -529,26 +545,44 @@ class LiveStreamWidget(Static):
             existing = self.shards.get(live.tab_id)
             if existing is not None and existing.text == text:
                 existing.speed_ticks = self._shard_speed(live)
+                existing.x = 0
+                existing.y = index
+                self._maybe_add_idle_pulse(live, existing, width, height)
                 continue
+            if existing is not None:
+                self._release_falling_shard(existing, height)
+            now = time.monotonic()
             self.shards[live.tab_id] = StreamShard(
                 tab_id=live.tab_id,
                 text=text,
-                x=self._shard_x(live.tab_id, index, width, len(text)),
-                y=random.randint(0, max(0, height // 3)),
+                x=0,
+                y=index,
                 speed_ticks=self._shard_speed(live),
+                last_changed_at=now,
             )
+            self._last_idle_pulse_at[live.tab_id] = now
 
     def _sync_shards_if_needed(self) -> None:
         signature = self._current_shard_signature()
         if signature == self._shard_signature:
+            self._sync_idle_pulses()
             return
         self._shard_signature = signature
         self._sync_shards()
 
+    def _sync_idle_pulses(self) -> None:
+        width = max(24, self.size.width - 4)
+        height = max(6, self.size.height - 2)
+        ordered = self._ordered_buffers()[:self._top_shard_limit(height)]
+        for live in ordered:
+            existing = self.shards.get(live.tab_id)
+            if existing is not None:
+                self._maybe_add_idle_pulse(live, existing, width, height)
+
     def _current_shard_signature(self) -> tuple:
         width = max(24, self.size.width - 4)
         height = max(6, self.size.height - 2)
-        ordered = self._ordered_buffers()[:8]
+        ordered = self._ordered_buffers()[:MAX_LIVE_STREAM_SHARDS]
         return (
             width,
             height,
@@ -568,31 +602,64 @@ class LiveStreamWidget(Static):
 
     def _tick_shards(self) -> None:
         height = max(6, self.size.height - 2)
-        for tab_id, shard in list(self.shards.items()):
+        kept: deque[StreamShard] = deque(maxlen=MAX_FALLING_STREAM_SHARDS)
+        for shard in self.falling_shards:
             if shard.tick(height):
-                continue
-            live = self.buffers.get(tab_id)
-            if live is None:
-                self.shards.pop(tab_id, None)
-                continue
-            text = _stream_shard_text(live, width=max(12, self.size.width - 6))
-            shard.text = text
-            shard.y = -random.randint(0, max(1, height // 2))
-            shard.x = self._shard_x(tab_id, 0, max(24, self.size.width - 4), len(text))
+                kept.append(shard)
+        self.falling_shards = kept
 
-    def _shard_x(self, tab_id: str, index: int, width: int, text_len: int) -> int:
-        if width <= text_len + 1:
-            return 0
-        band = max(1, width // max(1, min(8, len(self.buffers) or 1)))
-        base = (index * band + (abs(hash(tab_id)) % max(1, band))) % width
-        return min(base, max(0, width - text_len - 1))
+    def _top_shard_limit(self, height: int) -> int:
+        return min(MAX_LIVE_STREAM_SHARDS, max(1, height // 3))
+
+    def _release_falling_shard(self, shard: StreamShard, height: int) -> None:
+        self.falling_shards.append(StreamShard(
+            tab_id=shard.tab_id,
+            text=shard.text,
+            x=0,
+            y=min(max(1, shard.y + 1), max(1, height - 1)),
+            speed_ticks=max(1, shard.speed_ticks),
+            last_changed_at=shard.last_changed_at,
+            ambient=shard.ambient,
+        ))
+
+    def _maybe_add_idle_pulse(
+        self,
+        live: LiveBuffer,
+        existing: StreamShard,
+        width: int,
+        height: int,
+    ) -> None:
+        now = time.monotonic()
+        if now - existing.last_changed_at < STATUS_IDLE_PULSE_SECONDS:
+            return
+        if now - self._last_idle_pulse_at.get(live.tab_id, 0.0) < STATUS_IDLE_PULSE_SECONDS:
+            return
+        self.falling_shards.append(StreamShard(
+            tab_id=live.tab_id,
+            text=self._ambient_pulse_text(existing.text, width=max(8, width - 2)),
+            x=0,
+            y=0,
+            speed_ticks=1,
+            last_changed_at=now,
+            ambient=True,
+        ))
+        self._last_idle_pulse_at[live.tab_id] = now
+
+    def _ambient_pulse_text(self, reference: str, width: int) -> str:
+        length = max(8, min(width, len(reference) or 16))
+        return "".join(
+            " " if random.random() < 0.18 else random.choice(rain_mod.CHARS)
+            for _ in range(length)
+        )
 
     def _shard_speed(self, live: LiveBuffer) -> int:
         if live.tab_id == self.selected_tab_id:
             return 1
         return {"working": 1, "blocked": 2, "crashed": 1, "idle": 3, "finished": 5}.get(live.state, 3)
 
-    def _shard_style(self, live: Optional[LiveBuffer]) -> str:
+    def _shard_style(self, live: Optional[LiveBuffer], *, shard: Optional[StreamShard] = None) -> str:
+        if shard is not None and shard.ambient:
+            return "color(29)"
         if live is None:
             return "bright_green"
         if live.tab_id == self.selected_tab_id:
@@ -1262,11 +1329,12 @@ def _closed_resume_command(memory: db.MissionMemory) -> str:
 def _post_spawn_resume_text(memory: db.MissionMemory) -> str:
     prompt = _closed_resume_prompt(memory)
     if memory.agent_kind in {"codex", "claude"}:
-        return f"{prompt}\n"
+        return iterm_client.text_with_enter(prompt)
     if memory.agent_kind == "gemini" and memory.resume_ref:
-        return f"/chat resume {memory.resume_ref}\n{prompt}\n"
+        resume = iterm_client.text_with_enter(f"/chat resume {memory.resume_ref}")
+        return f"{resume}{iterm_client.text_with_enter(prompt)}"
     if memory.agent_kind == "gemini":
-        return f"{prompt}\n"
+        return iterm_client.text_with_enter(prompt)
     return ""
 
 
@@ -1815,7 +1883,7 @@ class ProjectSwitchScreen(ModalScreen[Optional[ProjectSwitchRequest]]):
     ProjectSwitchScreen { align: center middle; }
     #project-dialog {
         width: 106;
-        height: 25;
+        height: 31;
         border: round ansi_bright_green;
         background: black;
         padding: 1 2;
@@ -1830,11 +1898,11 @@ class ProjectSwitchScreen(ModalScreen[Optional[ProjectSwitchRequest]]):
         margin-bottom: 1;
     }
     #project_table {
-        height: 13;
+        height: 12;
         margin-bottom: 1;
     }
     #project_detail {
-        height: 4;
+        height: 8;
         border: round green;
         padding: 0 1;
         color: ansi_bright_green;
@@ -1851,6 +1919,8 @@ class ProjectSwitchScreen(ModalScreen[Optional[ProjectSwitchRequest]]):
         Binding("k", "cursor_up", "prev"),
         Binding("down", "cursor_down", "next", show=False),
         Binding("up", "cursor_up", "prev", show=False),
+        Binding("p", "prune_selected", "prune empty"),
+        Binding("d", "delete_selected", "delete"),
     ]
 
     def __init__(
@@ -1864,6 +1934,7 @@ class ProjectSwitchScreen(ModalScreen[Optional[ProjectSwitchRequest]]):
         self.tenants = tenants
         self.current_tenant_id = current_tenant_id
         self.show_all = show_all
+        self.confirm_action: tuple[str, str] = ("", "")
         self.rows: list[ProjectSwitchRequest] = [
             ProjectSwitchRequest(tenant_id="", show_all=True),
             *[
@@ -1880,26 +1951,30 @@ class ProjectSwitchScreen(ModalScreen[Optional[ProjectSwitchRequest]]):
             yield Static("", id="project_detail")
             with Horizontal():
                 yield Button("select", variant="primary", id="project_select")
+                yield Button("prune empty", id="project_prune")
+                yield Button("delete", variant="error", id="project_delete")
                 yield Button("close", id="project_close")
 
     def on_mount(self) -> None:
         table = self.query_one("#project_table", DataTable)
         table.cursor_type = "row"
-        table.add_columns("SCOPE", "LIVE", "ROOT")
+        table.add_columns("SCOPE", "LIVE", "GRAPH", "ROOT")
         table.add_row(
             "global fleet" + (" *" if self.show_all else ""),
             str(len(db.all_missions())),
+            "—",
             "all project tenants",
         )
         selected_row = 0 if self.show_all else 0
         for idx, tenant in enumerate(self.tenants, start=1):
-            live_count = len(db.all_missions(tenant_id=tenant.tenant_id))
+            usage = self._usage(tenant.tenant_id)
             selected = " *" if tenant.tenant_id == self.current_tenant_id and not self.show_all else ""
             if selected:
                 selected_row = idx
             table.add_row(
                 f"{tenant.name or tenant.tenant_id}{selected}",
-                str(live_count),
+                str(usage.live_sessions),
+                str(usage.graph_rows),
                 _display_path(tenant.root_path),
             )
         table.cursor_coordinate = (selected_row, 0)
@@ -1909,26 +1984,71 @@ class ProjectSwitchScreen(ModalScreen[Optional[ProjectSwitchRequest]]):
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "project_select":
             self.action_select_project()
+        elif event.button.id == "project_prune":
+            self.action_prune_selected()
+        elif event.button.id == "project_delete":
+            self.action_delete_selected()
         else:
             self.action_close()
 
     def on_data_table_row_highlighted(self, event) -> None:
+        self.confirm_action = ("", "")
         self._refresh_detail()
 
     def action_cursor_down(self) -> None:
         table = self.query_one("#project_table", DataTable)
         table.action_cursor_down()
+        self.confirm_action = ("", "")
         self._refresh_detail()
 
     def action_cursor_up(self) -> None:
         table = self.query_one("#project_table", DataTable)
         table.action_cursor_up()
+        self.confirm_action = ("", "")
         self._refresh_detail()
 
     def action_select_project(self) -> None:
         request = self._selected_request()
         if request is not None:
             self.dismiss(request)
+
+    def action_prune_selected(self) -> None:
+        request = self._selected_request()
+        if request is None or request.show_all:
+            self.query_one("#project_detail", Static).update("Global fleet is not a project tenant.")
+            return
+        tenant = self._tenant_for_request(request)
+        if tenant is None:
+            self.query_one("#project_detail", Static).update("Project no longer exists.")
+            return
+        usage = self._usage(tenant.tenant_id)
+        if not usage.is_empty:
+            self.query_one("#project_detail", Static).update(self._detail(tenant, usage, blocked_prune=True))
+            return
+        if self.confirm_action != ("prune", tenant.tenant_id):
+            self.confirm_action = ("prune", tenant.tenant_id)
+            self.query_one("#project_detail", Static).update(self._detail(tenant, usage, confirm_prune=True))
+            return
+        self.dismiss(ProjectSwitchRequest(tenant_id=tenant.tenant_id, action="prune"))
+
+    def action_delete_selected(self) -> None:
+        request = self._selected_request()
+        if request is None or request.show_all:
+            self.query_one("#project_detail", Static).update("Global fleet is not a project tenant.")
+            return
+        tenant = self._tenant_for_request(request)
+        if tenant is None:
+            self.query_one("#project_detail", Static).update("Project no longer exists.")
+            return
+        usage = self._usage(tenant.tenant_id)
+        if usage.live_sessions:
+            self.query_one("#project_detail", Static).update(self._detail(tenant, usage, blocked_delete=True))
+            return
+        if self.confirm_action != ("delete", tenant.tenant_id):
+            self.confirm_action = ("delete", tenant.tenant_id)
+            self.query_one("#project_detail", Static).update(self._detail(tenant, usage, confirm_delete=True))
+            return
+        self.dismiss(ProjectSwitchRequest(tenant_id=tenant.tenant_id, action="delete"))
 
     def action_close(self) -> None:
         self.dismiss(None)
@@ -1940,6 +2060,15 @@ class ProjectSwitchScreen(ModalScreen[Optional[ProjectSwitchRequest]]):
             return None
         return self.rows[row]
 
+    def _tenant_for_request(self, request: ProjectSwitchRequest) -> Optional[db.ProjectTenant]:
+        return next((item for item in self.tenants if item.tenant_id == request.tenant_id), None)
+
+    def _usage(self, tenant_id: str) -> db.ProjectTenantUsage:
+        try:
+            return db.project_tenant_usage(tenant_id)
+        except Exception:
+            return db.ProjectTenantUsage(tenant_id=tenant_id)
+
     def _refresh_detail(self) -> None:
         request = self._selected_request()
         if request is None:
@@ -1947,12 +2076,44 @@ class ProjectSwitchScreen(ModalScreen[Optional[ProjectSwitchRequest]]):
         elif request.show_all:
             detail = "Global fleet: every live Morpheus session across all project roots."
         else:
-            tenant = next((item for item in self.tenants if item.tenant_id == request.tenant_id), None)
+            tenant = self._tenant_for_request(request)
             if tenant is None:
                 detail = "Project no longer exists."
             else:
-                detail = f"{tenant.name} ({tenant.root_kind})\n{tenant.root_path}"
+                detail = self._detail(tenant, self._usage(tenant.tenant_id))
         self.query_one("#project_detail", Static).update(detail)
+
+    def _detail(
+        self,
+        tenant: db.ProjectTenant,
+        usage: db.ProjectTenantUsage,
+        *,
+        confirm_prune: bool = False,
+        confirm_delete: bool = False,
+        blocked_prune: bool = False,
+        blocked_delete: bool = False,
+    ) -> str:
+        lines = [
+            f"{tenant.name or tenant.tenant_id} ({tenant.root_kind})",
+            tenant.root_path,
+            (
+                f"{usage.live_sessions} live · {usage.active_memories} active · "
+                f"{usage.archived_memories} archived · {usage.graph_rows} graph rows"
+            ),
+        ]
+        if blocked_prune:
+            lines.append("Prune only removes empty project tenants; delete purges non-live graph rows.")
+        elif blocked_delete:
+            lines.append("Close or prune live sessions before deleting this project tenant.")
+        elif confirm_prune:
+            lines.append("Press prune again to remove this empty project tenant row.")
+        elif confirm_delete:
+            lines.append("Press delete again to purge this tenant's stored graph rows.")
+        elif usage.is_empty:
+            lines.append("Empty project tenant; prune can remove it.")
+        else:
+            lines.append("Delete removes missions, memory, events, artifacts, edges, notes, and loops.")
+        return "\n".join(lines)
 
 
 class LoopManagerScreen(ModalScreen[Optional[LoopActionRequest]]):
@@ -3093,6 +3254,9 @@ class MorpheusApp(App):
     def _handle_project_switch_result(self, result: Optional[ProjectSwitchRequest]) -> None:
         if result is None:
             return
+        if result.action in {"prune", "delete"}:
+            self._handle_project_cleanup_result(result)
+            return
         if result.show_all:
             self.project = None
             self.show_all = True
@@ -3118,6 +3282,44 @@ class MorpheusApp(App):
             pass
         self._refresh_table()
         self._push_alert(Alert(time.time(), "summary", f"project scope: {self._scope_text()}"))
+
+    def _handle_project_cleanup_result(self, result: ProjectSwitchRequest) -> None:
+        if result.show_all or not result.tenant_id:
+            self._push_alert(Alert(time.time(), "error", "global fleet cannot be pruned"))
+            return
+        if result.action == "prune":
+            cleanup = db.prune_empty_project_tenant(result.tenant_id)
+        else:
+            cleanup = db.delete_project_tenant(result.tenant_id, allow_live=False)
+        if cleanup.blocked_reason:
+            self._push_alert(Alert(time.time(), "error", cleanup.blocked_reason))
+            return
+        ledger_mod.log_action(
+            f"project_{result.action}",
+            details={
+                "tenant_id": cleanup.tenant_id,
+                "root_path": cleanup.root_path,
+                "deleted": cleanup.deleted,
+            },
+        )
+
+        if result.tenant_id == self.tenant_id:
+            self.project = None
+            self.show_all = True
+            self.tenant_id = ""
+        try:
+            self.query_one("#header", Static).update(self._header_text(compact="compact" in self.screen.classes))
+        except Exception:
+            pass
+        self._refresh_table()
+        action = "pruned" if result.action == "prune" else "deleted"
+        self._push_alert(
+            Alert(
+                time.time(),
+                "summary",
+                f"{action} project [{cleanup.name or cleanup.tenant_id}] ({cleanup.total_deleted} DB rows)",
+            )
+        )
 
     def action_toggle_card_details(self) -> None:
         try:

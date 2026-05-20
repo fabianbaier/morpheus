@@ -454,6 +454,67 @@ class DashboardTest(unittest.IsolatedAsyncioTestCase):
 
         sync_shards.assert_called_once()
 
+    def test_new_stream_update_replaces_top_line_and_drops_old_line(self) -> None:
+        stream = dashboard.LiveStreamWidget()
+        stream.buffers = {
+            "tab-123456": LiveBuffer(
+                tab_id="tab-123456",
+                goal="X",
+                state="working",
+                last_event="active output",
+                buffer="First useful status.",
+                observed_at=1,
+            )
+        }
+
+        with patch.object(dashboard.time, "monotonic", return_value=1.0):
+            stream._sync_shards()
+
+        stream.buffers["tab-123456"] = LiveBuffer(
+            tab_id="tab-123456",
+            goal="X",
+            state="working",
+            last_event="active output",
+            buffer="Second useful status.",
+            observed_at=2,
+        )
+        with patch.object(dashboard.time, "monotonic", return_value=2.0):
+            stream._sync_shards()
+
+        current = stream.shards["tab-123456"]
+        self.assertEqual(current.x, 0)
+        self.assertEqual(current.y, 0)
+        self.assertIn("Second usefu", current.text)
+        self.assertEqual(len(stream.falling_shards), 1)
+        self.assertEqual(stream.falling_shards[0].x, 0)
+        self.assertGreaterEqual(stream.falling_shards[0].y, 1)
+        self.assertIn("First useful", stream.falling_shards[0].text)
+
+    def test_idle_stream_adds_capped_matrix_pulses_without_replacing_status(self) -> None:
+        stream = dashboard.LiveStreamWidget()
+        stream.buffers = {
+            "tab-123456": LiveBuffer(
+                tab_id="tab-123456",
+                goal="current debate on X",
+                state="working",
+                last_event="active output",
+                buffer="Latest real status.",
+                observed_at=1,
+            )
+        }
+
+        with patch.object(dashboard.time, "monotonic", return_value=1.0):
+            stream._sync_shards_if_needed()
+        current_text = stream.shards["tab-123456"].text
+
+        for step in range(dashboard.MAX_FALLING_STREAM_SHARDS + 4):
+            with patch.object(dashboard.time, "monotonic", return_value=3.0 + step):
+                stream._sync_shards_if_needed()
+
+        self.assertEqual(stream.shards["tab-123456"].text, current_text)
+        self.assertEqual(len(stream.falling_shards), dashboard.MAX_FALLING_STREAM_SHARDS)
+        self.assertTrue(all(shard.ambient for shard in stream.falling_shards))
+
     def test_header_shows_project_root_and_hidden_count(self) -> None:
         project = dashboard.db.ProjectTenant(
             tenant_id="p_current",
@@ -511,6 +572,40 @@ class DashboardTest(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(app.show_all)
         self.assertEqual(app.tenant_id, "p_b")
         self.assertEqual(set(app.live_buffers), {"tab-b"})
+
+    def test_project_cleanup_result_purges_current_scope_and_switches_global(self) -> None:
+        project = dashboard.db.ProjectTenant(
+            tenant_id="p_old",
+            name="old",
+            root_path="/tmp/old",
+        )
+        app = DashboardHarness(project=project)
+        captured = {}
+        cleanup = dashboard.db.ProjectCleanupResult(
+            tenant_id=project.tenant_id,
+            name=project.name,
+            root_path=project.root_path,
+            deleted={"project_tenants": 1, "mission_memory": 2},
+        )
+
+        def fake_log_action(action, tab_id=None, details=None):
+            captured["ledger"] = (action, tab_id, details)
+            return 1
+
+        with (
+            patch.object(dashboard.db, "delete_project_tenant", new=lambda tenant_id, allow_live=False: cleanup),
+            patch.object(dashboard.ledger_mod, "log_action", new=fake_log_action),
+            patch.object(dashboard.db, "all_missions", new=lambda tenant_id=None: []),
+            patch.object(app, "_refresh_table", new=lambda: None),
+        ):
+            app._handle_project_switch_result(dashboard.ProjectSwitchRequest("p_old", action="delete"))
+
+        self.assertIsNone(app.project)
+        self.assertTrue(app.show_all)
+        self.assertEqual(app.tenant_id, "")
+        self.assertEqual(captured["ledger"][0], "project_delete")
+        self.assertEqual(captured["ledger"][2]["deleted"], cleanup.deleted)
+        self.assertIn("deleted project", app.alerts[-1].text)
 
     async def test_project_switch_key_opens_switcher(self) -> None:
         project = dashboard.db.ProjectTenant(
@@ -1564,6 +1659,7 @@ class DashboardTest(unittest.IsolatedAsyncioTestCase):
             f"cd /tmp/work && codex --yolo resume {resume_id}",
         )
         self.assertIn("Resume this Morpheus mission", captured["send_text"]["text"])
+        self.assertTrue(captured["send_text"]["text"].endswith("\r"))
         self.assertEqual(captured["send_text"]["tab_ids"], ["tab-new"])
         self.assertEqual(captured["mission"].mission_id, "m_closed")
         self.assertEqual(captured["mission"].tab_id, "tab-new")
@@ -1571,6 +1667,21 @@ class DashboardTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(captured["memory"].phase, "working")
         self.assertEqual(captured["event"]["kind"], "resume")
         self.assertEqual(captured["event"]["metadata"]["agent_kind"], "codex")
+
+    def test_post_spawn_resume_text_submits_gemini_resume_and_prompt(self) -> None:
+        memory = dashboard.db.MissionMemory(
+            mission_id="m_closed",
+            title="Closed Gemini mission",
+            next_step="answer follow-up",
+            agent_kind="gemini",
+            resume_ref="gemini-session",
+        )
+
+        text = dashboard._post_spawn_resume_text(memory)
+
+        self.assertIn("/chat resume gemini-session\r", text)
+        self.assertIn("Resume this Morpheus mission", text)
+        self.assertTrue(text.endswith("\r"))
 
     async def test_new_session_submit_spawns_tab_and_records_mission(self) -> None:
         app = DashboardHarness()
