@@ -1,19 +1,18 @@
-"""Live dashboard — runs inside one dedicated iTerm tab.
+"""Interactive mission control TUI built on Textual.
 
-Drives the same tick logic as `morpheus watch` (so every other tab's title
-stays current) and renders a three-pane TUI:
+Live in this tab. Spawn, browse, focus, prune, snapshot — all from keybindings.
+The morpheus tab is your command center; the iTerm tabs are your workers.
 
-  ┌── banner + summary ─────────────────────────────────┐
-  │                                                     │
-  │  ┌── matrix rain ─────┐  ┌── mission table ──────┐  │
-  │  │                    │  │                        │  │
-  │  │   katakana drops   │  │   tab | st | goal …    │  │
-  │  │                    │  │                        │  │
-  │  └────────────────────┘  └────────────────────────┘  │
-  │                                                     │
-  │  ┌── 🐇 alerts (recent state changes + notes) ────┐  │
-  │  └─────────────────────────────────────────────────┘  │
-  └─────────────────────────────────────────────────────┘
+  ┌─ MORPHEUS banner ─────────────────────────────────────────────────────┐
+  │                                                                       │
+  │  ┌── rain ────────────┐  ┌── missions (sorted newest-active first) ┐  │
+  │  │  vertical katakana │  │  cursor-navigable, ticker-flash on      │  │
+  │  │  per session       │  │  state change (green/yellow/red row)    │  │
+  │  └────────────────────┘  └────────────────────────────────────────┘   │
+  │  ┌── 🐇 alerts ──────────────────────────────────────────────────┐    │
+  │  └────────────────────────────────────────────────────────────────┘   │
+  │  [j/k] nav  [enter] focus  [n] new  [d] kill  [p] prune  …            │
+  └───────────────────────────────────────────────────────────────────────┘
 """
 
 from __future__ import annotations
@@ -22,22 +21,23 @@ import asyncio
 import time
 from collections import deque
 from dataclasses import dataclass
+from typing import Optional
 
 import iterm2
-from rich.align import Align
-from rich.console import Console, Group
-from rich.layout import Layout
-from rich.live import Live
-from rich.panel import Panel
-from rich.table import Table
 from rich.text import Text
+from textual.app import App, ComposeResult
+from textual.binding import Binding
+from textual.containers import Container, Horizontal, Vertical
+from textual.screen import ModalScreen
+from textual.widgets import Button, DataTable, Footer, Input, Label, RichLog, Static
 
+from morpheus import context as ctx_mod
 from morpheus import core, db, iterm_client, naming, rain as rain_mod
 from morpheus import __version__
 
-console = Console()
+# ── content / palette ─────────────────────────────────────────────────────
 
-# ── style + content constants ─────────────────────────────────────────────
+RABBIT = "🐇"
 
 BANNER = r"""
  ███╗   ███╗ ██████╗ ██████╗ ██████╗ ██╗  ██╗███████╗██╗   ██╗███████╗
@@ -48,32 +48,42 @@ BANNER = r"""
  ╚═╝     ╚═╝ ╚═════╝ ╚═╝  ╚═╝╚═╝     ╚═╝  ╚═╝╚══════╝ ╚═════╝ ╚══════╝
 """.strip("\n")
 
-# White rabbit — used for every "new / push-to-user" event. (Follow it.)
-RABBIT = "🐇"
-ALERTS_MAX = 12
+COL_MUTED   = "color(244)"
+COL_DIMMER  = "bright_black"
+COL_BODY    = "color(252)"
+COL_ACCENT  = "bright_cyan"
 
-STATE_ORDER = {"blocked": 0, "crashed": 1, "working": 2,
-               "idle": 3, "finished": 4, "unknown": 5}
-STATE_STYLE = {
+STATE_TEXT_STYLE = {
     "blocked":  "bold bright_red",
     "crashed":  "bold bright_magenta",
     "working":  "bright_green",
     "idle":     "bright_yellow",
-    "finished": "color(244)",   # readable gray, not invisible-on-black `dim`
-    "unknown":  "color(250)",   # light gray, calmer than pure white
+    "finished": "color(244)",
+    "unknown":  "color(250)",
 }
 
-# Color palette for everything else (tuned for true-black backgrounds):
-COL_MUTED  = "color(244)"   # secondary text — clearly legible
-COL_DIMMER = "bright_black"  # tertiary — visible dark gray on most terminals
-COL_BODY   = "color(252)"   # near-white body text
-COL_ACCENT = "bright_cyan"   # call-attention non-alert (spawn etc.)
+# Stock-ticker row background colors (entire row paints this color for ~3s
+# after a state change, then settles back to default).
+FLASH_BG = {
+    "working":  "color(22)",   # dark green — "gaining"
+    "idle":     "color(58)",   # dark yellow
+    "blocked":  "color(94)",   # dark amber — needs you
+    "crashed":  "color(52)",   # dark red — "losing"
+    "finished": "color(53)",   # dark magenta — done
+    "unknown":  "color(238)",
+}
+FLASH_DURATION = 3.0  # seconds
+
+# Sort order for the missions table when there are no flashes pulling
+# things up — newest activity first.
+def _sort_key(m: db.Mission):
+    return -m.buffer_changed_at
 
 
 @dataclass
 class Alert:
     ts: float
-    kind: str   # state | note | spawn | close
+    kind: str   # state | note | spawn | close | error
     text: str
 
     def render(self) -> Text:
@@ -84,21 +94,366 @@ class Alert:
             "note":  "bright_green",
             "spawn": COL_ACCENT,
             "close": COL_MUTED,
+            "error": "bold bright_red",
         }.get(self.kind, COL_BODY)
         t.append(self.text, style=style)
         return t
 
 
-class DashboardState:
-    """Mutable state held across frames."""
+# ── rain widget ───────────────────────────────────────────────────────────
+
+class RainWidget(Static):
+    """Static widget that owns a rain.Rain and renders it every tick."""
+
+    def __init__(self, **kw):
+        super().__init__("", **kw)
+        self.rain: Optional[rain_mod.Rain] = None
+
+    def on_show(self) -> None:
+        self._ensure_rain()
+
+    def on_resize(self, event) -> None:
+        if self.rain is None:
+            self._ensure_rain()
+        else:
+            cols, rows = self._inner_size()
+            self.rain.resize(cols=cols, rows=rows)
+
+    def _inner_size(self) -> tuple[int, int]:
+        # Subtract a few for the panel border + padding.
+        w = max(8, self.size.width - 2)
+        h = max(4, self.size.height - 2)
+        return w, h
+
+    def _ensure_rain(self) -> None:
+        if self.rain is None:
+            cols, rows = self._inner_size()
+            self.rain = rain_mod.Rain(cols=cols, rows=rows)
+
+    def tick_rain(self, missions: list[db.Mission]) -> None:
+        if self.rain is None:
+            self._ensure_rain()
+        if self.rain is None:
+            return
+        self.rain.update_missions(missions)
+        self.rain.tick()
+        self.update(self.rain.render())
+
+
+# ── missions table ────────────────────────────────────────────────────────
+
+class MissionsTable(DataTable):
+    """Sortable, navigable missions list with row-flash on state change."""
+
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        self.cursor_type = "row"
+        self.zebra_stripes = False
+        self.row_tab_ids: list[str] = []
+
+    def on_mount(self) -> None:
+        self.add_columns("ID", "ST", "GOAL", "AGE", "LAST EVENT")
+
+    def refresh_rows(
+        self,
+        missions: list[db.Mission],
+        flashing: dict[str, tuple[float, str]],
+    ) -> None:
+        # Preserve cursor position by tab_id across refreshes when possible.
+        prior_tab = self.row_tab_ids[self.cursor_row] if (
+            self.row_tab_ids and 0 <= self.cursor_row < len(self.row_tab_ids)
+        ) else None
+
+        self.clear()
+        self.row_tab_ids = []
+
+        sorted_m = sorted(missions, key=_sort_key)
+        now = time.time()
+
+        for m in sorted_m:
+            self.row_tab_ids.append(m.tab_id)
+            emoji = naming.STATE_EMOJI.get(m.state, "⚪")
+            age = naming.format_age(naming.now_minus(m.buffer_changed_at))
+            tab_short = (m.tab_id or "?").split("-")[0]
+            goal_disp = m.goal or "(untitled)"
+            last_evt = m.last_event or "—"
+
+            flash = flashing.get(m.tab_id)
+            if flash and flash[0] > now:
+                bg = FLASH_BG.get(flash[1], "color(238)")
+                cell_style = f"bold bright_white on {bg}"
+            else:
+                cell_style = STATE_TEXT_STYLE.get(m.state, COL_BODY)
+
+            self.add_row(
+                Text(tab_short, style=cell_style),
+                Text(emoji),
+                Text(goal_disp, style=cell_style),
+                Text(age, style=cell_style),
+                Text(last_evt, style=cell_style),
+            )
+
+        # Restore cursor to the same tab if it still exists.
+        if prior_tab and prior_tab in self.row_tab_ids:
+            self.move_cursor(row=self.row_tab_ids.index(prior_tab))
+
+    def selected_tab_id(self) -> Optional[str]:
+        if not self.row_tab_ids:
+            return None
+        if self.cursor_row is None or self.cursor_row < 0:
+            return None
+        if self.cursor_row >= len(self.row_tab_ids):
+            return None
+        return self.row_tab_ids[self.cursor_row]
+
+
+# ── modal: spawn new session ──────────────────────────────────────────────
+
+class NewSessionScreen(ModalScreen[Optional[tuple[str, str]]]):
+    """Modal form to spawn a new iTerm tab + register a mission card."""
+
+    CSS = """
+    NewSessionScreen {
+        align: center middle;
+    }
+    #dialog {
+        width: 70;
+        height: 16;
+        border: round bright_green;
+        background: black;
+        padding: 1 2;
+    }
+    #dialog Label.title {
+        color: bright_green;
+        text-style: bold;
+        margin-bottom: 1;
+    }
+    #dialog Label.hint {
+        color: $text-muted;
+    }
+    Input {
+        background: black;
+        color: bright_green;
+        border: round green;
+        margin: 0 0 1 0;
+    }
+    Input:focus {
+        border: round bright_green;
+    }
+    #buttons {
+        height: 3;
+        align: center middle;
+    }
+    Button {
+        margin: 0 1;
+    }
+    """
+
+    BINDINGS = [
+        Binding("escape", "cancel", "cancel"),
+        Binding("ctrl+enter", "submit", "spawn"),
+    ]
+
+    def compose(self) -> ComposeResult:
+        with Container(id="dialog"):
+            yield Label(f"{RABBIT}  SPAWN NEW SESSION", classes="title")
+            yield Input(placeholder="goal — one line, e.g. 'PR #224 review'", id="goal_input")
+            yield Input(placeholder="command — e.g. 'codex' or 'claude'", id="cmd_input")
+            yield Label("enter to spawn · esc to cancel", classes="hint")
+            with Horizontal(id="buttons"):
+                yield Button("spawn", id="spawn_btn", variant="success")
+                yield Button("cancel", id="cancel_btn", variant="default")
+
+    def on_mount(self) -> None:
+        self.query_one("#goal_input", Input).focus()
+
+    def action_submit(self) -> None:
+        goal = self.query_one("#goal_input", Input).value
+        cmd = self.query_one("#cmd_input", Input).value
+        if cmd:
+            self.dismiss((goal, cmd))
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        if event.input.id == "goal_input":
+            self.query_one("#cmd_input", Input).focus()
+        elif event.input.id == "cmd_input":
+            self.action_submit()
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "spawn_btn":
+            self.action_submit()
+        else:
+            self.action_cancel()
+
+
+# ── modal: post note ──────────────────────────────────────────────────────
+
+class NoteScreen(ModalScreen[Optional[tuple[str, str, Optional[str]]]]):
+    """Post a cross-session note. Returns (kind, text, tab_id_or_None)."""
+
+    CSS = """
+    NoteScreen { align: center middle; }
+    #dialog {
+        width: 70;
+        height: 12;
+        border: round bright_yellow;
+        background: black;
+        padding: 1 2;
+    }
+    #dialog Label.title {
+        color: bright_yellow;
+        text-style: bold;
+        margin-bottom: 1;
+    }
+    Input {
+        background: black;
+        color: bright_yellow;
+        border: round yellow;
+    }
+    Input:focus { border: round bright_yellow; }
+    """
+
+    BINDINGS = [
+        Binding("escape", "cancel", "cancel"),
+    ]
+
+    def __init__(self, attach_tab_id: Optional[str] = None):
+        super().__init__()
+        self.attach_tab_id = attach_tab_id
+
+    def compose(self) -> ComposeResult:
+        with Container(id="dialog"):
+            title = f"{RABBIT}  NEW NOTE"
+            if self.attach_tab_id:
+                title += f"  (attached to {self.attach_tab_id.split('-')[0]})"
+            yield Label(title, classes="title")
+            yield Input(placeholder="note text · enter to post · esc to cancel", id="text_input")
+
+    def on_mount(self) -> None:
+        self.query_one("#text_input", Input).focus()
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        text = event.value.strip()
+        if text:
+            self.dismiss(("note", text, self.attach_tab_id))
+        else:
+            self.dismiss(None)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+# ── main app ──────────────────────────────────────────────────────────────
+
+FOOTER_BINDINGS = [
+    Binding("j", "cursor_down", "↓"),
+    Binding("k", "cursor_up", "↑"),
+    Binding("down", "cursor_down", "next", show=False),
+    Binding("up", "cursor_up", "prev", show=False),
+    Binding("enter", "focus_session", "focus tab"),
+    Binding("n", "new_session", "new"),
+    Binding("d", "kill_session", "kill"),
+    Binding("p", "prune_stale", "prune"),
+    Binding("s", "snapshot_session", "snapshot"),
+    Binding("slash", "post_note", "note"),
+    Binding("r", "refresh_now", "refresh"),
+    Binding("q", "quit", "quit"),
+    Binding("ctrl+c", "quit", "quit", show=False),
+]
+
+
+class MorpheusApp(App):
+    """The interactive Matrix mission control."""
+
+    TITLE = "▶ MORPHEUS"
+    SUB_TITLE = f"mission control v{__version__}"
+
+    BINDINGS = FOOTER_BINDINGS
+
+    CSS = """
+    Screen {
+        background: black;
+        color: white;
+    }
+    #header {
+        height: 9;
+        background: black;
+        color: bright_green;
+        content-align: center middle;
+    }
+    #body {
+        height: 1fr;
+    }
+    #rain-panel {
+        width: 40%;
+        border: round green;
+        background: black;
+        padding: 0 0;
+    }
+    #missions-panel {
+        width: 60%;
+        border: round green;
+        background: black;
+    }
+    #alerts-panel {
+        height: 14;
+        border: round bright_yellow;
+        background: black;
+        color: white;
+    }
+    DataTable {
+        background: black;
+    }
+    DataTable > .datatable--header {
+        background: black;
+        color: bright_green;
+        text-style: bold;
+    }
+    DataTable > .datatable--cursor {
+        background: bright_green 25%;
+    }
+    DataTable > .datatable--hover {
+        background: green 15%;
+    }
+    Footer {
+        background: black;
+        color: bright_green;
+    }
+    """
 
     def __init__(self):
-        self.alerts: deque[Alert] = deque(maxlen=ALERTS_MAX)
-        self.last_seen_note_id: int = 0
+        super().__init__()
+        self.iterm_conn = None
+        self.alerts: deque = deque(maxlen=12)
+        self.flashing: dict[str, tuple[float, str]] = {}
         self.last_seen_tabs: set[str] = set()
-        self.rain: rain_mod.Rain | None = None
-        self.last_layout_size: tuple[int, int] = (0, 0)
-        # Initial watermarks so we don't replay existing state as fresh alerts.
+        self.last_seen_note_id: int = 0
+        self.log_handle = None
+
+    # ── compose ────────────────────────────────────────────────────────────
+
+    def compose(self) -> ComposeResult:
+        banner = Text(BANNER, style="bold bright_green", justify="center")
+        sub = Text(
+            f"\nmission control v{__version__}  •  {RABBIT} follow the white rabbit",
+            style=COL_MUTED, justify="center",
+        )
+        yield Static(banner + sub, id="header")
+        with Horizontal(id="body"):
+            yield RainWidget(id="rain-panel")
+            yield MissionsTable(id="missions-panel")
+        yield RichLog(id="alerts-panel", markup=False, wrap=False, highlight=False)
+        yield Footer()
+
+    # ── mount + intervals ──────────────────────────────────────────────────
+
+    async def on_mount(self) -> None:
+        self.log_handle = core.setup_logging()
+
+        # Watermarks so we don't replay existing notes/sessions as fresh alerts.
         try:
             recent = db.recent_notes(limit=1)
             self.last_seen_note_id = recent[0].id if recent else 0
@@ -109,263 +464,303 @@ class DashboardState:
         except Exception:
             pass
 
-    def push(self, alert: Alert) -> None:
-        self.alerts.appendleft(alert)
-
-
-# ── renderers ─────────────────────────────────────────────────────────────
-
-def _summary_line(missions: list[db.Mission]) -> Text:
-    counts: dict[str, int] = {}
-    for m in missions:
-        counts[m.state] = counts.get(m.state, 0) + 1
-
-    t = Text(f"◉ {len(missions)} mission(s)   ", style="bold bright_white")
-    for emoji, key in [("🔴", "blocked"), ("💀", "crashed"), ("🟢", "working"),
-                       ("🟡", "idle"), ("⚫", "finished")]:
-        c = counts.get(key, 0)
-        if c:
-            t.append(f"{emoji} {c} {key}   ", style=STATE_STYLE.get(key, COL_BODY))
-    return t
-
-
-def _render_header() -> Group:
-    return Group(
-        Align.center(Text(BANNER, style="bold bright_green")),
-        Align.center(Text(
-            f"mission control v{__version__}  •  {RABBIT} follow the white rabbit  •  Ctrl-C to exit",
-            style=COL_MUTED,
-        )),
-    )
-
-
-def _render_mission_table(missions: list[db.Mission], live_ids: set[str],
-                          stale_after_hours: float = 4.0) -> Table:
-    table = Table(
-        header_style="bold bright_green",
-        border_style="green",
-        show_header=True,
-        expand=True,
-        padding=(0, 1),
-    )
-    table.add_column("ID",         style="bright_green", no_wrap=True, width=8)
-    table.add_column("ST",         width=3, justify="center")
-    table.add_column("GOAL",       ratio=3)
-    table.add_column("AGE",        justify="right", width=6, style=COL_BODY)
-    table.add_column("LAST EVENT", ratio=3, overflow="fold", style=COL_MUTED)
-
-    sorted_m = sorted(missions, key=lambda m: (STATE_ORDER.get(m.state, 9), -m.updated_at))
-    for m in sorted_m:
-        emoji = naming.STATE_EMOJI.get(m.state, "⚪")
-        age_secs = naming.now_minus(m.buffer_changed_at)
-        age = naming.format_age(age_secs)
-        style = STATE_STYLE.get(m.state, COL_BODY)
-        goal_disp = m.goal or "(untitled)"
-        # Stale tabs get an inline age prefix in bright yellow so they pop.
-        stale = (m.state in ("idle", "finished")) and age_secs >= stale_after_hours * 3600
-        goal_text = Text()
-        if stale:
-            goal_text.append(f"({age}) ", style="bright_yellow")
-        goal_text.append(goal_disp, style=style)
-        tab_short = (m.tab_id or "?").split("-")[0]
-        table.add_row(tab_short, emoji, goal_text, age, m.last_event or "—")
-    return table
-
-
-def _render_alerts(state: DashboardState) -> Group:
-    if not state.alerts:
-        empty = Text(
-            f"{RABBIT}  no incoming. waiting for sessions to do interesting things…",
-            style=COL_MUTED,
-        )
-        return Group(empty)
-    lines = [a.render() for a in list(state.alerts)]
-    return Group(*lines)
-
-
-def _build_layout(rain: rain_mod.Rain, missions: list[db.Mission],
-                  live_ids: set[str], state: DashboardState) -> Layout:
-    layout = Layout()
-    layout.split_column(
-        Layout(name="header", size=10),
-        Layout(name="body", ratio=1),
-        Layout(name="alerts", size=ALERTS_MAX + 2),
-    )
-    layout["body"].split_row(
-        Layout(name="rain", ratio=2),
-        Layout(name="missions", ratio=3),
-    )
-    layout["header"].update(_render_header())
-
-    rain_title = Text("rain  ", style="bold bright_green")
-    rain_title.append("(state: speed · brightness · color)", style=COL_MUTED)
-    layout["rain"].update(Panel(
-        rain.render(),
-        title=rain_title,
-        border_style="green",
-        padding=(0, 0),
-    ))
-
-    layout["missions"].update(Panel(
-        Group(_summary_line(missions), Text(""), _render_mission_table(missions, live_ids)),
-        title=Text("missions", style="bold bright_green"),
-        border_style="green",
-    ))
-
-    alerts_title = Text(f"{RABBIT}  alerts  ", style="bold bright_white")
-    alerts_title.append("(state changes · new notes · spawns)", style=COL_MUTED)
-    layout["alerts"].update(Panel(
-        _render_alerts(state),
-        title=alerts_title,
-        border_style="bright_yellow",   # draws the eye — this is where things to follow live
-    ))
-    return layout
-
-
-# ── self-tab management ───────────────────────────────────────────────────
-
-async def _claim_self_tab(connection) -> None:
-    """Rename this tab so the watcher excludes it."""
-    app = await iterm2.async_get_app(connection)
-    if app is None:
-        return
-    window = app.current_terminal_window
-    if window is None:
-        return
-    tab = window.current_tab
-    if tab is None or tab.current_session is None:
-        return
-    try:
-        await tab.current_session.async_set_name(naming.MORPHEUS_TAB_PREFIX)
-    except Exception:
-        pass
-
-
-# ── alert sources ─────────────────────────────────────────────────────────
-
-def _scan_new_missions(state: DashboardState, missions: list[db.Mission]) -> None:
-    current = {m.tab_id for m in missions}
-    new_tabs = current - state.last_seen_tabs
-    closed_tabs = state.last_seen_tabs - current
-    by_id = {m.tab_id: m for m in missions}
-    for tab in new_tabs:
-        m = by_id.get(tab)
-        if m is None:
-            continue
-        state.push(Alert(
-            ts=time.time(),
-            kind="spawn",
-            text=f"new session [{m.goal or '(untitled)'}] {tab.split('-')[0]}",
-        ))
-    for tab in closed_tabs:
-        state.push(Alert(
-            ts=time.time(),
-            kind="close",
-            text=f"session [{tab.split('-')[0]}] closed",
-        ))
-    state.last_seen_tabs = current
-
-
-def _scan_new_notes(state: DashboardState) -> None:
-    recent = db.recent_notes(limit=ALERTS_MAX)
-    fresh = [n for n in recent if n.id > state.last_seen_note_id]
-    if not fresh:
-        return
-    # Map tab_id -> goal for nicer alert text.
-    goals = {m.tab_id: (m.goal or "(untitled)") for m in db.all_missions()}
-    for n in sorted(fresh, key=lambda n: n.created_at):
-        goal = goals.get(n.tab_id or "", "unknown")
-        marker = {"note": "•", "claim": "⚑", "broadcast": "📡"}.get(n.kind, "•")
-        state.push(Alert(
-            ts=n.created_at,
-            kind="note",
-            text=f"{marker} note from [{goal}]: {n.text}",
-        ))
-    state.last_seen_note_id = max(n.id for n in fresh)
-
-
-def _make_state_hook(state: DashboardState):
-    async def on_state_change(mission: db.Mission, old: str, new: str) -> None:
-        emoji_new = naming.STATE_EMOJI.get(new, "⚪")
-        emoji_old = naming.STATE_EMOJI.get(old, "⚪")
-        goal = mission.goal or (mission.tab_id or "?").split("-")[0]
-        # Only blocked/crashed/finished transitions get alerts to reduce noise.
-        important_new = new in ("blocked", "crashed", "finished")
-        important_old = old in ("blocked", "crashed")
-        if not (important_new or important_old):
+        # Connect to iTerm2 (async — runs inside Textual's event loop).
+        try:
+            self.iterm_conn = await iterm2.Connection.async_create()
+        except Exception as e:
+            self._push_alert(Alert(time.time(), "error", f"iTerm2 connect failed: {e}"))
             return
-        state.push(Alert(
-            ts=time.time(),
-            kind="state",
-            text=f"{emoji_old} → {emoji_new}  [{goal}] is now {new}",
+
+        await self._claim_self_tab()
+        self._push_alert(Alert(
+            time.time(), "spawn",
+            f"morpheus dashboard online — follow the white rabbit."
         ))
-    return on_state_change
+
+        # Heavy tick: enumerate iTerm tabs, detect state, write DB + titles + context.
+        self.set_interval(2.0, self._do_tick)
+        # Light tick: animate rain.
+        self.set_interval(0.12, self._do_rain_animate)
+        # Table re-render (catches flash-expiry without waiting for next heavy tick).
+        self.set_interval(0.5, self._refresh_table)
+
+    async def _claim_self_tab(self) -> None:
+        app = await iterm2.async_get_app(self.iterm_conn)
+        if app is None:
+            return
+        window = app.current_terminal_window
+        if window is None:
+            return
+        tab = window.current_tab
+        if tab is None or tab.current_session is None:
+            return
+        try:
+            await tab.current_session.async_set_name(naming.MORPHEUS_TAB_PREFIX)
+        except Exception:
+            pass
+
+    # ── tick loop ──────────────────────────────────────────────────────────
+
+    async def _do_tick(self) -> None:
+        if self.iterm_conn is None:
+            return
+        try:
+            await core._tick(
+                self.iterm_conn, self.log_handle,
+                on_state_change=self._on_state_change,
+            )
+            missions = db.all_missions()
+            self._scan_new_missions(missions)
+            self._scan_new_notes()
+        except Exception as e:
+            self.log_handle.exception("tick error: %s", e)
+
+    def _do_rain_animate(self) -> None:
+        try:
+            missions = db.all_missions()
+        except Exception:
+            return
+        try:
+            rain_widget = self.query_one(RainWidget)
+            rain_widget.tick_rain(missions)
+        except Exception:
+            pass
+
+    def _refresh_table(self) -> None:
+        try:
+            missions = db.all_missions()
+        except Exception:
+            return
+        # Expire old flashes.
+        now = time.time()
+        self.flashing = {k: v for k, v in self.flashing.items() if v[0] > now}
+        try:
+            table = self.query_one(MissionsTable)
+            table.refresh_rows(missions, self.flashing)
+        except Exception:
+            pass
+
+    # ── change detection / alerts ──────────────────────────────────────────
+
+    async def _on_state_change(self, mission: db.Mission, old: str, new: str) -> None:
+        # Start a flash for this row.
+        self.flashing[mission.tab_id] = (time.time() + FLASH_DURATION, new)
+        # Push an alert for notable transitions.
+        if new in ("blocked", "crashed", "finished") or old in ("blocked", "crashed"):
+            emoji_old = naming.STATE_EMOJI.get(old, "⚪")
+            emoji_new = naming.STATE_EMOJI.get(new, "⚪")
+            goal = mission.goal or (mission.tab_id or "?").split("-")[0]
+            self._push_alert(Alert(
+                time.time(), "state",
+                f"{emoji_old} → {emoji_new}  [{goal}] is now {new}",
+            ))
+
+    def _scan_new_missions(self, missions: list[db.Mission]) -> None:
+        current = {m.tab_id for m in missions}
+        new_tabs = current - self.last_seen_tabs
+        closed_tabs = self.last_seen_tabs - current
+        by_id = {m.tab_id: m for m in missions}
+        for t in new_tabs:
+            m = by_id.get(t)
+            if m is None:
+                continue
+            self.flashing[t] = (time.time() + FLASH_DURATION, m.state or "working")
+            self._push_alert(Alert(
+                time.time(), "spawn",
+                f"new session [{m.goal or '(untitled)'}] {t.split('-')[0]}",
+            ))
+        for t in closed_tabs:
+            self._push_alert(Alert(
+                time.time(), "close",
+                f"session [{t.split('-')[0]}] closed",
+            ))
+        self.last_seen_tabs = current
+
+    def _scan_new_notes(self) -> None:
+        recent = db.recent_notes(limit=12)
+        fresh = [n for n in recent if n.id > self.last_seen_note_id]
+        if not fresh:
+            return
+        goals = {m.tab_id: (m.goal or "(untitled)") for m in db.all_missions()}
+        for n in sorted(fresh, key=lambda n: n.created_at):
+            goal = goals.get(n.tab_id or "", "unknown")
+            marker = {"note": "•", "claim": "⚑", "broadcast": "📡"}.get(n.kind, "•")
+            self._push_alert(Alert(
+                n.created_at, "note",
+                f"{marker} note from [{goal}]: {n.text}",
+            ))
+        self.last_seen_note_id = max(n.id for n in fresh)
+
+    def _push_alert(self, alert: Alert) -> None:
+        self.alerts.appendleft(alert)
+        try:
+            rich_log = self.query_one("#alerts-panel", RichLog)
+            rich_log.write(alert.render())
+        except Exception:
+            pass
+
+    # ── actions (keybindings) ──────────────────────────────────────────────
+
+    def action_cursor_down(self) -> None:
+        try:
+            self.query_one(MissionsTable).action_cursor_down()
+        except Exception:
+            pass
+
+    def action_cursor_up(self) -> None:
+        try:
+            self.query_one(MissionsTable).action_cursor_up()
+        except Exception:
+            pass
+
+    async def action_focus_session(self) -> None:
+        if self.iterm_conn is None:
+            return
+        table = self.query_one(MissionsTable)
+        tab_id = table.selected_tab_id()
+        if not tab_id:
+            return
+        app = await iterm2.async_get_app(self.iterm_conn)
+        if app is None:
+            return
+        for window in app.windows:
+            for tab in window.tabs:
+                if tab.tab_id == tab_id:
+                    try:
+                        await window.async_activate()
+                    except Exception:
+                        pass
+                    try:
+                        await tab.async_select()
+                    except Exception:
+                        try:
+                            await tab.async_activate()
+                        except Exception:
+                            pass
+                    self._push_alert(Alert(
+                        time.time(), "spawn",
+                        f"focused [{tab_id.split('-')[0]}]"
+                    ))
+                    return
+
+    async def action_new_session(self) -> None:
+        if self.iterm_conn is None:
+            return
+        result = await self.push_screen_wait(NewSessionScreen())
+        if not result:
+            return
+        goal, cmd = result
+        if not cmd:
+            return
+        info = await iterm_client.spawn_tab(self.iterm_conn, command=cmd, goal=goal)
+        if info is None:
+            self._push_alert(Alert(time.time(), "error", "spawn failed — is iTerm focused?"))
+            return
+        now = time.time()
+        m = db.Mission(
+            tab_id=info.tab_id, session_id=info.session_id,
+            goal=goal or naming.infer_goal_from_cmd(cmd) or "(untitled)",
+            state="working", cmd=cmd,
+            buffer_changed_at=now, last_event_at=now, created_at=now,
+        )
+        db.upsert(m)
+        # Alert will fire on next _scan_new_missions.
+
+    async def action_kill_session(self) -> None:
+        if self.iterm_conn is None:
+            return
+        table = self.query_one(MissionsTable)
+        tab_id = table.selected_tab_id()
+        if not tab_id:
+            return
+        ok = await iterm_client.close_tab(self.iterm_conn, tab_id)
+        if ok:
+            db.delete(tab_id)
+            self._push_alert(Alert(
+                time.time(), "close",
+                f"killed [{tab_id.split('-')[0]}]"
+            ))
+
+    async def action_prune_stale(self) -> None:
+        if self.iterm_conn is None:
+            return
+        now = time.time()
+        stale_threshold = 4 * 3600
+        live = await iterm_client.enumerate_tabs(self.iterm_conn)
+        live_ids = {t.tab_id for t in live}
+        candidates = []
+        for m in db.all_missions():
+            if m.tab_id not in live_ids:
+                continue
+            if m.state not in ("idle", "finished"):
+                continue
+            if (now - m.buffer_changed_at) < stale_threshold:
+                continue
+            candidates.append(m)
+        closed = 0
+        for m in candidates:
+            ok = await iterm_client.close_tab(self.iterm_conn, m.tab_id)
+            if ok:
+                db.delete(m.tab_id)
+                closed += 1
+        self._push_alert(Alert(
+            time.time(), "close",
+            f"pruned {closed}/{len(candidates)} stale tabs",
+        ))
+
+    async def action_snapshot_session(self) -> None:
+        if self.iterm_conn is None:
+            return
+        from pathlib import Path
+        table = self.query_one(MissionsTable)
+        tab_id = table.selected_tab_id()
+        if not tab_id:
+            return
+        live = await iterm_client.enumerate_tabs(self.iterm_conn)
+        tab = next((t for t in live if t.tab_id == tab_id), None)
+        if tab is None:
+            return
+        m = db.get(tab_id) or db.Mission(tab_id=tab_id)
+        ts = time.strftime("%Y-%m-%dT%H-%M-%S")
+        snap_dir = Path.home() / ".morpheus" / "snapshots"
+        snap_dir.mkdir(parents=True, exist_ok=True)
+        out_path = snap_dir / f"{ts}-{tab_id.split('-')[0]}.md"
+        body = (
+            f"# Morpheus snapshot — {ts}\n\n"
+            f"- **Tab**: `{tab_id}`\n"
+            f"- **Goal**: {m.goal or '(untitled)'}\n"
+            f"- **State**: {m.state}\n"
+            f"- **Last event**: {m.last_event}\n"
+            f"- **Cmd**: `{m.cmd or '?'}`\n\n"
+            f"## Buffer\n\n```\n{tab.buffer}\n```\n"
+        )
+        out_path.write_text(body)
+        self._push_alert(Alert(
+            time.time(), "spawn",
+            f"snapshot → {out_path.name}",
+        ))
+
+    async def action_post_note(self) -> None:
+        table = self.query_one(MissionsTable)
+        attach_tab = table.selected_tab_id()
+        result = await self.push_screen_wait(NoteScreen(attach_tab_id=attach_tab))
+        if not result:
+            return
+        kind, text, tab_id = result
+        db.add_note(text=text, tab_id=tab_id, session_id=None, kind=kind)
+        try:
+            ctx_mod.write_context_file()
+            ctx_mod.write_context_json()
+        except Exception:
+            pass
+        # Will surface on next _scan_new_notes.
+
+    async def action_refresh_now(self) -> None:
+        await self._do_tick()
+        self._refresh_table()
 
 
-# ── main loop ─────────────────────────────────────────────────────────────
-
-async def _loop(connection):
-    log = core.setup_logging()
-    await _claim_self_tab(connection)
-    log.info("dashboard started")
-
-    state = DashboardState()
-    on_state_change = _make_state_hook(state)
-    state.push(Alert(ts=time.time(), kind="spawn",
-                     text="morpheus dashboard online — follow the white rabbit."))
-
-    last_tick = 0.0
-    last_size = (0, 0)
-
-    with Live(console=console, refresh_per_second=12, screen=True,
-              transient=False) as live:
-        while True:
-            try:
-                now = time.time()
-
-                # Heavy tick: poll iTerm, detect state, write DB + titles + context.
-                if now - last_tick >= 2.0:
-                    await core._tick(connection, log, on_state_change=on_state_change)
-                    fresh_missions = db.all_missions()
-                    _scan_new_missions(state, fresh_missions)
-                    _scan_new_notes(state)
-                    last_tick = now
-
-                missions = db.all_missions()
-                live_tabs = await iterm_client.enumerate_tabs(connection)
-
-                # Compute the inner area of the rain panel: console - misc framing.
-                # Width of rain pane ≈ (2/5) * console.width minus borders.
-                # Height ≈ console.height minus header(10) minus alerts(14) minus borders.
-                w = max(20, int(console.size.width * 2 / 5) - 4)
-                h = max(8, console.size.height - 10 - (ALERTS_MAX + 2) - 4)
-
-                if state.rain is None:
-                    state.rain = rain_mod.Rain(cols=w, rows=h)
-                elif (w, h) != last_size:
-                    state.rain.resize(cols=w, rows=h)
-                    last_size = (w, h)
-
-                state.rain.update_missions(missions)
-                state.rain.tick()
-
-                live.update(_build_layout(
-                    state.rain, missions, {t.tab_id for t in live_tabs}, state,
-                ))
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:
-                log.exception("dashboard tick error: %s", e)
-            await asyncio.sleep(0.08)  # ~12 fps
-
+# ── public entry ──────────────────────────────────────────────────────────
 
 def run() -> None:
-    console.print(
-        f"[bold bright_green]▶ MORPHEUS[/bold bright_green] — launching dashboard "
-        f"(this tab is now the command center; titles sync every 2s)\n"
-        f"[bright_black]{RABBIT} follow the white rabbit — Ctrl-C to exit.[/bright_black]"
-    )
-    try:
-        iterm_client.run_app(_loop)
-    except KeyboardInterrupt:
-        console.print("\n[bright_black]dashboard closed.[/bright_black]")
+    MorpheusApp().run()

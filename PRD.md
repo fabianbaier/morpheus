@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| **Status** | v0.1.0 (rain + 🐇 alerts shipped) |
+| **Status** | v0.2.0 (interactive Textual TUI: keybindings, stock-ticker row flash, in-dashboard spawn/kill/prune/note) |
 | **Author** | Fabian Baier |
 | **Last updated** | 2026-05-19 |
 | **Target platform** | macOS + iTerm2 |
@@ -349,7 +349,39 @@ connect."
 
 ## 9. Roadmap
 
-### v0.1 — Rain + alerts (PARTIALLY SHIPPED 2026-05-19)
+### v0.2 — Interactive TUI (SHIPPED 2026-05-19)
+
+Morpheus is now the user's home base. Live in the morpheus tab; navigate,
+spawn, focus, prune, snapshot, post notes — all without leaving.
+
+Stack: switched the dashboard from `rich.Live` to **Textual** (canonical
+Python TUI framework, by the Rich author). Rich.Text + rain.Rain still
+own the rendering of cells/animation.
+
+Shipped:
+- ✅ DataTable of missions, **sorted newest-active first** (by
+  `buffer_changed_at` desc).
+- ✅ **Stock-ticker row flash**: on every state change, the entire row
+  paints a state-colored background for 3s, then settles. Green for
+  →working, yellow for →blocked, red for →crashed, magenta for
+  →finished. Mirrors a Bloomberg green/red ticker.
+- ✅ Keybinding-driven UX:
+  - `j/k` (or arrows) — navigate the missions table
+  - `Enter` — focus the selected session's iTerm tab (jumps you there
+    via `tab.async_select`)
+  - `n` — modal: spawn new session (goal + command form)
+  - `d` — close the selected session's iTerm tab
+  - `p` — prune all stale (idle/finished, age > 4h)
+  - `s` — snapshot selected to `~/.morpheus/snapshots/`
+  - `/` — modal: post a cross-session note attached to the selected tab
+  - `r` — force-refresh the heavy tick now
+  - `q` (or Ctrl+C) — quit
+- ✅ Two modal screens (`NewSessionScreen`, `NoteScreen`) — input fields
+  with green/yellow Matrix borders, Enter/Esc to commit/cancel.
+- ✅ Rain widget still animates inside its panel, sized to container.
+- ✅ Footer auto-renders the active keybindings.
+
+### v0.1 — Rain + alerts (SHIPPED 2026-05-19)
 
 Shipped:
 - ✅ Matrix rain animation in the dashboard. One vertical stream per session;
