@@ -394,6 +394,11 @@ def _stream_shard_text(live: LiveBuffer, width: int) -> str:
     return _truncate(f"{emoji} {label} :: {snippet}", width)
 
 
+def _summary_alert_key(mission: db.Mission, headline: str, verb: str) -> str:
+    source = mission.buffer_hash or headline
+    return f"{mission.tab_id}:{source}:{verb}:{headline}"
+
+
 def _is_headline_noise(line: str) -> bool:
     if len(line) < 3:
         return True
@@ -843,6 +848,7 @@ class MorpheusApp(App):
         self.last_seen_tabs: set[str] = set()
         self.last_seen_note_id: int = 0
         self.live_buffers: dict[str, LiveBuffer] = {}
+        self.summary_alert_hashes: dict[str, str] = {}
         self.self_tab_id: Optional[str] = None
         self.self_session_id: Optional[str] = None
         self.log_handle = None
@@ -1017,7 +1023,20 @@ class MorpheusApp(App):
         # Start a flash for this row.
         self.flashing[mission.tab_id] = (time.time() + FLASH_DURATION, new)
         if new == "finished":
-            self._push_session_end_alert(mission)
+            self._push_session_summary_alert(
+                mission,
+                verb="completed",
+                fallback=mission.last_event or "session ended",
+            )
+            return
+        if new == "idle" and old in ("working", "blocked"):
+            pushed = self._push_session_summary_alert(
+                mission,
+                verb="ready",
+                fallback="",
+            )
+            if pushed:
+                return
             return
 
         # Push an alert for notable transitions.
@@ -1030,15 +1049,27 @@ class MorpheusApp(App):
                 f"{emoji_old} → {emoji_new}  [{goal}] is now {new}",
             ))
 
-    def _push_session_end_alert(self, mission: db.Mission) -> None:
+    def _push_session_summary_alert(
+        self,
+        mission: db.Mission,
+        *,
+        verb: str,
+        fallback: str = "",
+    ) -> bool:
         goal = mission.goal or (mission.tab_id or "?").split("-")[0]
         live = self.live_buffers.get(mission.tab_id)
         headline = _session_headline(
             live.buffer if live else "",
-            fallback=mission.last_event or "session ended",
+            fallback=fallback,
         )
+        if not headline:
+            return False
+        summary_key = _summary_alert_key(mission, headline, verb)
+        if self.summary_alert_hashes.get(mission.tab_id) == summary_key:
+            return False
+        self.summary_alert_hashes[mission.tab_id] = summary_key
         detail = f" — {headline}" if headline else ""
-        text = f"completed [{goal}]{detail}"
+        text = f"{verb} [{goal}]{detail}"
         self._push_alert(Alert(time.time(), "summary", text))
         if mission.mission_id:
             try:
@@ -1048,10 +1079,15 @@ class MorpheusApp(App):
                     actor="morpheus",
                     summary=text,
                     source_ref=f"tab:{mission.tab_id}",
-                    metadata={"state": mission.state, "last_event": mission.last_event},
+                    metadata={
+                        "state": mission.state,
+                        "last_event": mission.last_event,
+                        "summary_kind": verb,
+                    },
                 )
             except Exception:
                 pass
+        return True
 
     def _scan_new_missions(self, missions: list[db.Mission]) -> None:
         current = {m.tab_id for m in missions}
@@ -1070,8 +1106,10 @@ class MorpheusApp(App):
         for t in closed_tabs:
             if self._is_self_tab_id(t):
                 self.live_buffers.pop(t, None)
+                self.summary_alert_hashes.pop(t, None)
                 continue
             live = self.live_buffers.pop(t, None)
+            self.summary_alert_hashes.pop(t, None)
             goal = (live.goal if live else "") or t.split("-")[0]
             headline = _session_headline(live.buffer if live else "")
             detail = f" — {headline}" if headline else ""

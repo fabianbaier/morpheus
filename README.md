@@ -76,8 +76,8 @@ table controls selection, and the right card shows the selected mission's graph
 memory plus the latest terminal tail. Use `j`/`k` or arrows to move, then press
 `Enter` to jump into the real iTerm tab when you need to respond directly. Use
 `n` to spawn a new session without leaving Morpheus. The bottom white-rabbit
-strip acts like a ticker: blocked prompts, collisions, spawns, notes, and
-completed-session headlines roll in there.
+strip acts like a ticker: blocked prompts, collisions, spawns, notes,
+completed-session headlines, and ready-response headlines roll in there.
 
 Core commands:
 
@@ -213,9 +213,10 @@ Next implementation phases:
 4. Session-end rabbit ticker headlines. Done in `0.7.0a4`.
 5. Matrix rain output shards. Done in `0.7.0a5`.
 6. Robust self-tab exclusion. Done in `0.7.0a6`.
-7. Edit mission flow for why/plan/next/provenance/proof fields.
-8. `b` brief-selected using mission graph plus transcript tail.
-9. Resume-fresh flow that snapshots, archives old attachment, and spawns a new
+7. Ready-response rabbit ticker headlines. Done in `0.7.0a7`.
+8. Edit mission flow for why/plan/next/provenance/proof fields.
+9. `b` brief-selected using mission graph plus transcript tail.
+10. Resume-fresh flow that snapshots, archives old attachment, and spawns a new
    session linked by a `spawned_from` edge.
 
 > "I can only show you the door. You're the one that has to walk through it."

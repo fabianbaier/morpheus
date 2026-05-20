@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| **Status** | v0.7.0a6 implemented (robust self-tab exclusion); next: edit mission flow |
+| **Status** | v0.7.0a7 implemented (ready-response rabbit ticker); next: edit mission flow |
 | **Author** | Fabian Baier |
 | **Last updated** | 2026-05-20 |
 | **Target platform** | macOS + iTerm2 |
@@ -291,6 +291,9 @@ Required live-stream behavior:
   session finishes or closes, it should show a short headline from the latest
   substantive terminal output so completed work arrives as skimmable ticker
   items.
+- Agent sessions that finish a response and return to an idle prompt should also
+  produce a ticker headline. A hard process exit is not required; `working →
+  idle` with new substantive output counts as "ready for review."
 
 Acceptance test: start a Codex session that performs a web search, keep focus
 in Morpheus, and verify the cockpit shows the search/tool progress and latest
@@ -649,6 +652,7 @@ This table is the source of truth for where the product stands right now.
 | Session-end rabbit ticker | Implemented in v0.7.0a4 | Finished sessions now emit bottom-strip completion headlines from the latest substantive terminal output and store a mission summary event when possible |
 | Matrix rain output shards | Implemented in v0.7.0a5 | Left panel is rain-first again: real terminal output is embedded as falling bright shards inside the Matrix rain instead of rendered as a static terminal tail |
 | Robust self-tab exclusion | Implemented in v0.7.0a6 | Dashboard passes its own tab/session IDs into the watcher; core also recognizes the Morpheus screen by buffer if iTerm leaves the title as `Python"` |
+| Ready-response rabbit ticker | Implemented in v0.7.0a7 | `working → idle` now emits a `ready [...]` headline from the latest substantive terminal output, so Codex answers that return to the prompt show in the bottom ticker |
 | Edit mission flow | Not implemented | `e` opens goal/why/plan/next/criteria/source/proof editor |
 | Brief selected | Not implemented | `b` renders a cited why/status/next card from graph + transcript tail |
 | Resume fresh | Not implemented | `r` snapshots, archives old attachment, spawns replacement with mission context |

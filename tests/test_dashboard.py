@@ -180,6 +180,53 @@ class DashboardTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(captured["event"]["actor"], "morpheus")
         self.assertEqual(captured["event"]["summary"], alert.text)
 
+    async def test_idle_after_working_pushes_ready_ticker_once(self) -> None:
+        app = DashboardHarness()
+        events = []
+        mission = dashboard.db.Mission(
+            tab_id="tab-123456",
+            mission_id="m_20260520000102_abcd1234",
+            goal="latest news on X",
+            state="idle",
+            last_event="idle 38s",
+            buffer_hash="hash-ready",
+        )
+        app.live_buffers[mission.tab_id] = LiveBuffer(
+            tab_id=mission.tab_id,
+            goal=mission.goal,
+            state=mission.state,
+            last_event=mission.last_event,
+            buffer="Searching the web\nThe latest X debate is split across policy and sports.",
+            observed_at=0,
+        )
+
+        def fake_add_event(mission_id, kind, summary, actor="user", source_ref="", metadata=None):
+            events.append(
+                {
+                    "mission_id": mission_id,
+                    "kind": kind,
+                    "summary": summary,
+                    "actor": actor,
+                    "source_ref": source_ref,
+                    "metadata": metadata,
+                }
+            )
+            return 1
+
+        with patch.object(dashboard.db, "add_event", new=fake_add_event):
+            await app._on_state_change(mission, "working", "idle")
+            await app._on_state_change(mission, "working", "idle")
+
+        self.assertEqual(len(app.alerts), 1)
+        alert = app.alerts[0]
+        self.assertEqual(alert.kind, "summary")
+        self.assertEqual(
+            alert.text,
+            "ready [latest news on X] — The latest X debate is split across policy and sports.",
+        )
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["metadata"]["summary_kind"], "ready")
+
     def test_scan_new_missions_silently_drops_self_tab(self) -> None:
         app = MorpheusApp()
         app.self_tab_id = "self-tab"
