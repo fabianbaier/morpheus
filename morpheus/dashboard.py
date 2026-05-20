@@ -68,6 +68,21 @@ STATE_TEXT_STYLE = {
 
 ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+SEPARATOR_RE = re.compile(r"^[\s\-_=~*·•.┄─━═╍╎│|┆┊┉┈—–]+$")
+LEADING_MARKER_RE = re.compile(r"^\s*(?:[-*•]|\d+[.)])\s+")
+SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+(?=[A-Z0-9\"'“])")
+CONCLUSION_RE = re.compile(
+    r"\b("
+    r"answer|bottom line|tl;dr|summary|recommend|recommendation|"
+    r"practical answer|my pick|i['’]?d focus|i would focus|i(?:'|’)d use|"
+    r"focus on|looks like|next step|done|fixed|shipped|implemented"
+    r")\b",
+    re.IGNORECASE,
+)
+TRAILING_DISCLAIMER_RE = re.compile(
+    r"\s+(?:This is )?not (?:financial|legal|medical) advice\.?$",
+    re.IGNORECASE,
+)
 
 # Stock-ticker row background colors (entire row paints this color for ~3s
 # after a state change, then settles back to default).
@@ -384,12 +399,66 @@ def _session_headline(
     fallback: str = "",
     width: int = 120,
 ) -> str:
+    lines = _latest_response_lines(buffer)
+    headline = _response_headline(lines)
+    if headline:
+        return _truncate(headline, width)
+    return _truncate(fallback, width) if fallback else ""
+
+
+def _latest_response_lines(buffer: str) -> list[str]:
+    lines: list[str] = []
     for raw in reversed(buffer.splitlines()):
         line = _clean_terminal_line(raw)
+        if not line:
+            continue
+        if _is_response_boundary(line):
+            if lines:
+                break
+            continue
         if _is_headline_noise(line):
             continue
-        return _truncate(line, width)
-    return _truncate(fallback, width) if fallback else ""
+        lines.append(line)
+    return list(reversed(lines))
+
+
+def _response_headline(lines: list[str]) -> str:
+    candidates: list[tuple[int, str]] = []
+    for index, line in enumerate(lines):
+        candidate = _headline_candidate(line)
+        if not candidate:
+            continue
+        score = index
+        if CONCLUSION_RE.search(candidate):
+            score += 100
+        if candidate.endswith((".", "!", "?")):
+            score += 5
+        candidates.append((score, candidate))
+
+    if not candidates:
+        return ""
+    _score, candidate = max(candidates, key=lambda item: item[0])
+    return _first_sentence(candidate)
+
+
+def _headline_candidate(line: str) -> str:
+    line = LEADING_MARKER_RE.sub("", line).strip()
+    if _is_summary_candidate_noise(line):
+        return ""
+    line = TRAILING_DISCLAIMER_RE.sub("", line)
+    return " ".join(line.split()).strip()
+
+
+def _first_sentence(value: str) -> str:
+    value = value.strip()
+    if not value:
+        return ""
+    parts = [part.strip() for part in SENTENCE_SPLIT_RE.split(value) if part.strip()]
+    for part in parts:
+        if _is_summary_candidate_noise(part):
+            continue
+        return TRAILING_DISCLAIMER_RE.sub("", part).strip()
+    return value
 
 
 def _stream_shard_text(live: LiveBuffer, width: int) -> str:
@@ -411,6 +480,8 @@ def _summary_alert_key(mission: db.Mission, headline: str, verb: str) -> str:
 def _is_headline_noise(line: str) -> bool:
     if len(line) < 3:
         return True
+    if _is_separator_line(line):
+        return True
     lowered = line.lower()
     if lowered.startswith("use /skills to list"):
         return True
@@ -418,9 +489,43 @@ def _is_headline_noise(line: str) -> bool:
         return True
     if lowered.startswith("> use /skills to list"):
         return True
-    if lowered.startswith("gpt-") and "·" in lowered:
+    if lowered.startswith("gpt-") and ("·" in lowered or "~" in lowered):
         return True
     if lowered in {"searching the web", "thinking", "working"}:
+        return True
+    if lowered.startswith("searched "):
+        return True
+    return False
+
+
+def _is_response_boundary(line: str) -> bool:
+    if _is_separator_line(line):
+        return True
+    lowered = line.lower()
+    if lowered.startswith("› ") and not lowered.startswith("› use /skills"):
+        return True
+    if lowered.startswith("> ") and not lowered.startswith("> use /skills"):
+        return True
+    if lowered.startswith("❯ "):
+        return True
+    return False
+
+
+def _is_separator_line(line: str) -> bool:
+    return bool(SEPARATOR_RE.fullmatch(line))
+
+
+def _is_summary_candidate_noise(line: str) -> bool:
+    lowered = line.lower()
+    if _is_headline_noise(line):
+        return True
+    if lowered.startswith(("sources:", "source:")):
+        return True
+    if lowered.startswith(("caveat:", "disclaimer:")):
+        return True
+    if lowered in {"not financial advice.", "not legal advice.", "not medical advice."}:
+        return True
+    if "http://" in lowered or "https://" in lowered:
         return True
     return False
 

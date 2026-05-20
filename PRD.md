@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| **Status** | v0.8.0a1 implemented (PRD Runs foundation); next: child-worker tree UI |
+| **Status** | v0.8.0a2 implemented (ready-response headlines); next: child-worker tree UI |
 | **Author** | Fabian Baier |
 | **Last updated** | 2026-05-20 |
 | **Target platform** | macOS + iTerm2 |
@@ -294,6 +294,12 @@ Required live-stream behavior:
 - Agent sessions that finish a response and return to an idle prompt should also
   produce a ticker headline. A hard process exit is not required; `working →
   idle` with new substantive output counts as "ready for review."
+- Ready/completed headlines must summarize the latest assistant answer block,
+  not merely the last visible terminal line. They should ignore Codex prompt
+  chrome, model/status lines, web-search trace lines, source URLs, and
+  separator rules, then select a one-sentence response headline. A future
+  background LLM summarizer may improve this, but the cockpit must never block
+  on a synchronous summarization call.
 
 Acceptance test: start a Codex session that performs a web search, keep focus
 in Morpheus, and verify the cockpit shows the search/tool progress and latest
@@ -681,7 +687,7 @@ This table is the source of truth for where the product stands right now.
 | Session-end rabbit ticker | Implemented in v0.7.0a4 | Finished sessions now emit bottom-strip completion headlines from the latest substantive terminal output and store a mission summary event when possible |
 | Matrix rain output shards | Implemented in v0.7.0a5 | Left panel is rain-first again: real terminal output is embedded as falling bright shards inside the Matrix rain instead of rendered as a static terminal tail |
 | Robust self-tab exclusion | Implemented in v0.7.0a6 | Dashboard passes its own tab/session IDs into the watcher; core also recognizes the Morpheus screen by buffer if iTerm leaves the title as `Python"` |
-| Ready-response rabbit ticker | Implemented in v0.7.0a7 | `working → idle` now emits a `ready [...]` headline from the latest substantive terminal output, so Codex answers that return to the prompt show in the bottom ticker |
+| Ready-response rabbit ticker | Implemented in v0.8.0a2 | `working → idle` now emits a `ready [...]` headline by extracting the latest assistant answer block, skipping Codex chrome/separators/source URLs, and compressing it to one sentence |
 | PRD Runs foundation | Implemented in v0.8.0a1 | PRD finder, new-session PRD selector, parent mission creation, coordinator prompt/status files, `morpheus run start`, and coordinator graph edge shipped |
 | PRD run tree UI | Not implemented | Show parent PRD rows with collapsible coordinator/worker children in the mission table |
 | PRD child worker spawn | Not implemented | Manual worker spawn under selected parent with file/path ownership and proof requirements |

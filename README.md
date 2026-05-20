@@ -78,6 +78,9 @@ memory plus the latest terminal tail. Use `j`/`k` or arrows to move, then press
 `n` to spawn a new session without leaving Morpheus. The bottom white-rabbit
 strip acts like a ticker: blocked prompts, collisions, spawns, notes,
 completed-session headlines, and ready-response headlines roll in there.
+Ready/completed headlines summarize the latest assistant answer block instead
+of blindly using the last terminal line, so Codex prompt chrome and separator
+rules do not become ticker text.
 
 Core commands:
 
@@ -235,7 +238,7 @@ Next implementation phases:
 4. Session-end rabbit ticker headlines. Done in `0.7.0a4`.
 5. Matrix rain output shards. Done in `0.7.0a5`.
 6. Robust self-tab exclusion. Done in `0.7.0a6`.
-7. Ready-response rabbit ticker headlines. Done in `0.7.0a7`.
+7. Ready-response rabbit ticker headlines. Done in `0.8.0a2`.
 8. PRD Runs foundation. Done in `0.8.0a1`.
 9. Collapsible PRD run tree in the cockpit.
 10. Manual child-worker spawn under a PRD run.

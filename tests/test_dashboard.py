@@ -122,6 +122,48 @@ class DashboardTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(rendered, "Assuming you mean X/Twitter: two debate clusters.")
 
+    def test_session_headline_ignores_codex_chrome_and_summarizes_answer(self) -> None:
+        rendered = _session_headline(
+            "\n".join(
+                [
+                    "› and what do you think is a great new stockprice for tomorrow",
+                    "• Searching the web",
+                    "• Searched finance: WMT",
+                    "────────────────────────────────────────────────────────────",
+                    "For tomorrow, I’d focus on WMT.",
+                    "",
+                    "Current price: $134.20",
+                    "My “good entry” zone: $130–$132",
+                    "I would avoid chasing it above: $136+",
+                    "",
+                    "So my practical answer: WMT under $132 looks like the better disciplined buy zone for tomorrow. Not financial advice.",
+                    "────────────────────────────────────────────────────────────",
+                    "› Use /skills to list available skills",
+                    "gpt-5.5 xhigh · ~",
+                ]
+            ),
+            fallback="idle",
+        )
+
+        self.assertEqual(
+            rendered,
+            "So my practical answer: WMT under $132 looks like the better disciplined buy zone for tomorrow.",
+        )
+
+    def test_session_headline_skips_sources_after_answer(self) -> None:
+        rendered = _session_headline(
+            "\n".join(
+                [
+                    "The fix is to store run state in the mission graph.",
+                    "Sources: https://example.com/docs",
+                    "› Use /skills to list available skills",
+                ]
+            ),
+            fallback="idle",
+        )
+
+        self.assertEqual(rendered, "The fix is to store run state in the mission graph.")
+
     def test_stream_shard_text_embeds_live_output_in_mission_label(self) -> None:
         live = LiveBuffer(
             tab_id="tab-123456",
@@ -197,7 +239,14 @@ class DashboardTest(unittest.IsolatedAsyncioTestCase):
             goal=mission.goal,
             state=mission.state,
             last_event=mission.last_event,
-            buffer="Searching the web\nThe latest X debate is split across policy and sports.",
+            buffer="\n".join(
+                [
+                    "Searching the web",
+                    "The latest X debate is split across policy and sports.",
+                    "────────────────────────────────────────────────────────────",
+                    "› Use /skills to list available skills",
+                ]
+            ),
             observed_at=0,
         )
 
