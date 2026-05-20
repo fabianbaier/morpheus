@@ -56,19 +56,28 @@ class FakeRichLog:
 
 
 @contextmanager
-def isolated_dashboard_runtime(missions=None):
+def isolated_dashboard_runtime(missions=None, memories=None, edges=None):
     async def fake_async_create():
         return object()
 
     mission_rows = list(missions or [])
+    memory_rows = list(memories or [])
+    edge_rows = list(edges or [])
 
     with (
         patch.object(dashboard.iterm2.Connection, "async_create", new=fake_async_create),
         patch.object(dashboard.core, "setup_logging", new=lambda: FakeLogger()),
         patch.object(dashboard.db, "recent_notes", new=lambda limit=1: []),
         patch.object(dashboard.db, "all_missions", new=lambda: list(mission_rows)),
-        patch.object(dashboard.db, "all_memory", new=lambda include_archived=False: []),
-        patch.object(dashboard.db, "edges_from_id", new=lambda *args, **kwargs: []),
+        patch.object(dashboard.db, "all_memory", new=lambda include_archived=False: list(memory_rows)),
+        patch.object(
+            dashboard.db,
+            "edges_from_id",
+            new=lambda node_id, relation="", limit=50: [
+                edge for edge in edge_rows
+                if edge.from_id == node_id and (not relation or edge.relation == relation)
+            ][:limit],
+        ),
     ):
         yield
 
@@ -129,7 +138,7 @@ class DashboardTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("verify the b key modal [prd:PRD.md]", brief.body)
         self.assertIn("latest terminal detail [tab:tab-123456]", brief.body)
 
-    def test_mission_card_render_includes_graph_memory(self) -> None:
+    def test_mission_card_render_prioritizes_latest_output_when_collapsed(self) -> None:
         card = MissionCardWidget()
         mission = dashboard.db.Mission(
             tab_id="tab-123456",
@@ -174,21 +183,28 @@ class DashboardTest(unittest.IsolatedAsyncioTestCase):
             goal=mission.goal,
             state=mission.state,
             last_event="active output",
-            buffer="alpha\nSearching the web\nfinal response line",
+            buffer="\n".join(f"line {i}" for i in range(12)),
             observed_at=0,
         )
 
         rendered = card._render_card(mission, memory, [event], [artifact], live).plain
 
         self.assertIn("Graph card", rendered)
-        self.assertIn("phase: planning", rendered)
-        self.assertIn("why: recover stale agent intent", rendered)
-        self.assertIn("next: wire edit flow", rendered)
+        self.assertIn("tab tab", rendered)
         self.assertIn("LATEST OUTPUT", rendered)
-        self.assertIn("Searching the web", rendered)
-        self.assertIn("final response line", rendered)
-        self.assertIn("decision build card before edit flow", rendered)
-        self.assertIn("pass test tests/test_dashboard.py", rendered)
+        self.assertIn("line 0", rendered)
+        self.assertIn("line 11", rendered)
+        self.assertNotIn("why: recover stale agent intent", rendered)
+        self.assertNotIn("decision build card before edit flow", rendered)
+
+        card.toggle_details()
+        expanded = card._render_card(mission, memory, [event], [artifact], live).plain
+
+        self.assertIn("phase: planning", expanded)
+        self.assertIn("why: recover stale agent intent", expanded)
+        self.assertIn("next: wire edit flow", expanded)
+        self.assertIn("decision build card before edit flow", expanded)
+        self.assertIn("pass test tests/test_dashboard.py", expanded)
 
     def test_tail_lines_prefers_recent_non_empty_output(self) -> None:
         rendered = _tail_lines("old\n\nmiddle\nlatest and very long", limit=2, width=12)
@@ -563,6 +579,106 @@ class DashboardTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(app.alerts[0].kind, "error")
         self.assertIn("no mission selected", app.alerts[0].text)
+
+    async def test_kill_prd_parent_archives_run_and_closes_child_tabs(self) -> None:
+        app = DashboardHarness()
+        parent = dashboard.db.MissionMemory(
+            mission_id="m_parent",
+            title="new1",
+            topic="prd-run",
+            source_kind="prd",
+            updated_at=100,
+        )
+        child = dashboard.db.Mission(
+            tab_id="tab-child",
+            mission_id="m_child",
+            goal="new1 coordinator",
+            state="idle",
+            buffer_changed_at=90,
+        )
+        edge = dashboard.db.MissionEdge(
+            id=1,
+            from_id=parent.mission_id,
+            to_id=child.mission_id,
+            relation="coordinator",
+            reason="coordinator",
+            created_at=95,
+        )
+        closed: list[str] = []
+        deleted: list[str] = []
+        archived: list[str] = []
+
+        async def fake_close_tab(connection, tab_id):
+            closed.append(tab_id)
+            return True
+
+        with isolated_dashboard_runtime([child], [parent], [edge]), patch.object(
+            dashboard.iterm_client, "close_tab", new=fake_close_tab
+        ), patch.object(
+            dashboard.db, "delete", new=lambda tab_id: deleted.append(tab_id)
+        ), patch.object(
+            dashboard.db, "archive_memory", new=lambda mission_id, summary="": archived.append(mission_id)
+        ):
+            async with app.run_test(size=(120, 40)) as pilot:
+                app._refresh_table()
+                await pilot.pause()
+                await pilot.press("d")
+                await pilot.pause()
+
+        self.assertEqual(closed, ["tab-child"])
+        self.assertEqual(deleted, ["tab-child"])
+        self.assertEqual(archived, ["m_parent"])
+        self.assertIn("killed PRD run", app.alerts[0].text)
+
+    async def test_prune_archives_orphan_prd_parent_rows(self) -> None:
+        app = DashboardHarness()
+        orphan_parent = dashboard.db.MissionMemory(
+            mission_id="m_orphan",
+            title="old run",
+            topic="prd-run",
+            source_kind="prd",
+            updated_at=1,
+        )
+        active_parent = dashboard.db.MissionMemory(
+            mission_id="m_active",
+            title="active run",
+            topic="prd-run",
+            source_kind="prd",
+            updated_at=1,
+        )
+        child = dashboard.db.Mission(
+            tab_id="tab-child",
+            mission_id="m_child",
+            goal="active coordinator",
+            state="working",
+            buffer_changed_at=1,
+        )
+        edge = dashboard.db.MissionEdge(
+            id=1,
+            from_id=active_parent.mission_id,
+            to_id=child.mission_id,
+            relation="coordinator",
+            reason="coordinator",
+            created_at=1,
+        )
+        archived: list[str] = []
+
+        async def fake_enumerate_tabs(connection):
+            return [SimpleNamespace(tab_id="tab-child")]
+
+        with isolated_dashboard_runtime([child], [orphan_parent, active_parent], [edge]), patch.object(
+            dashboard.iterm_client, "enumerate_tabs", new=fake_enumerate_tabs
+        ), patch.object(
+            dashboard.db, "archive_memory", new=lambda mission_id, summary="": archived.append(mission_id)
+        ):
+            async with app.run_test(size=(120, 40)) as pilot:
+                app._refresh_table()
+                await pilot.pause()
+                await pilot.press("p")
+                await pilot.pause()
+
+        self.assertEqual(archived, ["m_orphan"])
+        self.assertIn("archived 1 orphan PRD runs", app.alerts[0].text)
 
     async def test_edit_mission_without_selection_pushes_alert(self) -> None:
         app = DashboardHarness()
@@ -1032,6 +1148,19 @@ class DashboardTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(captured["loop"]["command"], "codex exec")
         self.assertEqual(captured["loop"]["target_mission_id"], "")
         self.assertIsNone(captured["loop"]["target_tab_id"])
+
+    async def test_space_toggles_mission_card_details(self) -> None:
+        app = DashboardHarness()
+
+        with isolated_dashboard_runtime():
+            async with app.run_test(size=(120, 40)) as pilot:
+                card = app.query_one(MissionCardWidget)
+                self.assertFalse(card.details_expanded)
+
+                await pilot.press("space")
+                await pilot.pause()
+
+                self.assertTrue(card.details_expanded)
 
 
 if __name__ == "__main__":

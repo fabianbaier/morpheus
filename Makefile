@@ -1,16 +1,19 @@
 PYTHON ?= python3
 VENV ?= .venv
 POLL ?= 5
+LOCAL_BIN ?= $(HOME)/.local/bin
 
 VENV_PY := $(VENV)/bin/python
 MORPHEUS := $(VENV)/bin/morpheus
+LOCAL_MORPHEUS := $(LOCAL_BIN)/morpheus
 
-.PHONY: help bootstrap install start up dashboard daemon daemon-start daemon-stop daemon-status status watch doctor logs graph-status test clean
+.PHONY: help bootstrap install install-cli uninstall-cli start up dashboard daemon daemon-start daemon-stop daemon-status status watch doctor logs graph-status test clean
 
 help:
 	@printf "Morpheus dev commands\n\n"
 	@printf "  make start         Install/reload daemon, then open the Morpheus cockpit\n"
 	@printf "  make dashboard     Open the Morpheus cockpit without touching daemon state\n"
+	@printf "  make install-cli   Put a morpheus shim on your user PATH (default: ~/.local/bin)\n"
 	@printf "  make daemon        Install/reload the launchd daemon from this repo venv\n"
 	@printf "  make status        Show daemon health\n"
 	@printf "  make watch         Run foreground watcher instead of launchd\n"
@@ -28,6 +31,33 @@ bootstrap: $(VENV_PY)
 	$(VENV_PY) -m pip install -e .
 
 install: bootstrap
+
+install-cli: bootstrap
+	@mkdir -p "$(LOCAL_BIN)"
+	@if [ -e "$(LOCAL_MORPHEUS)" ] && [ ! -L "$(LOCAL_MORPHEUS)" ]; then \
+		printf "Refusing to overwrite non-symlink: %s\n" "$(LOCAL_MORPHEUS)"; \
+		exit 1; \
+	fi
+	@ln -sfn "$(abspath $(MORPHEUS))" "$(LOCAL_MORPHEUS)"
+	@printf "Installed morpheus shim: %s -> %s\n" "$(LOCAL_MORPHEUS)" "$(abspath $(MORPHEUS))"
+	@"$(LOCAL_MORPHEUS)" version
+	@case ":$$PATH:" in \
+		*:"$(LOCAL_BIN)":*) \
+			printf "Ready: run 'morpheus' from any directory to use that directory as the cockpit cwd.\n"; \
+			;; \
+		*) \
+			printf "\nAdd this to your shell profile so new terminals can find it:\n"; \
+			printf '  export PATH="%s:$$PATH"\n' "$(LOCAL_BIN)"; \
+			;; \
+	esac
+
+uninstall-cli:
+	@if [ -L "$(LOCAL_MORPHEUS)" ] && [ "$$(readlink "$(LOCAL_MORPHEUS)")" = "$(abspath $(MORPHEUS))" ]; then \
+		rm "$(LOCAL_MORPHEUS)"; \
+		printf "Removed morpheus shim: %s\n" "$(LOCAL_MORPHEUS)"; \
+	else \
+		printf "No Morpheus-owned shim found at %s\n" "$(LOCAL_MORPHEUS)"; \
+	fi
 
 daemon daemon-start: bootstrap
 	$(MORPHEUS) install-daemon --poll $(POLL)

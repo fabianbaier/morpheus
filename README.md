@@ -46,6 +46,7 @@ Useful Make targets:
 ```bash
 make start          # reload daemon, then open the cockpit
 make dashboard      # open cockpit only
+make install-cli    # install a user PATH shim for running morpheus anywhere
 make daemon         # install/reload launchd watcher from this checkout
 make status         # daemon health, PID, last beacon, log path
 make watch          # foreground watcher instead of launchd
@@ -61,6 +62,18 @@ Override the daemon poll interval when testing:
 make start POLL=2
 ```
 
+Install the local CLI for other terminals:
+
+```bash
+make install-cli
+```
+
+This creates `~/.local/bin/morpheus` as a shim to this repo's editable
+`.venv/bin/morpheus`. You do not need to activate the venv; launch `morpheus`
+from any worktree and Morpheus will use that terminal's current directory as
+the dashboard cwd and PRD/source-file picker fallback. If `~/.local/bin` is not
+on your `PATH`, the target prints the exact `export PATH=...` line to add.
+
 ## Daily Use
 
 Run the cockpit:
@@ -72,8 +85,9 @@ morpheus
 Inside the cockpit, the left panel is a Matrix rain field made from active
 sessions: recent terminal output appears as bright falling shards inside the
 rain, with selected and urgent sessions rendered more prominently. The mission
-table controls selection, and the right card shows the selected mission's graph
-memory plus the latest terminal tail. Use `j`/`k` or arrows to move, then press
+table controls selection, and the right card prioritizes the selected mission's
+latest terminal output. Press `space` to expand or collapse the graph metadata,
+events, and artifacts underneath it. Use `j`/`k` or arrows to move, then press
 `b` for a cited graph/transcript brief, `e` to correct mission memory, or
 `r` to snapshot and resume the mission in a fresh tab. Press `Enter` to jump
 into the real iTerm tab when you need to respond directly. Use `n` to spawn a
@@ -87,7 +101,9 @@ freshest item at the top. Press `l` to create a recurring prompt loop; loop
 outputs appear as ticker items and, when targeted, as graph events/artifacts for
 the selected mission. For PRD runs, parent rows appear in the mission table and
 coordinator/worker tabs nest underneath; press `w` on a PRD parent/coordinator
-to spawn a manually scoped worker.
+to spawn a manually scoped worker. PRD parent rows are virtual run records, not
+extra iTerm tabs; pressing `d` on one archives that run and closes any live child
+tabs, while `p` prunes orphan parent rows that no longer have live children.
 
 Core commands:
 
@@ -212,7 +228,8 @@ intentionally not enabled yet.
 In the cockpit, PRD runs render as a small tree: the virtual parent row first,
 then the coordinator and worker tabs underneath. Select the parent/coordinator
 and press `w` to spawn a manual child worker with explicit scope and
-verification.
+verification. Select a virtual parent row and press `d` to kill the whole run;
+press `p` to clean up orphan parent rows left behind after their tabs disappear.
 
 ## Prompt Loops
 
@@ -269,9 +286,10 @@ make daemon
 
 ## Roadmap
 
-Current status: v0.8.0a9 has PRD Runs foundation, PRD tree/manual workers,
+Current status: v0.8.0a12 has PRD Runs foundation, PRD tree/manual workers,
 newest-first ready tickers, prompt loops foundation, nonblocking/Markdown PRD
-picker, edit mission flow, selected mission briefs, and resume-fresh.
+picker, edit mission flow, selected mission briefs, PRD parent cleanup, and an
+output-first mission card, plus a user PATH install target and resume-fresh.
 
 Next implementation phases:
 
@@ -291,8 +309,11 @@ Next implementation phases:
 14. Markdown source picker. Done in `0.8.0a7`.
 15. Edit mission flow for why/plan/next/provenance/proof fields. Done in `0.8.0a8`.
 16. `b` brief-selected using mission graph plus transcript tail. Done in `0.8.0a8`.
-17. Resume-fresh flow that snapshots, archives old attachment, and spawns a new
-   session linked by a `spawned_from` edge. Done in `0.8.0a9`.
-18. MCP mission graph update tools.
+17. PRD parent row kill/prune cleanup. Done in `0.8.0a9`.
+18. Output-first mission card with `space` details toggle. Done in `0.8.0a10`.
+19. User PATH CLI install target. Done in `0.8.0a11`.
+20. Resume-fresh flow that snapshots, archives old attachment, and spawns a new
+   session linked by a `spawned_from` edge. Done in `0.8.0a12`.
+21. MCP mission graph update tools.
 
 > "I can only show you the door. You're the one that has to walk through it."

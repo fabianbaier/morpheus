@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| **Status** | v0.8.0a9 implemented (resume fresh); next: MCP mission tools |
+| **Status** | v0.8.0a12 implemented (resume fresh); next: MCP mission tools |
 | **Author** | Fabian Baier |
 | **Last updated** | 2026-05-20 |
 | **Target platform** | macOS + iTerm2 |
@@ -318,6 +318,7 @@ attach.
 | `n` | New mission | Opens goal + command form; creates mission card before launch |
 | `b` | Brief selected | Shows a short "why / status / next step" card for selected session |
 | `e` | Edit mission | Edits goal, why, plan, next step, tags, linked PR, worktree |
+| `Space` | Toggle mission details | Expands/collapses metadata under the selected mission's latest output |
 | `a` | Answer prompt | Drafts a response for the selected blocked session; sending is ask-first with preview |
 | `s` | Snapshot | Writes transcript + mission card to `~/.morpheus/snapshots/` |
 | `r` | Resume fresh | Spawns a new session seeded with the snapshot + mission card |
@@ -404,10 +405,12 @@ Remaining v0.8 work:
 - Add a run status updater that writes mission events and keeps the status file
   aligned with the graph.
 
-Implemented v0.8.0a5 behavior: PRD parent rows render as virtual rows in the
-mission table, coordinator/worker sessions render underneath them, and `w`
-spawns a manually scoped worker linked to the same parent mission with a
-`worker` edge plus assignment events.
+Implemented behavior: PRD parent rows render as virtual rows in the mission
+table, coordinator/worker sessions render underneath them, and `w` spawns a
+manually scoped worker linked to the same parent mission with a `worker` edge
+plus assignment events. In v0.8.0a9, `d` on a virtual parent row archives the
+run and closes live child tabs; `p` archives orphan parent rows that no longer
+have live children.
 
 ### 6.6 Prompt Loops
 
@@ -755,11 +758,12 @@ This table is the source of truth for where the product stands right now.
 | Competitive research | Done in v0.6.2 | CCPM, Claude Code, Karpathy LLM Wiki, and open-source session managers folded into requirements |
 | Local dev launch flow | Implemented in v0.7.0 foundation | `Makefile` creates `.venv`, installs editable checkout, reloads daemon, opens cockpit |
 | Quickstart/architecture README | Implemented in v0.7.0 foundation | README now documents `make start`, architecture, mission graph, state files |
+| User PATH CLI install | Implemented in v0.8.0a11 | `make install-cli` links `~/.local/bin/morpheus` to this repo's editable venv command so `morpheus` can launch from any worktree without activating `.venv` |
 | Stable mission ID design | Implemented in v0.7.0 foundation | `missions.mission_id` added; live tabs attach to durable mission IDs |
 | Mission graph schema | Implemented in v0.7.0 foundation | `mission_memory`, `mission_events`, `mission_artifacts`, `mission_edges` added |
 | Provenance model | Foundation implemented | Graph fields store source kind/ref and confidence; UI trust treatment still pending |
 | Loop phase / proof tracking | Foundation implemented | `phase`, `last_verified_at`, events, artifacts exist; selected cockpit card now displays phase/events/artifacts |
-| Mission card panel | Implemented in v0.7.0a2 | Right-side Textual card shows selected mission graph fields, events, artifacts, unset memory gaps |
+| Mission card panel | Implemented in v0.8.0a10 | Right-side Textual card defaults to mission title/status plus a prominent latest-output block; `Space` expands graph fields, events, and artifacts underneath |
 | Live session streams | Implemented in v0.7.0a3 | Dashboard captures real terminal tails from selected/relevant sessions; v0.7.0a5 changes the visual treatment from static tails to Matrix rain shards |
 | Session-end rabbit ticker | Implemented in v0.7.0a4 | Finished sessions now emit bottom-strip completion headlines from the latest substantive terminal output and store a mission summary event when possible |
 | Matrix rain output shards | Implemented in v0.7.0a5 | Left panel is rain-first again: real terminal output is embedded as falling bright shards inside the Matrix rain instead of rendered as a static terminal tail |
@@ -774,7 +778,10 @@ This table is the source of truth for where the product stands right now.
 | Markdown source picker | Implemented in v0.8.0a7 | The `n` picker shows all discovered `.md`/`.markdown` files rather than only PRD-named files, while sorting PRD/spec candidates first |
 | Edit mission flow | Implemented in v0.8.0a8 | `e` opens a dashboard editor for goal/title/why/done/criteria/plan/next/phase/blocker/source/issue/PR/worktree/claimed paths/topic, saves graph memory + live fields, and records a `mission_edit` event |
 | Brief selected | Implemented in v0.8.0a8 | `b` opens a cited local brief for the selected mission using graph memory, recent events, artifacts, and transcript tail |
-| Resume fresh | Implemented in v0.8.0a9 | `r` snapshots the selected live tab, spawns a seeded replacement, links new -> old with `spawned_from`, and closes/archives the old tab after spawn |
+| PRD parent cleanup | Implemented in v0.8.0a9 | `d` on a virtual PRD parent archives the run and closes live coordinator/worker tabs; `p` archives orphan PRD parent rows with no live child tabs |
+| Output-first mission card | Implemented in v0.8.0a10 | The selected card shows much more latest terminal output by default and moves mission/graph metadata behind the `Space` details toggle |
+| User PATH CLI install | Implemented in v0.8.0a11 | `make install-cli` installs a safe user shim and prints a PATH hint when `~/.local/bin` is not visible to the shell |
+| Resume fresh | Implemented in v0.8.0a12 | `r` snapshots the selected live tab, spawns a seeded replacement, links new -> old with `spawned_from`, and closes/archives the old tab after spawn |
 | MCP mission tools | Partially shipped | Read-only session tools exist; graph read/update tools remain v0.7 |
 | 48-hour recall eval | Not implemented | Add fixture or dogfood checklist: stale mission → press `b` → know next action in <10s |
 
@@ -936,8 +943,8 @@ Must ship:
 - **Traceability links** — optional `source_doc`, `epic_ref`, `issue_ref`,
   `acceptance_criteria`, linked PR, branch, worktree, claimed paths, and proof
   artifacts.
-- **Mission card panel** — selected session shows the full card in the
-  cockpit, not just state/goal/last event.
+- **Mission card panel** — selected session shows a compact identity line plus
+  the latest terminal output first; `Space` expands the full graph card.
 - **Edit mission flow** — `e` opens an inline form to correct goal, why,
   done definition, acceptance criteria, phase, next step, source links, linked
   PR, worktree, and claimed paths.
