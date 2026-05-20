@@ -1074,6 +1074,7 @@ class DashboardTest(unittest.IsolatedAsyncioTestCase):
         app = DashboardHarness()
         done = asyncio.Event()
         captured = {}
+        resume_id = "019e466d-0fd8-7441-aa1f-32a5db211a73"
         memory = dashboard.db.MissionMemory(
             mission_id="m_closed",
             title="Closed Codex mission",
@@ -1082,8 +1083,9 @@ class DashboardTest(unittest.IsolatedAsyncioTestCase):
             next_step="run tests",
             phase="archived",
             agent_kind="codex",
-            resume_command="cd /tmp/work && codex resume --last",
-            resume_confidence="fallback",
+            resume_ref=resume_id,
+            resume_command=f"cd /tmp/work && codex --yolo resume {resume_id}",
+            resume_confidence="exact",
             last_tab_id="tab-old",
             closed_at=10,
             archived_at=10,
@@ -1092,6 +1094,14 @@ class DashboardTest(unittest.IsolatedAsyncioTestCase):
         async def fake_spawn_tab(connection, *, command, goal):
             captured["spawn"] = {"connection": connection, "command": command, "goal": goal}
             return SimpleNamespace(tab_id="tab-new", session_id="session-new")
+
+        async def fake_send_text_to_tabs(connection, tab_ids, text):
+            captured["send_text"] = {
+                "connection": connection,
+                "tab_ids": tab_ids,
+                "text": text,
+            }
+            return []
 
         def fake_upsert(mission):
             captured["mission"] = mission
@@ -1116,6 +1126,8 @@ class DashboardTest(unittest.IsolatedAsyncioTestCase):
         ), patch.object(
             dashboard.iterm_client, "spawn_tab", new=fake_spawn_tab
         ), patch.object(
+            dashboard.iterm_client, "send_text_to_tabs", new=fake_send_text_to_tabs
+        ), patch.object(
             dashboard.db, "upsert", new=fake_upsert
         ), patch.object(
             dashboard.db, "upsert_memory", new=fake_upsert_memory
@@ -1137,8 +1149,12 @@ class DashboardTest(unittest.IsolatedAsyncioTestCase):
                 await asyncio.wait_for(done.wait(), timeout=1)
 
         self.assertEqual(captured["spawn"]["goal"], "Closed Codex mission")
-        self.assertIn("codex resume --last", captured["spawn"]["command"])
-        self.assertIn("Resume this Morpheus mission", captured["spawn"]["command"])
+        self.assertEqual(
+            captured["spawn"]["command"],
+            f"cd /tmp/work && codex --yolo resume {resume_id}",
+        )
+        self.assertIn("Resume this Morpheus mission", captured["send_text"]["text"])
+        self.assertEqual(captured["send_text"]["tab_ids"], ["tab-new"])
         self.assertEqual(captured["mission"].mission_id, "m_closed")
         self.assertEqual(captured["mission"].tab_id, "tab-new")
         self.assertIsNone(captured["memory"].archived_at)

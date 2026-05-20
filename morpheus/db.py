@@ -8,6 +8,7 @@ tab/session currently attached to it.
 from __future__ import annotations
 
 import json
+import re
 import secrets
 import shlex
 import sqlite3
@@ -19,6 +20,38 @@ from typing import Any, Iterable, Iterator, Optional
 
 DB_DIR = Path.home() / ".morpheus"
 DB_PATH = DB_DIR / "morpheus.db"
+CODEX_SESSION_ID_RE = re.compile(
+    r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b"
+)
+CODEX_RESUME_LINE_RE = re.compile(
+    r"\bcodex\b[^\r\n]*?\bresume\s+(?P<ref>[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})\b"
+)
+CODEX_VALUE_OPTIONS = {
+    "-c",
+    "-C",
+    "-m",
+    "-p",
+    "-s",
+    "--approval-policy",
+    "--ask-for-approval",
+    "--cd",
+    "--config",
+    "--cwd",
+    "--model",
+    "--model-provider",
+    "--output-schema",
+    "--profile",
+    "--sandbox",
+}
+CLAUDE_VALUE_OPTIONS = {
+    "--add-dir",
+    "--append-system-prompt",
+    "--model",
+    "--mcp-config",
+    "--permission-prompt-tool",
+    "--resume",
+    "--session-id",
+}
 
 
 @dataclass
@@ -326,12 +359,26 @@ def _infer_agent_kind(command: str) -> str:
         parts = shlex.split(command or "")
     except ValueError:
         parts = (command or "").split()
-    if not parts:
-        return ""
-    exe = Path(parts[0]).name.lower()
-    if exe in {"codex", "claude", "gemini"}:
-        return exe
+    for part in parts:
+        exe = Path(part).name.lower()
+        if exe in {"codex", "claude", "gemini"}:
+            return exe
     return ""
+
+
+def _command_parts(command: str) -> list[str]:
+    try:
+        return shlex.split(command or "")
+    except ValueError:
+        return (command or "").split()
+
+
+def _agent_command_parts(command: str, agent_kind: str) -> list[str]:
+    parts = _command_parts(command)
+    for idx, part in enumerate(parts):
+        if Path(part).name.lower() == agent_kind:
+            return parts[idx:]
+    return parts
 
 
 def _option_value(parts: list[str], *names: str) -> str:
@@ -345,19 +392,20 @@ def _option_value(parts: list[str], *names: str) -> str:
 
 
 def _resume_ref_from_command(command: str, agent_kind: str) -> tuple[str, str]:
-    try:
-        parts = shlex.split(command or "")
-    except ValueError:
-        parts = (command or "").split()
+    parts = _agent_command_parts(command, agent_kind)
     if not parts:
         return "", "unavailable"
     if agent_kind == "codex":
         if "resume" in parts:
             idx = parts.index("resume")
             for value in parts[idx + 1:]:
+                if value == "--last":
+                    return "", "fallback"
                 if value.startswith("-"):
                     continue
-                return value, "exact"
+                if CODEX_SESSION_ID_RE.fullmatch(value):
+                    return value, "exact"
+                return "", "fallback"
         return "", "fallback"
     if agent_kind == "claude":
         ref = _option_value(parts, "--resume", "-r", "--session-id")
@@ -377,13 +425,52 @@ def _with_worktree(command: str, linked_worktree: str) -> str:
     return f"cd {shlex.quote(linked_worktree)} && {command}"
 
 
+def _leading_agent_options(parts: list[str], value_options: set[str]) -> list[str]:
+    if not parts:
+        return []
+    kept = [parts[0]]
+    idx = 1
+    while idx < len(parts):
+        part = parts[idx]
+        if part == "--" or not part.startswith("-"):
+            break
+        kept.append(part)
+        option_name = part.split("=", 1)[0]
+        if "=" not in part and option_name in value_options and idx + 1 < len(parts):
+            idx += 1
+            kept.append(parts[idx])
+        idx += 1
+    return kept
+
+
+def _codex_resume_command(command: str, resume_ref: str) -> str:
+    parts = _agent_command_parts(command, "codex") or ["codex"]
+    kept = _leading_agent_options(parts, CODEX_VALUE_OPTIONS) or ["codex"]
+    return shlex.join(kept + ["resume", resume_ref or "--last"])
+
+
+def _claude_resume_command(command: str, resume_ref: str) -> str:
+    parts = _agent_command_parts(command, "claude") or ["claude"]
+    kept = _leading_agent_options(parts, CLAUDE_VALUE_OPTIONS) or ["claude"]
+    if resume_ref:
+        return shlex.join(kept + ["--resume", resume_ref])
+    return shlex.join(kept + ["--continue"])
+
+
+def _codex_resume_ref_from_buffer(buffer: str) -> str:
+    found = ""
+    for match in CODEX_RESUME_LINE_RE.finditer(buffer or ""):
+        found = match.group("ref")
+    return found
+
+
 def _resume_command_for_mission(mission: Mission) -> tuple[str, str, str, str]:
     agent_kind = _infer_agent_kind(mission.cmd)
     resume_ref, confidence = _resume_ref_from_command(mission.cmd, agent_kind)
     if agent_kind == "codex":
-        base = f"codex resume {shlex.quote(resume_ref)}" if resume_ref else "codex resume --last"
+        base = _codex_resume_command(mission.cmd, resume_ref)
     elif agent_kind == "claude":
-        base = f"claude --resume {shlex.quote(resume_ref)}" if resume_ref else "claude --continue"
+        base = _claude_resume_command(mission.cmd, resume_ref)
     elif agent_kind == "gemini":
         base = "gemini"
     else:
@@ -400,6 +487,13 @@ def _persist_resume_metadata(
     if not mission.mission_id:
         return
     agent_kind, resume_ref, resume_command, confidence = _resume_command_for_mission(mission)
+    existing = conn.execute(
+        "SELECT resume_confidence FROM mission_memory WHERE mission_id = ?",
+        (mission.mission_id,),
+    ).fetchone()
+    if existing and existing["resume_confidence"] == "exact" and confidence != "exact":
+        resume_command = ""
+        confidence = ""
     conn.execute(
         """
         UPDATE mission_memory
@@ -429,6 +523,47 @@ def _persist_resume_metadata(
             mission.mission_id,
         ),
     )
+
+
+def refresh_resume_metadata_from_buffer(mission: Mission, buffer: str) -> bool:
+    """Persist exact provider resume metadata found in a live terminal buffer."""
+    if not mission.mission_id:
+        return False
+    agent_kind = _infer_agent_kind(mission.cmd)
+    if agent_kind != "codex":
+        return False
+    resume_ref = _codex_resume_ref_from_buffer(buffer)
+    if not resume_ref:
+        return False
+    resume_command = _with_worktree(
+        _codex_resume_command(mission.cmd, resume_ref),
+        mission.linked_worktree,
+    )
+    now = time.time()
+    with _connect() as conn:
+        cur = conn.execute(
+            """
+            UPDATE mission_memory
+               SET agent_kind = ?,
+                   resume_ref = ?,
+                   resume_command = ?,
+                   resume_confidence = ?,
+                   last_tab_id = CASE WHEN ? != '' THEN ? ELSE last_tab_id END,
+                   updated_at = ?
+             WHERE mission_id = ?
+            """,
+            (
+                agent_kind,
+                resume_ref,
+                resume_command,
+                "exact",
+                mission.tab_id,
+                mission.tab_id,
+                now,
+                mission.mission_id,
+            ),
+        )
+    return cur.rowcount > 0
 
 
 def new_mission_id(now: Optional[float] = None) -> str:

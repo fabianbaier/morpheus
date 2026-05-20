@@ -1117,18 +1117,18 @@ def _closed_resume_prompt(memory: db.MissionMemory) -> str:
 def _closed_resume_command(memory: db.MissionMemory) -> str:
     if not memory.resume_command:
         return ""
-    if memory.agent_kind in {"codex", "claude"}:
-        return f"{memory.resume_command} {shlex.quote(_closed_resume_prompt(memory))}"
     return memory.resume_command
 
 
 def _post_spawn_resume_text(memory: db.MissionMemory) -> str:
-    if memory.agent_kind != "gemini":
-        return ""
     prompt = _closed_resume_prompt(memory)
-    if memory.resume_ref:
+    if memory.agent_kind in {"codex", "claude"}:
+        return f"{prompt}\n"
+    if memory.agent_kind == "gemini" and memory.resume_ref:
         return f"/chat resume {memory.resume_ref}\n{prompt}\n"
-    return f"{prompt}\n"
+    if memory.agent_kind == "gemini":
+        return f"{prompt}\n"
+    return ""
 
 
 def _resume_prompt(

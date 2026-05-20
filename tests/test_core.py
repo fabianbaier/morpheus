@@ -1,6 +1,9 @@
+import tempfile
 import unittest
+from pathlib import Path
+from unittest.mock import patch
 
-from morpheus import core, iterm_client, naming
+from morpheus import core, db, iterm_client, naming
 
 
 def _tab(
@@ -9,6 +12,7 @@ def _tab(
     session_id: str = "session-123",
     current_name: str = "Python",
     buffer: str = "",
+    cwd: str = "",
 ) -> iterm_client.TabInfo:
     return iterm_client.TabInfo(
         tab_id=tab_id,
@@ -16,7 +20,19 @@ def _tab(
         window_id="window-123",
         buffer=buffer,
         current_name=current_name,
+        cwd=cwd,
     )
+
+
+class FakeLogger:
+    def debug(self, *args, **kwargs) -> None:
+        pass
+
+    def info(self, *args, **kwargs) -> None:
+        pass
+
+    def exception(self, *args, **kwargs) -> None:
+        pass
 
 
 class CoreTest(unittest.TestCase):
@@ -63,6 +79,63 @@ class CoreTest(unittest.TestCase):
         )
 
         self.assertFalse(core._should_ignore_tab(tab))
+
+
+class CoreTickTest(unittest.IsolatedAsyncioTestCase):
+    async def test_tick_persists_codex_resume_id_from_live_buffer(self) -> None:
+        resume_id = "019e466d-0fd8-7441-aa1f-32a5db211a73"
+        tab = _tab(
+            tab_id="tab-codex",
+            session_id="session-codex",
+            current_name="codex",
+            cwd="/tmp/work",
+            buffer=(
+                "Token usage: total=5,950 input=5,936 output=14\n"
+                f"To continue this session, run codex resume {resume_id}"
+            ),
+        )
+
+        async def fake_enumerate_tabs(connection):
+            return [tab]
+
+        async def fake_set_tab_name(connection, session_id, name):
+            return True
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with (
+                patch.object(db, "DB_DIR", root),
+                patch.object(db, "DB_PATH", root / "morpheus.db"),
+                patch.object(core.iterm_client, "enumerate_tabs", new=fake_enumerate_tabs),
+                patch.object(core.iterm_client, "set_tab_name", new=fake_set_tab_name),
+                patch.object(
+                    core.cfg_mod,
+                    "load",
+                    new=lambda: {
+                        "token_guard": {"enabled": False},
+                        "worktree": {"warn_on_collision": False},
+                    },
+                ),
+                patch.object(core.ctx_mod, "write_context_file", new=lambda: None),
+                patch.object(core.ctx_mod, "write_context_json", new=lambda: None),
+                patch.object(core.daemon_mod, "write_beacon", new=lambda: None),
+            ):
+                mission = db.Mission(
+                    tab_id=tab.tab_id,
+                    session_id=tab.session_id,
+                    goal="Codex mission",
+                    state="working",
+                    cmd="codex --yolo",
+                )
+                db.upsert(mission)
+
+                count = await core._tick(object(), FakeLogger())
+                memory = db.get_memory(mission.mission_id)
+
+        self.assertEqual(count, 1)
+        self.assertEqual(memory.resume_ref, resume_id)
+        self.assertEqual(memory.resume_confidence, "exact")
+        self.assertIn(f"cd /tmp/work && codex --yolo resume {resume_id}", memory.resume_command)
 
 
 if __name__ == "__main__":

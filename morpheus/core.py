@@ -98,6 +98,10 @@ async def _tick(connection, log: logging.Logger,
 
         prev.state = new_state
         db.upsert(prev)
+        try:
+            db.refresh_resume_metadata_from_buffer(prev, tab.buffer)
+        except Exception:
+            log.debug("resume metadata refresh failed for %s", tab.tab_id, exc_info=True)
 
         if on_tab_observed is not None:
             await on_tab_observed(tab, prev, d)

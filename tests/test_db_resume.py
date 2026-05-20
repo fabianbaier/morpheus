@@ -35,3 +35,37 @@ class ResumeMetadataTest(unittest.TestCase):
         self.assertEqual(archived.last_tab_id, "tab-codex")
         self.assertEqual(archived.agent_kind, "codex")
         self.assertIn("codex resume --last", archived.resume_command)
+
+    def test_buffer_resume_id_replaces_codex_fallback_and_survives_archive(self) -> None:
+        resume_id = "019e466d-0fd8-7441-aa1f-32a5db211a73"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with patch.object(db, "DB_DIR", root), patch.object(db, "DB_PATH", root / "morpheus.db"):
+                mission = db.Mission(
+                    tab_id="tab-codex",
+                    session_id="session-codex",
+                    goal="resume closed codex",
+                    cmd="codex --yolo",
+                    linked_worktree="/tmp/work",
+                    state="working",
+                )
+                db.upsert(mission)
+
+                changed = db.refresh_resume_metadata_from_buffer(
+                    mission,
+                    "To continue this session, run codex resume "
+                    f"{resume_id}",
+                )
+                self.assertTrue(changed)
+                live_memory = db.get_memory(mission.mission_id)
+                self.assertEqual(live_memory.resume_ref, resume_id)
+                self.assertEqual(live_memory.resume_confidence, "exact")
+                self.assertIn(f"codex --yolo resume {resume_id}", live_memory.resume_command)
+
+                db.delete(mission.tab_id)
+                archived = db.get_memory(mission.mission_id)
+
+        self.assertEqual(archived.resume_ref, resume_id)
+        self.assertEqual(archived.resume_confidence, "exact")
+        self.assertIn(f"codex --yolo resume {resume_id}", archived.resume_command)
+        self.assertNotIn("--last", archived.resume_command)
