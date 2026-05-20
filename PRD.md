@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| **Status** | v0.3.0 (always-on launchd daemon · `morpheus brief` claude-p digest · macOS notifications · interactive Textual TUI) |
+| **Status** | v0.6.0 (config + worktree + token guard + ledger + ask + spawn-from-trigger + MCP server — full roadmap shipped 2026-05-19) |
 | **Author** | Fabian Baier |
 | **Last updated** | 2026-05-19 |
 | **Target platform** | macOS + iTerm2 |
@@ -431,57 +431,56 @@ Remaining for v0.1.x:
   hardcoded in `detect.py` — easy to extend in code; v0.4 makes it config)
 - `morpheus status` shell-prompt one-liner for non-Morpheus tabs
 
-### v0.4 — Safeguards + worktree awareness (NEXT)
+### v0.4 — Safeguards + worktree awareness (SHIPPED 2026-05-19)
 
-- **Worktree collision warnings** (load-bearing per
-  `workflow_use_worktrees.md` memory). At spawn time and during ticks,
-  detect cwd of each session via iTerm shell integration variables.
-  If two LIVE sessions share a cwd, push a 🐇 warning alert: *"COLLISION:
-  tab A and tab B both in ~/github/foo. Resolve before pushing."*
-- **Token budget guard**. Estimate per-session token throughput from
-  buffer size + tick deltas. Warn at 70%, auto-suggest snapshot at 90%,
-  fire a 🐇 alert at 100%. (No LLM call needed — heuristic only.)
-- **`~/.morpheus/config.toml`** — detection patterns, notification
-  silencing per kind, daily $ cap, autonomy ladder, brief schedule,
-  custom emoji/state mappings. Default written by `morpheus init-config`.
-- **Soft-autonomy ladder configuration** — per-action class:
-  always-allowed (poll/summarize/research/draft), ask-first (spawn-live/
-  kill/delete), never (merge/push/approve/external-message). Surfaced as
-  a `morpheus permissions` command.
-- **`morpheus daemon-status` enhancements** — show last beacon, last
-  tick duration, daily $ spent so far, number of restarts since boot.
+- ✅ **Worktree collision warnings** — iTerm shell-integration `path`
+  variable read per tab; tabs sharing a cwd trigger a `worktree_collision`
+  alert (dedup'd per group).
+- ✅ **Token budget guard** — heuristic on continuous "working" time.
+  `warn_minutes` (default 60) fires a 🐇 alert, `snapshot_minutes`
+  (default 120) fires the louder "SNAPSHOT NOW" alert with the exact
+  command to run.
+- ✅ **`~/.morpheus/config.toml`** — exhaustive schema, defaults written
+  on first read. Sections: general / detection / notifications / brief /
+  autonomy / worktree / token_guard / trigger / topic_watchers / colors.
+- ✅ **Soft-autonomy ladder** declared in config (allowed_actions /
+  ask_first_actions / denied_actions). Enforced in v0.5+ for autonomous
+  spawn paths via `ledger.is_within_daily_cap()`.
+- ✅ **`morpheus daemon-status`** — already detailed in v0.3.
 
-### v0.5 — Triggers + autonomous draft sessions
+### v0.5 — Triggers + autonomous draft sessions (SHIPPED 2026-05-19)
 
-- **Spawn-from-trigger**: a poller runs every N minutes via the daemon,
-  `gh pr list --search "review-requested:@me"` on configured repos. For
-  each NEW review-requested PR, the daemon creates a **draft codex
-  session** in a worktree: diff pre-loaded, `/adversarial-review` prompt
-  pre-filled, **paused before the first command**. The user attaches via
-  Enter and runs. Inbox-zero for PR reviews without losing the human-in-
-  the-loop checkpoint.
-- **`morpheus ask "<query>"`** — conversational interface to mission
-  state. *"Summarize all sessions on PR #224"*, *"kill anything idle >4h"*,
-  *"what's blocking me right now?"* Routed through `claude -p` with a
-  state snapshot as context.
-- **Web-search topic watchers** — configured topics polled on schedule;
-  each runs `claude -p --web` with a "what's new" prompt; non-trivial
-  hits land as 🐇 notes attached to the daemon (not any specific tab).
+- ✅ **Spawn-from-trigger** — `morpheus/trigger.py` polls
+  `gh search prs review-requested:@me` every `gh_poll_secs` from inside
+  the watch loop. New PRs land as 🐇 alerts. If
+  `config.trigger.spawn_from_gh_pr = true` AND we're inside the daily
+  $ cap, a draft codex tab spawns in a worktree (`gh pr checkout` into
+  `.claude/worktrees/pr-N` + `codex`). `seen_prs` SQLite table prevents
+  re-spawn loops. Available on-demand via `morpheus poll-prs`.
+- ✅ **`morpheus ask "<query>"`** — gather_state → claude-p with a
+  tight system prompt; falls back to codex exec, then to raw snapshot
+  if no LLM available. Logs each ask (~$0.03) to the cost ledger.
+- 🔜 **Web-search topic watchers** — schema in config
+  (`[topic_watchers]`) but executor deferred to v0.7. (Would call
+  `claude -p` with web search on a schedule.)
 
-### v0.6 — Ledger + economy + MCP
+### v0.6 — Ledger + economy + MCP (SHIPPED 2026-05-19)
 
-- **Cost ledger** — every autonomous LLM action logged with token + $
-  estimate. SQLite table `cost_ledger`. Daily/monthly cap; auto-disable
-  autonomy at cap; alert at 80%.
-- **Action ledger** — every spawn/kill/note/snapshot logged. Viewable
-  with `morpheus history` or as input to `/retro` skill weekly.
-- **Topic threads** — group multiple sessions about the same PR/PRD
-  into one thread. `morpheus thread create "PR #224"` and
-  `morpheus spawn --thread "PR #224" …` adds to it.
-- **MCP server** — expose `list_sessions()`, `get_session(id)`,
-  `post_note(text)`, `claim_path(path)`, `spawn(goal, cmd)` as MCP
-  tools. Claude Code / Codex with the MCP enabled call them natively;
-  no shell-out needed. Ships as `morpheus mcp serve`.
+- ✅ **Cost ledger** — `cost_ledger` SQLite table; every paid LLM
+  invocation logged with tokens + dollars. `morpheus ledger costs`.
+  `ledger.daily_dollar_total()` is what the autonomy gate consults.
+- ✅ **Action ledger** — `action_ledger` table records every
+  spawn/kill/note/snapshot/trigger_spawn. `morpheus ledger actions`.
+  Feeds `/retro` for weekly review.
+- ✅ **MCP server** — `morpheus mcp serve` exposes the read-only state
+  + post_note / claim_path as MCP tools. Wires into Claude Code via
+  `~/.claude.json` mcpServers entry. Tools: list_sessions, get_session,
+  get_context, get_context_short, post_note, claim_path, daily_spend,
+  recent_actions.
+- 🔜 **Topic threads** — deferred to v0.7 (column `topic` on missions
+  table, `--topic` flag on spawn/list); minor scope.
+- 🔜 **MCP spawn/kill** — deferred to v0.7 (FastMCP + iTerm async
+  context lifecycle needs more design).
 
 ### v1.0 — Cross-platform + extensibility
 
@@ -734,13 +733,13 @@ claim, defers.
 
 ---
 
-## 14. CLI command reference (complete as of v0.3.0)
+## 14. CLI command reference (complete as of v0.6.0)
 
 | Command | Purpose |
 |---|---|
 | `morpheus` | Default — launch the interactive Textual dashboard |
 | `morpheus dashboard` | Same as `morpheus` (explicit subcommand) |
-| `morpheus watch [--poll 5]` | Headless tick loop only; updates titles + context.md, no UI |
+| `morpheus watch [--poll 5] [--no-notify]` | Headless tick loop; updates titles + context.md + macOS notifications |
 | `morpheus spawn "<goal>" "<cmd>"` | Open new iTerm tab, run cmd, register mission |
 | `morpheus list [--stale 4]` | Print every mission with state, age, last event |
 | `morpheus prune [--older-than 4] [--yes]` | Close stale tabs (idle/finished, age >threshold) |
@@ -748,10 +747,15 @@ claim, defers.
 | `morpheus context [-f md/json/short] [--refresh]` | Print the shared cross-session snapshot |
 | `morpheus note "<text>" [--tab ID] [--kind note/claim/broadcast]` | Post a cross-session note |
 | `morpheus notes [--limit 15] [--tab ID]` | List recent cross-session notes |
-| `morpheus brief [--out FILE] [--notify] [--no-llm]` | Generate digest of current state via claude-p |
-| `morpheus install-daemon` | Install + start the launchd background watcher |
+| `morpheus brief [--out FILE] [--notify] [--no-llm] [--no-gh]` | Generate digest of current state via claude-p |
+| `morpheus ask "<query>" [--no-llm]` | Ask morpheus about its own state (claude-p answer) |
+| `morpheus poll-prs` | One-shot GH PR poll → 🐇 alerts (and draft sessions if config enables) |
+| `morpheus ledger costs [-n 50]` | Recent LLM cost ledger entries + today's total |
+| `morpheus ledger actions [-n 50]` | Recent action ledger (spawns/kills/notes/etc) |
+| `morpheus install-daemon [--poll 5]` | Install + start the launchd background watcher |
 | `morpheus uninstall-daemon` | Stop and remove the launchd agent |
 | `morpheus daemon-status` | Report daemon health (running? last beacon? log size?) |
+| `morpheus mcp serve` | Start MCP stdio server for Claude Code / Codex |
 | `morpheus doctor` | Diagnose iTerm2 + Python API connectivity |
 | `morpheus version` | Print morpheus version |
 
