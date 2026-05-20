@@ -1512,6 +1512,7 @@ class DashboardTest(unittest.IsolatedAsyncioTestCase):
             f"cd /tmp/work && codex --yolo resume {resume_id}",
         )
         self.assertIn("Resume this Morpheus mission", captured["send_text"]["text"])
+        self.assertTrue(captured["send_text"]["text"].endswith("\r"))
         self.assertEqual(captured["send_text"]["tab_ids"], ["tab-new"])
         self.assertEqual(captured["mission"].mission_id, "m_closed")
         self.assertEqual(captured["mission"].tab_id, "tab-new")
@@ -1519,6 +1520,21 @@ class DashboardTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(captured["memory"].phase, "working")
         self.assertEqual(captured["event"]["kind"], "resume")
         self.assertEqual(captured["event"]["metadata"]["agent_kind"], "codex")
+
+    def test_post_spawn_resume_text_submits_gemini_resume_and_prompt(self) -> None:
+        memory = dashboard.db.MissionMemory(
+            mission_id="m_closed",
+            title="Closed Gemini mission",
+            next_step="answer follow-up",
+            agent_kind="gemini",
+            resume_ref="gemini-session",
+        )
+
+        text = dashboard._post_spawn_resume_text(memory)
+
+        self.assertIn("/chat resume gemini-session\r", text)
+        self.assertIn("Resume this Morpheus mission", text)
+        self.assertTrue(text.endswith("\r"))
 
     async def test_new_session_submit_spawns_tab_and_records_mission(self) -> None:
         app = DashboardHarness()

@@ -1211,11 +1211,12 @@ def _closed_resume_command(memory: db.MissionMemory) -> str:
 def _post_spawn_resume_text(memory: db.MissionMemory) -> str:
     prompt = _closed_resume_prompt(memory)
     if memory.agent_kind in {"codex", "claude"}:
-        return f"{prompt}\n"
+        return iterm_client.text_with_enter(prompt)
     if memory.agent_kind == "gemini" and memory.resume_ref:
-        return f"/chat resume {memory.resume_ref}\n{prompt}\n"
+        resume = iterm_client.text_with_enter(f"/chat resume {memory.resume_ref}")
+        return f"{resume}{iterm_client.text_with_enter(prompt)}"
     if memory.agent_kind == "gemini":
-        return f"{prompt}\n"
+        return iterm_client.text_with_enter(prompt)
     return ""
 
 
