@@ -884,6 +884,37 @@ def archive_memory(mission_id: str, summary: str = "mission archived") -> None:
         _archive_mission(conn, mission_id, summary, "")
 
 
+def dismiss_closed_resume(mission_id: str, summary: str = "closed resume dismissed") -> bool:
+    """Hide an archived resumable mission from the closed-session dashboard rows."""
+    now = time.time()
+    with _connect() as conn:
+        cur = conn.execute(
+            """
+            UPDATE mission_memory
+               SET resume_command = '',
+                   resume_confidence = CASE
+                                         WHEN resume_confidence = 'dismissed' THEN resume_confidence
+                                         ELSE 'dismissed'
+                                       END,
+                   updated_at = ?
+             WHERE mission_id = ?
+               AND archived_at IS NOT NULL
+               AND resume_command != ''
+            """,
+            (now, mission_id),
+        )
+        if cur.rowcount:
+            _insert_event(
+                conn,
+                mission_id,
+                kind="archive",
+                actor="morpheus",
+                summary=summary,
+                ts=now,
+            )
+    return cur.rowcount > 0
+
+
 def add_event(
     mission_id: str,
     kind: str,

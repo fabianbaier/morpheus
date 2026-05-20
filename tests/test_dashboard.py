@@ -774,6 +774,42 @@ class DashboardTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(archived, ["m_parent"])
         self.assertIn("killed PRD run", app.alerts[0].text)
 
+    async def test_kill_closed_row_dismisses_it_from_dashboard(self) -> None:
+        app = DashboardHarness()
+        memory = dashboard.db.MissionMemory(
+            mission_id="m_closed",
+            title="closed codex",
+            phase="archived",
+            agent_kind="codex",
+            resume_command="codex resume 019e466d-0fd8-7441-aa1f-32a5db211a73",
+            resume_confidence="exact",
+            archived_at=10,
+            closed_at=10,
+        )
+        dismissed: list[str] = []
+        final_row_count = 0
+
+        def fake_dismiss(mission_id, summary=""):
+            dismissed.append(mission_id)
+            memory.resume_command = ""
+            return True
+
+        with isolated_dashboard_runtime(missions=[], memories=[memory]), patch.object(
+            dashboard.db, "dismiss_closed_resume", new=fake_dismiss
+        ):
+            async with app.run_test(size=(120, 40)) as pilot:
+                app._refresh_table()
+                await pilot.pause()
+                table = app.query_one(dashboard.MissionsTable)
+                self.assertEqual(table.selected_ref().role, "closed")
+                await pilot.press("d")
+                await pilot.pause()
+                final_row_count = table.row_count
+
+        self.assertEqual(dismissed, ["m_closed"])
+        self.assertIn("dismissed closed", app.alerts[0].text)
+        self.assertEqual(final_row_count, 0)
+
     async def test_prune_archives_orphan_prd_parent_rows(self) -> None:
         app = DashboardHarness()
         orphan_parent = dashboard.db.MissionMemory(
@@ -823,6 +859,42 @@ class DashboardTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(archived, ["m_orphan"])
         self.assertIn("archived 1 orphan PRD runs", app.alerts[0].text)
+
+    async def test_prune_closed_row_dismisses_it_from_dashboard(self) -> None:
+        app = DashboardHarness()
+        memory = dashboard.db.MissionMemory(
+            mission_id="m_closed",
+            title="closed codex",
+            phase="archived",
+            agent_kind="codex",
+            resume_command="codex resume 019e466d-0fd8-7441-aa1f-32a5db211a73",
+            resume_confidence="exact",
+            archived_at=10,
+            closed_at=10,
+        )
+        dismissed: list[str] = []
+        final_row_count = 0
+
+        def fake_dismiss(mission_id, summary=""):
+            dismissed.append(mission_id)
+            memory.resume_command = ""
+            return True
+
+        with isolated_dashboard_runtime(missions=[], memories=[memory]), patch.object(
+            dashboard.db, "dismiss_closed_resume", new=fake_dismiss
+        ):
+            async with app.run_test(size=(120, 40)) as pilot:
+                app._refresh_table()
+                await pilot.pause()
+                table = app.query_one(dashboard.MissionsTable)
+                self.assertEqual(table.selected_ref().role, "closed")
+                await pilot.press("p")
+                await pilot.pause()
+                final_row_count = table.row_count
+
+        self.assertEqual(dismissed, ["m_closed"])
+        self.assertIn("pruned closed", app.alerts[0].text)
+        self.assertEqual(final_row_count, 0)
 
     async def test_edit_mission_without_selection_pushes_alert(self) -> None:
         app = DashboardHarness()

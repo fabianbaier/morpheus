@@ -3089,6 +3089,19 @@ class MorpheusApp(App):
         if ref and ref.virtual and ref.role == "prd" and ref.mission_id:
             await self._kill_prd_run(ref.mission_id)
             return
+        if ref and ref.virtual and ref.role == "closed" and ref.mission_id:
+            if db.dismiss_closed_resume(ref.mission_id, "closed mission dismissed from dashboard"):
+                self._push_alert(Alert(
+                    time.time(), "close",
+                    f"dismissed closed [{ref.mission_id.split('_')[-1]}]"
+                ))
+                self._refresh_table()
+            else:
+                self._push_alert(Alert(
+                    time.time(), "error",
+                    f"closed mission [{ref.mission_id[:12]}] was already dismissed",
+                ))
+            return
         tab_id = ref.tab_id if ref and ref.tab_id else None
         if not tab_id:
             self._push_alert(Alert(time.time(), "error", "selected row has no live tab to kill"))
@@ -3103,6 +3116,21 @@ class MorpheusApp(App):
 
     async def action_prune_stale(self) -> None:
         if self.iterm_conn is None:
+            return
+        table = self.query_one(MissionsTable)
+        ref = table.selected_ref()
+        if ref and ref.virtual and ref.role == "closed" and ref.mission_id:
+            if db.dismiss_closed_resume(ref.mission_id, "closed mission pruned from dashboard"):
+                self._push_alert(Alert(
+                    time.time(), "close",
+                    f"pruned closed [{ref.mission_id.split('_')[-1]}]",
+                ))
+                self._refresh_table()
+            else:
+                self._push_alert(Alert(
+                    time.time(), "error",
+                    f"closed mission [{ref.mission_id[:12]}] was already pruned",
+                ))
             return
         now = time.time()
         stale_threshold = 4 * 3600

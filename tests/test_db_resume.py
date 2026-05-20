@@ -69,3 +69,26 @@ class ResumeMetadataTest(unittest.TestCase):
         self.assertEqual(archived.resume_confidence, "exact")
         self.assertIn(f"codex --yolo resume {resume_id}", archived.resume_command)
         self.assertNotIn("--last", archived.resume_command)
+
+    def test_dismiss_closed_resume_hides_archived_resumable_row(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with patch.object(db, "DB_DIR", root), patch.object(db, "DB_PATH", root / "morpheus.db"):
+                mission = db.Mission(
+                    tab_id="tab-codex",
+                    session_id="session-codex",
+                    goal="resume closed codex",
+                    cmd="codex",
+                    state="working",
+                )
+                db.upsert(mission)
+                db.delete(mission.tab_id)
+
+                dismissed = db.dismiss_closed_resume(mission.mission_id)
+                memory = db.get_memory(mission.mission_id)
+                events = db.recent_events(mission.mission_id, limit=5)
+
+        self.assertTrue(dismissed)
+        self.assertEqual(memory.resume_command, "")
+        self.assertEqual(memory.resume_confidence, "dismissed")
+        self.assertTrue(any(event.summary == "closed resume dismissed" for event in events))

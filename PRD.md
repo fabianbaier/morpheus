@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| **Status** | v0.8.0a21 implemented (exact Codex closed-session resume); next: 48-hour recall eval |
+| **Status** | v0.8.0a22 implemented (closed-row dismiss/prune); next: 48-hour recall eval |
 | **Author** | Fabian Baier |
 | **Last updated** | 2026-05-20 |
 | **Target platform** | macOS + iTerm2 |
@@ -772,7 +772,7 @@ This table is the source of truth for where the product stands right now.
 | Adaptive low-load rain | Implemented in v0.8.0a17 | Default rain cadence drops to 2 FPS, shard text parsing runs only when live buffers change, headline/tail scans are capped to recent terminal output, and slow render frames trigger short animation backoff so the cockpit remains usable |
 | Low-FPS rain repaint guard | Implemented in v0.8.0a18 | Rain now renders at 0.5 FPS by default and table refreshes update mission/card state without forcing rain repaint or shard parsing, removing the hidden duplicate render loop that made the cockpit unresponsive |
 | Zoom-safe compact layout | Implemented in v0.8.0a19 | Command-plus/iTerm font zoom now triggers a compact header/alert layout, dashboard panes fill the available body height instead of collapsing, and newly spawned sessions refresh the mission list immediately |
-| Closed-session provider resume | Implemented in v0.8.0a21 | Archived missions keep provider resume metadata; closed rows remain selectable and `r` opens a new iTerm tab with exact Codex session IDs when the terminal exposed one, then types the Morpheus recovery prompt into the resumed CLI |
+| Closed-session provider resume | Implemented in v0.8.0a22 | Archived missions keep provider resume metadata; closed rows remain selectable and `r` opens a new iTerm tab with exact Codex session IDs when the terminal exposed one, then types the Morpheus recovery prompt into the resumed CLI. Pressing `d` or `p` on a closed row now dismisses that resumable attachment from the dashboard without deleting graph history |
 | Robust self-tab exclusion | Implemented in v0.7.0a6 | Dashboard passes its own tab/session IDs into the watcher; core also recognizes the Morpheus screen by buffer if iTerm leaves the title as `Python"` |
 | Ready-response rabbit ticker | Implemented in v0.8.0a2 | `working → idle` now emits a `ready [...]` headline by extracting the latest assistant answer block, skipping Codex chrome/separators/source URLs, and compressing it to one sentence |
 | Newest-first rabbit ticker | Implemented in v0.8.0a3 | Bottom alert strip redraws from the newest-first alert deque so fresh session headlines stay at the top instead of appending chronologically |
