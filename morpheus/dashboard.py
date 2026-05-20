@@ -24,6 +24,7 @@ import random
 import re
 import shlex
 import tempfile
+import textwrap
 import time
 from collections import deque
 from contextlib import contextmanager
@@ -1115,6 +1116,9 @@ class MissionCardWidget(Static):
         artifacts = db.artifacts_for_mission(mission.mission_id, limit=5) if mission.mission_id else []
         self.update(self._render_card(mission, memory, events, artifacts, live))
 
+    def update_loop_card(self, loop: db.PromptLoop, runs: list[db.PromptLoopRun]) -> None:
+        self.update(self._render_loop_card(loop, runs))
+
     def _empty(self) -> Text:
         text = Text()
         text.append("MISSION CARD\n", style="bold bright_green")
@@ -1203,6 +1207,53 @@ class MissionCardWidget(Static):
 
         return text
 
+    def _render_loop_card(self, loop: db.PromptLoop, runs: list[db.PromptLoopRun]) -> Text:
+        text = Text()
+        text.append("LOOP CARD\n", style="bold bright_green")
+        text.append(f"{loop.name}\n", style="bold white")
+        text.append(
+            (
+                f"{loop.status} · every {loops_mod.format_interval(loop.interval_seconds)} · "
+                f"next {loops_mod.format_due(loop.next_run_at)} · target {_loop_target_label(loop)}"
+            ),
+            style="bold bright_yellow" if loop.status == "active" else COL_MUTED,
+        )
+        text.append("\n")
+
+        text.append("\nPROMPT\n", style="bold bright_green")
+        for line in _wrap_display_lines(loop.prompt, width=74, limit=6 if self.details_expanded else 3):
+            text.append(line, style=COL_BODY)
+            text.append("\n")
+
+        text.append("\nRUNS\n", style="bold bright_green")
+        if runs:
+            for run in runs[: 8 if self.details_expanded else 4]:
+                text.append(f"#{run.id} ", style=COL_ACCENT)
+                text.append(f"{_format_dashboard_ts(run.started_at)} {run.status}", style=COL_BODY)
+                if run.exit_code is not None:
+                    text.append(f" exit {run.exit_code}", style=COL_DIMMER)
+                text.append("\n")
+                text.append(f"  {run.summary or 'no summary'}\n", style=COL_BODY)
+                if self.details_expanded and run.output_path:
+                    text.append(f"  output {run.output_path}\n", style=COL_DIMMER)
+        else:
+            text.append("none yet\n", style=COL_DIMMER)
+            text.append("run `morpheus loops run-due` from launchd/cron/manual to create run history\n", style=COL_DIMMER)
+
+        if not self.details_expanded:
+            return text
+
+        text.append("\nCONFIG\n", style="bold bright_green")
+        self._field(text, "loop", str(loop.id))
+        self._field(text, "status", loop.status)
+        self._field(text, "command", loop.command)
+        self._field(text, "project", _display_path(loop.project_root), muted=not loop.project_root)
+        self._field(text, "tenant", loop.tenant_id, muted=not loop.tenant_id)
+        self._field(text, "last", loop.last_summary or "unset", muted=not loop.last_summary)
+        text.append("\n")
+        text.append("run model: captured command executions, not reusable live tabs yet\n", style=COL_DIMMER)
+        return text
+
     def _render_latest_output(self, text: Text, live: Optional[LiveBuffer]) -> None:
         text.append("\nLATEST OUTPUT\n", style="bold bright_green")
         if live and live.buffer:
@@ -1240,6 +1291,18 @@ def _single_line(value: str, limit: int = 140) -> str:
     if len(cleaned) <= limit:
         return cleaned
     return cleaned[: limit - 1] + "…"
+
+
+def _wrap_display_lines(value: str, width: int = 80, limit: int = 4) -> list[str]:
+    cleaned = " ".join(value.split())
+    if not cleaned:
+        return ["unset"]
+    lines = textwrap.wrap(cleaned, width=width, break_long_words=False, break_on_hyphens=False)
+    if len(lines) <= limit:
+        return lines
+    shown = lines[:limit]
+    shown[-1] = shown[-1][: max(0, width - 1)] + "…"
+    return shown
 
 
 def _join_nonempty(*parts: str) -> str:
@@ -2333,6 +2396,7 @@ class LoopManagerScreen(ModalScreen[Optional[LoopActionRequest]]):
         Binding("k", "cursor_up", "prev"),
         Binding("down", "cursor_down", "next", show=False),
         Binding("up", "cursor_up", "prev", show=False),
+        Binding("enter", "edit_selected", "edit"),
         Binding("e", "edit_selected", "edit"),
         Binding("p", "toggle_selected", "pause/resume"),
         Binding("t", "join_selected", "join"),
@@ -2347,6 +2411,7 @@ class LoopManagerScreen(ModalScreen[Optional[LoopActionRequest]]):
         run_counts_by_loop: Optional[dict[int, int]] = None,
         scope_label: str = "current project",
         join_target_label: str = "ticker/context only",
+        selected_loop_id: Optional[int] = None,
         join_target_mission_id: str = "",
         join_target_tab_id: Optional[str] = None,
     ):
@@ -2356,6 +2421,7 @@ class LoopManagerScreen(ModalScreen[Optional[LoopActionRequest]]):
         self.run_counts_by_loop = run_counts_by_loop or {}
         self.scope_label = scope_label
         self.join_target_label = join_target_label
+        self.selected_loop_id = selected_loop_id
         self.join_target_mission_id = join_target_mission_id
         self.join_target_tab_id = join_target_tab_id
         self.confirm_delete_id: Optional[int] = None
@@ -2380,7 +2446,10 @@ class LoopManagerScreen(ModalScreen[Optional[LoopActionRequest]]):
         table = self.query_one("#loops_table", DataTable)
         table.cursor_type = "row"
         table.add_columns("ID", "ST", "NAME", "EVERY", "NEXT", "TARGET", "RUNS", "LAST")
-        for loop in self.loops:
+        selected_row = 0
+        for idx, loop in enumerate(self.loops):
+            if loop.id == self.selected_loop_id:
+                selected_row = idx
             table.add_row(
                 str(loop.id),
                 loop.status,
@@ -2391,6 +2460,8 @@ class LoopManagerScreen(ModalScreen[Optional[LoopActionRequest]]):
                 str(self.run_counts_by_loop.get(loop.id, len(self.runs_by_loop.get(loop.id, [])))),
                 loop.last_summary or "—",
             )
+        if self.loops:
+            table.cursor_coordinate = (selected_row, 0)
         table.focus()
         self._refresh_detail()
 
@@ -2489,6 +2560,7 @@ class LoopManagerScreen(ModalScreen[Optional[LoopActionRequest]]):
             f"status {loop.status} · every {loops_mod.format_interval(loop.interval_seconds)} · next {loops_mod.format_due(loop.next_run_at)}",
             f"target {_loop_target_label(loop)} · command {loop.command}",
             f"prompt {loop.prompt}",
+            "keys Enter/e edit · p pause/resume · t join selected mission · d delete",
         ]
         runs = self.runs_by_loop.get(loop.id, [])
         if runs:
@@ -3068,6 +3140,28 @@ class MorpheusApp(App):
         tenant_id = "" if self.show_all else self.tenant_id
         return db.all_loops(include_paused=True, tenant_id=tenant_id)
 
+    def _selected_loop_id(self) -> Optional[int]:
+        try:
+            ref = self.query_one(MissionsTable).selected_ref()
+        except Exception:
+            return None
+        if ref is None or ref.role != "loop" or not ref.mission_id:
+            return None
+        try:
+            prefix, loop_id = ref.mission_id.split(":", 1)
+            return int(loop_id) if prefix == "loop" else None
+        except (TypeError, ValueError):
+            return None
+
+    def _loop_for_row_id(self, row_id: str) -> Optional[db.PromptLoop]:
+        try:
+            prefix, loop_id = row_id.split(":", 1)
+            if prefix != "loop":
+                return None
+            return db.get_loop(int(loop_id))
+        except (TypeError, ValueError):
+            return None
+
     def _selected_tab_id(self) -> Optional[str]:
         try:
             return self.query_one(MissionsTable).selected_tab_id()
@@ -3101,6 +3195,11 @@ class MorpheusApp(App):
             mission = next((m for m in missions if m.tab_id == tab_id), None)
         if tab_id and mission is None:
             mission = db.get(tab_id)
+        if mission is None and mission_id and mission_id.startswith("loop:"):
+            loop = self._loop_for_row_id(mission_id)
+            if loop is not None:
+                card.update_loop_card(loop, db.loop_runs(loop.id, limit=8))
+                return
         if mission is None and mission_id:
             memory = db.get_memory(mission_id)
             if memory is not None:
@@ -3112,24 +3211,6 @@ class MorpheusApp(App):
                     cmd="prd-run",
                     buffer_changed_at=memory.updated_at,
                     last_event=memory.next_step or "PRD run",
-                )
-        if mission is None and mission_id and mission_id.startswith("loop:"):
-            try:
-                loop_id = int(mission_id.split(":", 1)[1])
-                loop = db.get_loop(loop_id)
-            except (TypeError, ValueError):
-                loop = None
-            if loop is not None:
-                mission = db.Mission(
-                    tab_id="",
-                    mission_id=mission_id,
-                    tenant_id=loop.tenant_id,
-                    project_root=loop.project_root,
-                    goal=f"loop: {loop.name}",
-                    state=loop.status,
-                    cmd=loop.command,
-                    buffer_changed_at=loop.last_run_at or loop.updated_at,
-                    last_event=loop.last_summary or f"next {loops_mod.format_due(loop.next_run_at)}",
                 )
         if mission is None:
             card.update_card(None)
@@ -3330,6 +3411,10 @@ class MorpheusApp(App):
     async def action_focus_session(self) -> None:
         if self._toggle_prd_parent(self._selected_prd_parent_row_id() or ""):
             return
+        loop_id = self._selected_loop_id()
+        if loop_id is not None:
+            self._open_loop_manager(selected_loop_id=loop_id)
+            return
         if self.iterm_conn is None:
             return
         table = self.query_one(MissionsTable)
@@ -3465,6 +3550,9 @@ class MorpheusApp(App):
         )
 
     def action_manage_loops(self) -> None:
+        self._open_loop_manager(selected_loop_id=self._selected_loop_id())
+
+    def _open_loop_manager(self, selected_loop_id: Optional[int] = None) -> None:
         target_label, target_mission_id, target_tab_id = self._loop_target_for_selection()
         loops = self._visible_loops()
         runs_by_loop = {loop.id: db.loop_runs(loop.id, limit=5) for loop in loops}
@@ -3476,6 +3564,7 @@ class MorpheusApp(App):
                 run_counts_by_loop=run_counts_by_loop,
                 scope_label=self._scope_text(),
                 join_target_label=target_label,
+                selected_loop_id=selected_loop_id,
                 join_target_mission_id=target_mission_id,
                 join_target_tab_id=target_tab_id,
             ),
@@ -3751,7 +3840,7 @@ class MorpheusApp(App):
             self._push_alert(Alert(time.time(), "error", f"loop #{result.loop_id} not found"))
             return
         if result.action == "edit":
-            self.push_screen(LoopEditScreen(loop), self._handle_loop_edit_result)
+            self._open_loop_editor(loop.id)
             return
 
         try:
@@ -3826,6 +3915,13 @@ class MorpheusApp(App):
 
         self._push_alert(Alert(time.time(), "summary", message))
         self._refresh_table()
+
+    def _open_loop_editor(self, loop_id: int) -> None:
+        loop = db.get_loop(loop_id)
+        if loop is None:
+            self._push_alert(Alert(time.time(), "error", f"loop #{loop_id} not found"))
+            return
+        self.push_screen(LoopEditScreen(loop), self._handle_loop_edit_result)
 
     def _handle_loop_edit_result(self, result: Optional[LoopActionRequest]) -> None:
         if result is None:
@@ -4029,6 +4125,10 @@ class MorpheusApp(App):
 
     def action_edit_mission(self) -> None:
         table = self.query_one(MissionsTable)
+        loop_id = self._selected_loop_id()
+        if loop_id is not None:
+            self._open_loop_editor(loop_id)
+            return
         tab_id = table.selected_tab_id()
         if not tab_id:
             self._push_alert(Alert(time.time(), "error", "no mission selected to edit"))

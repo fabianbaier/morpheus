@@ -216,6 +216,43 @@ class DashboardTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("decision build card before edit flow", expanded)
         self.assertIn("pass test tests/test_dashboard.py", expanded)
 
+    def test_loop_card_renders_prompt_and_run_history(self) -> None:
+        card = MissionCardWidget()
+        loop = dashboard.db.PromptLoop(
+            id=7,
+            name="market scan",
+            prompt="summarize tomorrow's market catalysts and blockers",
+            interval_seconds=900,
+            command="codex exec",
+            status="active",
+            last_summary="WMT disciplined zone",
+            next_run_at=0,
+        )
+        run = dashboard.db.PromptLoopRun(
+            id=3,
+            loop_id=loop.id,
+            started_at=1,
+            finished_at=2,
+            status="success",
+            exit_code=0,
+            output_path="/tmp/loop.txt",
+            summary="WMT disciplined zone",
+        )
+
+        rendered = card._render_loop_card(loop, [run]).plain
+
+        self.assertIn("LOOP CARD", rendered)
+        self.assertIn("market scan", rendered)
+        self.assertIn("summarize tomorrow's market catalysts", rendered)
+        self.assertIn("WMT disciplined zone", rendered)
+        self.assertNotIn("run model:", rendered)
+
+        card.toggle_details()
+        expanded = card._render_loop_card(loop, [run]).plain
+        self.assertIn("command: codex exec", expanded)
+        self.assertIn("output /tmp/loop.txt", expanded)
+        self.assertIn("not reusable live tabs yet", expanded)
+
     def test_tail_lines_prefers_recent_non_empty_output(self) -> None:
         rendered = _tail_lines("old\n\nmiddle\nlatest and very long", limit=2, width=12)
 
@@ -2215,6 +2252,101 @@ class DashboardTest(unittest.IsolatedAsyncioTestCase):
                 await pilot.pause()
 
                 self.assertIsInstance(app.screen, LoopManagerScreen)
+
+    async def test_enter_on_loop_row_opens_manager_for_selected_loop(self) -> None:
+        app = DashboardHarness()
+        loops = [
+            dashboard.db.PromptLoop(
+                id=7,
+                name="market scan",
+                prompt="summarize catalysts",
+                interval_seconds=900,
+                command="codex exec",
+                next_run_at=0,
+            ),
+            dashboard.db.PromptLoop(
+                id=8,
+                name="repo pulse",
+                prompt="summarize repo",
+                interval_seconds=1800,
+                command="codex exec",
+                next_run_at=0,
+            ),
+        ]
+
+        with isolated_dashboard_runtime(), patch.object(
+            dashboard.db, "all_loops", new=lambda include_paused=True, tenant_id="": loops
+        ), patch.object(
+            dashboard.db, "loop_runs", new=lambda loop_id, limit=5: []
+        ), patch.object(
+            dashboard.db, "loop_run_count", new=lambda loop_id: 0
+        ):
+            async with app.run_test(size=(120, 40)) as pilot:
+                app._refresh_table()
+                await pilot.pause()
+                table = app.query_one(dashboard.MissionsTable)
+                table.move_cursor(row=1)
+
+                await pilot.press("enter")
+                await pilot.pause()
+
+                self.assertIsInstance(app.screen, LoopManagerScreen)
+                self.assertEqual(app.screen._selected_loop().id, 8)
+                self.assertIn("repo pulse", app.screen._detail(loops[1]))
+
+    async def test_edit_key_on_loop_row_opens_loop_editor(self) -> None:
+        app = DashboardHarness()
+        loop = dashboard.db.PromptLoop(
+            id=7,
+            name="market scan",
+            prompt="summarize catalysts",
+            interval_seconds=900,
+            command="codex exec",
+            next_run_at=0,
+        )
+
+        with isolated_dashboard_runtime(), patch.object(
+            dashboard.db, "all_loops", new=lambda include_paused=True, tenant_id="": [loop]
+        ), patch.object(
+            dashboard.db, "get_loop", new=lambda loop_id: loop if loop_id == loop.id else None
+        ):
+            async with app.run_test(size=(120, 40)) as pilot:
+                app._refresh_table()
+                await pilot.pause()
+
+                await pilot.press("e")
+                await pilot.pause()
+
+                self.assertIsInstance(app.screen, LoopEditScreen)
+                self.assertEqual(app.screen.query_one("#loop_prompt", Input).value, "summarize catalysts")
+
+    async def test_selected_loop_row_updates_loop_card(self) -> None:
+        app = DashboardHarness()
+        loop = dashboard.db.PromptLoop(
+            id=7,
+            name="market scan",
+            prompt="summarize catalysts",
+            interval_seconds=900,
+            command="codex exec",
+            next_run_at=0,
+        )
+
+        with isolated_dashboard_runtime(), patch.object(
+            dashboard.db, "all_loops", new=lambda include_paused=True, tenant_id="": [loop]
+        ), patch.object(
+            dashboard.db, "get_loop", new=lambda loop_id: loop if loop_id == loop.id else None
+        ), patch.object(
+            dashboard.db, "loop_runs", new=lambda loop_id, limit=8: []
+        ):
+            async with app.run_test(size=(120, 40)) as pilot:
+                app._refresh_table()
+                app._refresh_mission_card()
+                await pilot.pause()
+
+                card = app.query_one(MissionCardWidget)
+                rendered = str(card.content)
+                self.assertIn("LOOP CARD", rendered)
+                self.assertIn("summarize catalysts", rendered)
 
     async def test_loop_manager_edit_action_updates_loop(self) -> None:
         app = DashboardHarness()

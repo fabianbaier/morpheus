@@ -135,14 +135,15 @@ checks such as "scan for new blockers every 30 minutes" or "summarize market
 catalysts." Loop results show up in the ticker, and targeted loops also attach
 events/artifacts to the selected mission. Project loops appear as `LOOP` rows
 in the cockpit; use `Shift+L` or `L` to inspect recent runs and edit/manage
-them.
+them. You can also select a `LOOP` row and press `Enter` to inspect it, or `e`
+to edit its prompt/config directly.
 
 ### Key Shortcuts
 
 | Key | Action |
 |---|---|
 | `j` / `k` or arrows | Move selection |
-| `Enter` | Focus the selected real iTerm tab |
+| `Enter` | Focus selected iTerm tab; inspect selected loop |
 | `n` | New session |
 | `w` | New worker under a PRD run |
 | `l` | New recurring prompt loop |
@@ -336,9 +337,11 @@ From the cockpit, press `l` to create a loop. If a mission is selected, loop
 results route back to that mission as `loop_output` events and `loop-output`
 artifacts; otherwise they report to the ticker/context only. Loops are visible
 as project-scoped `LOOP` rows, and `Shift+L` / `L` opens the loop manager for
-edit/pause/resume/delete/join controls plus recent run history. The dashboard
-does not run long loop commands inline; use launchd/cron or
-`morpheus loops run-due`.
+edit/pause/resume/delete/join controls plus recent run history. Selecting a
+`LOOP` row shows its prompt/config/history in the right-side card; `Enter`
+opens the manager on that loop and `e` opens its editor. The dashboard does not
+run long loop commands inline; use launchd/cron or `morpheus loops run-due`.
+Loop runs are captured command executions today, not reusable live tab sessions.
 
 ## State Files
 

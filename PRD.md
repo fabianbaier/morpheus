@@ -317,7 +317,7 @@ attach.
 | Key | Function | Required behavior |
 |---|---|---|
 | `j` / `k` or arrows | Move selection | Moves through sessions without changing focus in iTerm |
-| `Enter` | Attach / focus | Jumps to the selected iTerm tab or owned PTY session |
+| `Enter` | Attach / focus / inspect | Jumps to the selected iTerm tab or owned PTY session; on `LOOP` rows, opens the loop manager preselected to that loop |
 | `n` | New mission | Opens goal + command form; creates mission card before launch |
 | `b` | Brief selected | Shows a short "why / status / next step" card for selected session |
 | `e` | Edit mission | Edits goal, why, plan, next step, tags, linked PR, worktree |
@@ -519,6 +519,10 @@ Required behavior:
 - Project-scoped loop rows appear in the cockpit as `LOOP` rows so active,
   paused, due, and last-run state are visible even when a loop is not attached
   to a live mission.
+- Selecting a `LOOP` row updates the mission card into a loop card with prompt,
+  schedule, target, and recent run history. Pressing `Enter` on a `LOOP` row
+  opens the loop manager preselected to that loop; pressing `e` edits that loop
+  directly.
 - Due loop execution captures stdout/stderr into
   `~/.morpheus/loops/<loop-id>/<timestamp>.txt`.
 - Every run emits a one-line ticker note (`kind=loop`). If targeted, it also
@@ -535,11 +539,16 @@ Required behavior:
 Implemented cockpit controls:
 
 - `Shift+L` / `L` opens the loop manager for the current project, with recent
-  run history plus edit/pause/resume/delete/join controls. Editing can change
-  name, prompt, interval, and command without leaving the cockpit.
+  run history plus edit/pause/resume/delete/join controls. If a `LOOP` row is
+  already selected, the manager opens on that loop. Editing can change name,
+  prompt, interval, and command without leaving the cockpit.
 
 Future work:
 
+- Optional session-backed loop runner where a loop can reuse a visible worker
+  session instead of executing stateless command runs. The current implemented
+  model stores captured command executions as loop-run artifacts, not reusable
+  live tabs.
 - Optional fan-out where a loop result can draft an instruction for a target
   session, with user approval before sending text.
 - Background LLM summarization for long loop outputs, recorded with provenance
@@ -884,6 +893,7 @@ This table is the source of truth for where the product stands right now.
 | Prompt loops foundation | Implemented in v0.8.0a4 | `l` creates recurring prompt loops; `morpheus loops run-due` runs due prompts, captures output, publishes ticker notes, and routes graph events/artifacts to target missions |
 | Prompt loop cockpit visibility | Implemented in v0.8.0a27 | Loops now store owning project tenant/root, render as `LOOP` rows in the mission table, and `Shift+L`/`L` opens the current project's loop manager so active/due/last-run state is visible without running loop commands inside the dashboard |
 | Prompt loop cockpit editing/history | Implemented in v0.8.0a28 | The loop manager shows run counts and recent run history, explains when no runner has executed yet, edits name/prompt/interval/command in-cockpit, and backfills legacy targeted loops into their project tenant |
+| Loop row inspect/edit UX | Implemented in v0.8.0a29 | Selecting a `LOOP` row renders a loop card with prompt/config/history; `Enter` opens the loop manager preselected to that loop, and `e` edits the loop instead of falling into mission-edit errors |
 | PRD Runs foundation | Implemented in v0.8.0a1 | PRD finder, new-session PRD selector, parent mission creation, coordinator prompt/status files, `morpheus run start`, and coordinator graph edge shipped |
 | PRD run tree UI | Partially implemented in v0.8.0a5 | Shows virtual PRD parent rows with coordinator/worker sessions rendered underneath them; collapse/expand remains future polish |
 | PRD child worker spawn | Implemented in v0.8.0a5 | `w` spawns a manual child worker under the selected PRD parent/coordinator/worker with scope and verification prompts |
