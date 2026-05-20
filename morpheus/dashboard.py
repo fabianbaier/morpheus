@@ -36,6 +36,8 @@ from textual.widgets import Button, DataTable, Footer, Input, Label, RichLog, Se
 
 from morpheus import context as ctx_mod
 from morpheus import core, db, iterm_client, naming, rain as rain_mod
+from morpheus import ledger as ledger_mod
+from morpheus import loops as loops_mod
 from morpheus import prd_runs
 from morpheus import __version__
 
@@ -138,6 +140,16 @@ class NewSessionRequest:
     goal: str
     command: str
     prd_path: str = ""
+
+
+@dataclass
+class LoopRequest:
+    name: str
+    prompt: str
+    interval: str
+    command: str
+    target_mission_id: str = ""
+    target_tab_id: Optional[str] = None
 
 
 @dataclass
@@ -889,6 +901,106 @@ class NoteScreen(ModalScreen[Optional[tuple[str, str, Optional[str]]]]):
         self.dismiss(None)
 
 
+class LoopScreen(ModalScreen[Optional[LoopRequest]]):
+    """Create a recurring prompt loop routed to ticker/context or a mission."""
+
+    CSS = """
+    LoopScreen { align: center middle; }
+    #dialog {
+        width: 82;
+        height: 20;
+        border: round ansi_bright_yellow;
+        background: black;
+        padding: 1 2;
+    }
+    #dialog Label.title {
+        color: ansi_bright_yellow;
+        text-style: bold;
+        margin-bottom: 1;
+    }
+    #dialog Label.hint {
+        color: grey;
+        margin-bottom: 1;
+    }
+    Input {
+        background: black;
+        color: ansi_bright_yellow;
+        border: round yellow;
+        margin-bottom: 1;
+    }
+    Input:focus { border: round ansi_bright_yellow; }
+    Button { margin-right: 2; }
+    """
+
+    BINDINGS = [
+        Binding("escape", "cancel", "cancel"),
+    ]
+
+    def __init__(
+        self,
+        *,
+        target_label: str,
+        target_mission_id: str = "",
+        target_tab_id: Optional[str] = None,
+    ):
+        super().__init__()
+        self.target_label = target_label
+        self.target_mission_id = target_mission_id
+        self.target_tab_id = target_tab_id
+
+    def compose(self) -> ComposeResult:
+        with Container(id="dialog"):
+            yield Label(f"{RABBIT}  NEW LOOP", classes="title")
+            yield Label(f"target: {self.target_label}", classes="hint")
+            yield Input(placeholder="name, e.g. morning market scan", id="loop_name")
+            yield Input(placeholder="prompt to run on every loop tick", id="loop_prompt")
+            yield Input(value="30m", placeholder="interval, e.g. 15m, 2h, daily", id="loop_interval")
+            yield Input(value=loops_mod.DEFAULT_COMMAND, placeholder="command, e.g. codex exec", id="loop_command")
+            with Horizontal():
+                yield Button("create", variant="primary", id="loop_create")
+                yield Button("cancel", id="loop_cancel")
+
+    def on_mount(self) -> None:
+        self.query_one("#loop_name", Input).focus()
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        order = ["loop_name", "loop_prompt", "loop_interval", "loop_command"]
+        if event.input.id in order:
+            idx = order.index(event.input.id)
+            if idx < len(order) - 1:
+                self.query_one(f"#{order[idx + 1]}", Input).focus()
+            else:
+                self.action_submit()
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "loop_create":
+            self.action_submit()
+        else:
+            self.action_cancel()
+
+    def action_submit(self) -> None:
+        name = self.query_one("#loop_name", Input).value.strip()
+        prompt = self.query_one("#loop_prompt", Input).value.strip()
+        interval = self.query_one("#loop_interval", Input).value.strip() or "30m"
+        command = self.query_one("#loop_command", Input).value.strip() or loops_mod.DEFAULT_COMMAND
+        if not prompt:
+            self.query_one("#loop_prompt", Input).focus()
+            return
+        if not name:
+            name = prompt[:48] + ("…" if len(prompt) > 48 else "")
+        self.dismiss(LoopRequest(
+            name=name,
+            prompt=prompt,
+            interval=interval,
+            command=command,
+            target_mission_id=self.target_mission_id,
+            target_tab_id=self.target_tab_id,
+        ))
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
 # ── main app ──────────────────────────────────────────────────────────────
 
 FOOTER_BINDINGS = [
@@ -902,6 +1014,7 @@ FOOTER_BINDINGS = [
     Binding("p", "prune_stale", "prune"),
     Binding("s", "snapshot_session", "snapshot"),
     Binding("slash", "post_note", "note"),
+    Binding("l", "new_loop", "loop"),
     Binding("r", "refresh_now", "refresh"),
     Binding("q", "quit", "quit"),
     Binding("ctrl+c", "quit", "quit", show=False),
@@ -1264,7 +1377,7 @@ class MorpheusApp(App):
         goals = {m.tab_id: (m.goal or "(untitled)") for m in db.all_missions()}
         for n in sorted(fresh, key=lambda n: n.created_at):
             goal = goals.get(n.tab_id or "", "unknown")
-            marker = {"note": "•", "claim": "⚑", "broadcast": "📡"}.get(n.kind, "•")
+            marker = {"note": "•", "claim": "⚑", "broadcast": "📡", "loop": "↻"}.get(n.kind, "•")
             self._push_alert(Alert(
                 n.created_at, "note",
                 f"{marker} note from [{goal}]: {n.text}",
@@ -1336,6 +1449,69 @@ class MorpheusApp(App):
         root = self._selected_worktree_or_cwd()
         candidates = prd_runs.find_prds(root)
         self.push_screen(NewSessionScreen(prd_candidates=candidates, root=root), self._handle_new_session_result)
+
+    def action_new_loop(self) -> None:
+        target_tab_id = self._selected_tab_id()
+        target_mission_id = ""
+        target_label = "ticker/context only"
+        if target_tab_id:
+            mission = db.get(target_tab_id)
+            if mission and mission.mission_id:
+                target_mission_id = mission.mission_id
+                target_label = f"{mission.goal or target_tab_id.split('-')[0]} ({target_tab_id.split('-')[0]})"
+        self.push_screen(
+            LoopScreen(
+                target_label=target_label,
+                target_mission_id=target_mission_id,
+                target_tab_id=target_tab_id if target_mission_id else None,
+            ),
+            self._handle_loop_result,
+        )
+
+    def _handle_loop_result(self, result: Optional[LoopRequest]) -> None:
+        if result is None:
+            return
+        try:
+            interval = loops_mod.parse_interval(result.interval)
+            loop = db.create_loop(
+                name=result.name,
+                prompt=result.prompt,
+                interval_seconds=interval,
+                command=result.command,
+                target_mission_id=result.target_mission_id,
+                target_tab_id=result.target_tab_id,
+            )
+            if result.target_mission_id:
+                db.add_event(
+                    result.target_mission_id,
+                    kind="loop_created",
+                    actor="morpheus",
+                    summary=f"Loop created: {loop.name} every {loops_mod.format_interval(interval)}",
+                    source_ref=f"loop:{loop.id}",
+                    metadata={"loop_id": loop.id, "target_tab_id": result.target_tab_id},
+                )
+            ledger_mod.log_action(
+                "loop_create",
+                tab_id=result.target_tab_id,
+                details={
+                    "loop_id": loop.id,
+                    "name": loop.name,
+                    "interval_seconds": loop.interval_seconds,
+                    "target_mission_id": result.target_mission_id,
+                },
+            )
+            ctx_mod.write_context_file()
+            ctx_mod.write_context_json()
+        except Exception as e:
+            self._push_alert(Alert(time.time(), "error", f"loop create failed: {e}"))
+            return
+
+        target = f" → {result.target_tab_id.split('-')[0]}" if result.target_tab_id else " → ticker"
+        self._push_alert(Alert(
+            time.time(),
+            "spawn",
+            f"loop [{loop.name}] every {loops_mod.format_interval(loop.interval_seconds)}{target}",
+        ))
 
     async def _handle_new_session_result(self, result: Optional[NewSessionRequest]) -> None:
         if not result:

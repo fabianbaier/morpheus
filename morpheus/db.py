@@ -96,6 +96,38 @@ class MissionEdge:
     created_at: float
 
 
+@dataclass
+class PromptLoop:
+    id: int
+    name: str
+    prompt: str
+    interval_seconds: float
+    command: str
+    target_mission_id: str = ""
+    target_tab_id: Optional[str] = None
+    status: str = "active"
+    last_run_at: float = 0.0
+    next_run_at: float = 0.0
+    last_run_status: str = ""
+    last_summary: str = ""
+    created_at: float = field(default_factory=time.time)
+    updated_at: float = field(default_factory=time.time)
+
+
+@dataclass
+class PromptLoopRun:
+    id: int
+    loop_id: int
+    started_at: float
+    finished_at: float
+    status: str
+    exit_code: Optional[int]
+    output_path: str
+    summary: str
+    target_mission_id: str = ""
+    target_tab_id: Optional[str] = None
+
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS missions (
     tab_id            TEXT PRIMARY KEY,
@@ -197,6 +229,41 @@ CREATE TABLE IF NOT EXISTS notes (
 
 CREATE INDEX IF NOT EXISTS notes_tab_idx     ON notes(tab_id);
 CREATE INDEX IF NOT EXISTS notes_created_idx ON notes(created_at DESC);
+
+CREATE TABLE IF NOT EXISTS prompt_loops (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    name              TEXT NOT NULL,
+    prompt            TEXT NOT NULL,
+    interval_seconds  REAL NOT NULL,
+    command           TEXT NOT NULL,
+    target_mission_id TEXT NOT NULL DEFAULT '',
+    target_tab_id     TEXT,
+    status            TEXT NOT NULL DEFAULT 'active',
+    last_run_at       REAL NOT NULL DEFAULT 0,
+    next_run_at       REAL NOT NULL,
+    last_run_status   TEXT NOT NULL DEFAULT '',
+    last_summary      TEXT NOT NULL DEFAULT '',
+    created_at        REAL NOT NULL,
+    updated_at        REAL NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS prompt_loops_status_next_idx ON prompt_loops(status, next_run_at);
+CREATE INDEX IF NOT EXISTS prompt_loops_target_idx ON prompt_loops(target_mission_id);
+
+CREATE TABLE IF NOT EXISTS prompt_loop_runs (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    loop_id           INTEGER NOT NULL,
+    started_at        REAL NOT NULL,
+    finished_at       REAL NOT NULL,
+    status            TEXT NOT NULL,
+    exit_code         INTEGER,
+    output_path       TEXT NOT NULL DEFAULT '',
+    summary           TEXT NOT NULL DEFAULT '',
+    target_mission_id TEXT NOT NULL DEFAULT '',
+    target_tab_id     TEXT
+);
+
+CREATE INDEX IF NOT EXISTS prompt_loop_runs_loop_idx ON prompt_loop_runs(loop_id, started_at DESC);
 """
 
 
@@ -619,6 +686,8 @@ def graph_counts() -> dict[str, int]:
             "events": conn.execute("SELECT COUNT(*) AS n FROM mission_events").fetchone()["n"],
             "artifacts": conn.execute("SELECT COUNT(*) AS n FROM mission_artifacts").fetchone()["n"],
             "edges": conn.execute("SELECT COUNT(*) AS n FROM mission_edges").fetchone()["n"],
+            "loops": conn.execute("SELECT COUNT(*) AS n FROM prompt_loops").fetchone()["n"],
+            "loop_runs": conn.execute("SELECT COUNT(*) AS n FROM prompt_loop_runs").fetchone()["n"],
         }
 
 
@@ -661,6 +730,149 @@ def notes_for_tab(tab_id: str, limit: int = 10) -> list[Note]:
             (tab_id, limit),
         ).fetchall()
     return [_row_to_note(r) for r in rows]
+
+
+def create_loop(
+    name: str,
+    prompt: str,
+    interval_seconds: float,
+    command: str,
+    target_mission_id: str = "",
+    target_tab_id: Optional[str] = None,
+    status: str = "active",
+    next_run_at: Optional[float] = None,
+) -> PromptLoop:
+    now = time.time()
+    next_at = next_run_at if next_run_at is not None else now + interval_seconds
+    with _connect() as conn:
+        cur = conn.execute(
+            """
+            INSERT INTO prompt_loops (
+                name, prompt, interval_seconds, command, target_mission_id,
+                target_tab_id, status, next_run_at, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                name,
+                prompt,
+                interval_seconds,
+                command,
+                target_mission_id,
+                target_tab_id,
+                status,
+                next_at,
+                now,
+                now,
+            ),
+        )
+        row = conn.execute("SELECT * FROM prompt_loops WHERE id = ?", (cur.lastrowid,)).fetchone()
+    return _row_to_prompt_loop(row)
+
+
+def all_loops(include_paused: bool = True) -> list[PromptLoop]:
+    query = "SELECT * FROM prompt_loops"
+    params: tuple[Any, ...] = ()
+    if not include_paused:
+        query += " WHERE status = ?"
+        params = ("active",)
+    query += " ORDER BY next_run_at ASC, created_at DESC"
+    with _connect() as conn:
+        rows = conn.execute(query, params).fetchall()
+    return [_row_to_prompt_loop(row) for row in rows]
+
+
+def get_loop(loop_id: int) -> Optional[PromptLoop]:
+    with _connect() as conn:
+        row = conn.execute("SELECT * FROM prompt_loops WHERE id = ?", (loop_id,)).fetchone()
+    return _row_to_prompt_loop(row) if row else None
+
+
+def due_loops(now: Optional[float] = None, limit: int = 10) -> list[PromptLoop]:
+    ts = now or time.time()
+    with _connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT * FROM prompt_loops
+             WHERE status = 'active' AND next_run_at <= ?
+             ORDER BY next_run_at ASC
+             LIMIT ?
+            """,
+            (ts, limit),
+        ).fetchall()
+    return [_row_to_prompt_loop(row) for row in rows]
+
+
+def set_loop_status(loop_id: int, status: str) -> Optional[PromptLoop]:
+    now = time.time()
+    with _connect() as conn:
+        conn.execute(
+            "UPDATE prompt_loops SET status = ?, updated_at = ? WHERE id = ?",
+            (status, now, loop_id),
+        )
+        row = conn.execute("SELECT * FROM prompt_loops WHERE id = ?", (loop_id,)).fetchone()
+    return _row_to_prompt_loop(row) if row else None
+
+
+def update_loop_after_run(
+    loop_id: int,
+    *,
+    last_run_at: float,
+    next_run_at: float,
+    last_run_status: str,
+    last_summary: str,
+) -> Optional[PromptLoop]:
+    now = time.time()
+    with _connect() as conn:
+        conn.execute(
+            """
+            UPDATE prompt_loops
+               SET last_run_at = ?,
+                   next_run_at = ?,
+                   last_run_status = ?,
+                   last_summary = ?,
+                   updated_at = ?
+             WHERE id = ?
+            """,
+            (last_run_at, next_run_at, last_run_status, last_summary, now, loop_id),
+        )
+        row = conn.execute("SELECT * FROM prompt_loops WHERE id = ?", (loop_id,)).fetchone()
+    return _row_to_prompt_loop(row) if row else None
+
+
+def record_loop_run(
+    loop_id: int,
+    *,
+    started_at: float,
+    finished_at: float,
+    status: str,
+    exit_code: Optional[int],
+    output_path: str,
+    summary: str,
+    target_mission_id: str = "",
+    target_tab_id: Optional[str] = None,
+) -> PromptLoopRun:
+    with _connect() as conn:
+        cur = conn.execute(
+            """
+            INSERT INTO prompt_loop_runs (
+                loop_id, started_at, finished_at, status, exit_code, output_path,
+                summary, target_mission_id, target_tab_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                loop_id,
+                started_at,
+                finished_at,
+                status,
+                exit_code,
+                output_path,
+                summary,
+                target_mission_id,
+                target_tab_id,
+            ),
+        )
+        row = conn.execute("SELECT * FROM prompt_loop_runs WHERE id = ?", (cur.lastrowid,)).fetchone()
+    return _row_to_prompt_loop_run(row)
 
 
 def _archive_mission(
@@ -728,6 +940,40 @@ def _row_to_note(row: sqlite3.Row) -> Note:
         text=row["text"],
         kind=row["kind"],
         created_at=row["created_at"],
+    )
+
+
+def _row_to_prompt_loop(row: sqlite3.Row) -> PromptLoop:
+    return PromptLoop(
+        id=row["id"],
+        name=row["name"],
+        prompt=row["prompt"],
+        interval_seconds=row["interval_seconds"],
+        command=row["command"],
+        target_mission_id=row["target_mission_id"],
+        target_tab_id=row["target_tab_id"],
+        status=row["status"],
+        last_run_at=row["last_run_at"],
+        next_run_at=row["next_run_at"],
+        last_run_status=row["last_run_status"],
+        last_summary=row["last_summary"],
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
+    )
+
+
+def _row_to_prompt_loop_run(row: sqlite3.Row) -> PromptLoopRun:
+    return PromptLoopRun(
+        id=row["id"],
+        loop_id=row["loop_id"],
+        started_at=row["started_at"],
+        finished_at=row["finished_at"],
+        status=row["status"],
+        exit_code=row["exit_code"],
+        output_path=row["output_path"],
+        summary=row["summary"],
+        target_mission_id=row["target_mission_id"],
+        target_tab_id=row["target_tab_id"],
     )
 
 

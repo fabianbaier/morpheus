@@ -30,7 +30,7 @@ def _format_note_line(n: db.Note, missions_by_tab: dict[str, db.Mission]) -> str
     ts = time.strftime("%H:%M", time.localtime(n.created_at))
     tab_short = (n.tab_id or "?").split("-")[0]
     goal = missions_by_tab.get(n.tab_id, db.Mission(tab_id="")).goal or "?"
-    kind_marker = {"note": "•", "claim": "⚑", "broadcast": "📡"}.get(n.kind, "•")
+    kind_marker = {"note": "•", "claim": "⚑", "broadcast": "📡", "loop": "↻"}.get(n.kind, "•")
     return f"- [{ts}] {kind_marker} **{tab_short}** ({goal}): {n.text}"
 
 

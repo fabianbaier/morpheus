@@ -1,0 +1,302 @@
+"""Recurring prompt loops routed through the Morpheus mission graph.
+
+Morpheus stores loop intent and routing. A cron/launchd entry can call
+`morpheus loops run-due` every minute; this module decides which prompts are
+due, runs them, captures output, and publishes summaries back into ticker notes
+and mission graph events.
+"""
+
+from __future__ import annotations
+
+import re
+import shlex
+import subprocess
+import time
+from pathlib import Path
+from typing import Optional
+
+from morpheus import context as ctx_mod
+from morpheus import db, ledger
+
+DEFAULT_COMMAND = "codex exec"
+DEFAULT_TIMEOUT_SECONDS = 20 * 60
+MIN_INTERVAL_SECONDS = 60
+
+DURATION_RE = re.compile(
+    r"^\s*(?P<num>\d+(?:\.\d+)?)\s*"
+    r"(?P<unit>s|sec|secs|second|seconds|m|min|mins|minute|minutes|"
+    r"h|hr|hrs|hour|hours|d|day|days)?\s*$",
+    re.IGNORECASE,
+)
+CONCLUSION_RE = re.compile(
+    r"\b(answer|summary|bottom line|recommend|done|fixed|shipped|implemented|next step)\b",
+    re.IGNORECASE,
+)
+NOISE_PREFIXES = (
+    "searching the web",
+    "thinking",
+    "working",
+    "sources:",
+    "source:",
+    "use /skills to list",
+    "› use /skills to list",
+    "> use /skills to list",
+)
+
+
+def parse_interval(value: str) -> float:
+    """Parse human loop intervals like `15m`, `2h`, `daily`, or bare minutes."""
+    normalized = value.strip().lower()
+    aliases = {
+        "hourly": 3600,
+        "daily": 86400,
+        "weekly": 7 * 86400,
+    }
+    if normalized in aliases:
+        return float(aliases[normalized])
+
+    match = DURATION_RE.match(value)
+    if not match:
+        raise ValueError("interval must look like 15m, 2h, daily, or weekly")
+    amount = float(match.group("num"))
+    unit = (match.group("unit") or "m").lower()
+    multiplier = 60
+    if unit.startswith("s"):
+        multiplier = 1
+    elif unit.startswith("h"):
+        multiplier = 3600
+    elif unit.startswith("d"):
+        multiplier = 86400
+    seconds = amount * multiplier
+    if seconds < MIN_INTERVAL_SECONDS:
+        raise ValueError("loop interval must be at least 60 seconds")
+    return seconds
+
+
+def format_interval(seconds: float) -> str:
+    seconds_i = int(seconds)
+    if seconds_i % 86400 == 0:
+        days = seconds_i // 86400
+        return f"{days}d"
+    if seconds_i % 3600 == 0:
+        hours = seconds_i // 3600
+        return f"{hours}h"
+    if seconds_i % 60 == 0:
+        minutes = seconds_i // 60
+        return f"{minutes}m"
+    return f"{seconds_i}s"
+
+
+def format_due(ts: float, now: Optional[float] = None) -> str:
+    now_ts = now or time.time()
+    delta = int(ts - now_ts)
+    if delta <= 0:
+        return "due"
+    return f"in {format_interval(delta)}"
+
+
+def build_command(command: str, prompt: str) -> str:
+    """Build a shell command. `{prompt}` opt-in lets users place the prompt."""
+    command = command.strip() or DEFAULT_COMMAND
+    quoted = shlex.quote(prompt)
+    if "{prompt}" in command:
+        return command.replace("{prompt}", quoted)
+    return f"{command} {quoted}"
+
+
+def summarize_output(stdout: str, stderr: str = "", width: int = 160) -> str:
+    body = stdout.strip() or stderr.strip()
+    candidates: list[tuple[int, str]] = []
+    for index, raw in enumerate(body.splitlines()):
+        line = _clean_line(raw)
+        if not line or _is_noise(line):
+            continue
+        score = index
+        if CONCLUSION_RE.search(line):
+            score += 100
+        if line.endswith((".", "!", "?")):
+            score += 5
+        candidates.append((score, line))
+    if not candidates:
+        return "loop completed with no visible output" if stdout.strip() else "loop produced no output"
+    _score, line = max(candidates, key=lambda item: item[0])
+    line = _first_sentence(line)
+    return line if len(line) <= width else line[: width - 1] + "…"
+
+
+def run_due(
+    *,
+    limit: int = 5,
+    timeout: int = DEFAULT_TIMEOUT_SECONDS,
+    now: Optional[float] = None,
+    cwd: Optional[Path] = None,
+) -> list[db.PromptLoopRun]:
+    runs: list[db.PromptLoopRun] = []
+    for loop in db.due_loops(now=now, limit=limit):
+        runs.append(run_loop(loop, timeout=timeout, cwd=cwd))
+    return runs
+
+
+def run_loop(
+    loop: db.PromptLoop,
+    *,
+    timeout: int = DEFAULT_TIMEOUT_SECONDS,
+    cwd: Optional[Path] = None,
+) -> db.PromptLoopRun:
+    started = time.time()
+    command = build_command(loop.command, loop.prompt)
+    output_path = _output_path(loop.id, started)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    status = "success"
+    exit_code: Optional[int] = 0
+    try:
+        completed = subprocess.run(
+            command,
+            shell=True,
+            cwd=str(cwd) if cwd else None,
+            text=True,
+            capture_output=True,
+            timeout=timeout,
+            check=False,
+        )
+        exit_code = completed.returncode
+        stdout = completed.stdout or ""
+        stderr = completed.stderr or ""
+        if completed.returncode != 0:
+            status = "failed"
+        summary = summarize_output(stdout, stderr)
+        output = _format_output(command, stdout, stderr, completed.returncode)
+    except subprocess.TimeoutExpired as exc:
+        status = "timeout"
+        exit_code = None
+        stdout = _decode_timeout_value(exc.stdout)
+        stderr = _decode_timeout_value(exc.stderr)
+        summary = f"loop timed out after {timeout}s"
+        output = _format_output(command, stdout, stderr, None, timed_out=True)
+
+    output_path.write_text(output, encoding="utf-8")
+    finished = time.time()
+    run = db.record_loop_run(
+        loop.id,
+        started_at=started,
+        finished_at=finished,
+        status=status,
+        exit_code=exit_code,
+        output_path=str(output_path),
+        summary=summary,
+        target_mission_id=loop.target_mission_id,
+        target_tab_id=loop.target_tab_id,
+    )
+    db.update_loop_after_run(
+        loop.id,
+        last_run_at=finished,
+        next_run_at=finished + loop.interval_seconds,
+        last_run_status=status,
+        last_summary=summary,
+    )
+    publish_run(loop, run)
+    try:
+        ctx_mod.write_context_file()
+        ctx_mod.write_context_json()
+    except Exception:
+        pass
+    ledger.log_action(
+        "loop_run",
+        tab_id=loop.target_tab_id,
+        details={
+            "loop_id": loop.id,
+            "run_id": run.id,
+            "status": status,
+            "target_mission_id": loop.target_mission_id,
+        },
+    )
+    return run
+
+
+def publish_run(loop: db.PromptLoop, run: db.PromptLoopRun) -> None:
+    note = f"loop [{loop.name}] {run.summary}"
+    db.add_note(
+        text=note,
+        tab_id=loop.target_tab_id,
+        kind="loop",
+    )
+    if not loop.target_mission_id:
+        return
+    db.add_event(
+        loop.target_mission_id,
+        kind="loop_output",
+        actor="morpheus",
+        summary=note,
+        source_ref=run.output_path,
+        metadata={
+            "loop_id": loop.id,
+            "run_id": run.id,
+            "status": run.status,
+            "target_tab_id": loop.target_tab_id,
+        },
+    )
+    db.add_artifact(
+        loop.target_mission_id,
+        kind="loop-output",
+        path_or_url=run.output_path,
+        status=run.status,
+        summary=note,
+    )
+
+
+def _output_path(loop_id: int, ts: float) -> Path:
+    stamp = time.strftime("%Y%m%dT%H%M%S", time.localtime(ts))
+    return db.DB_DIR / "loops" / str(loop_id) / f"{stamp}.txt"
+
+
+def _format_output(
+    command: str,
+    stdout: str,
+    stderr: str,
+    exit_code: Optional[int],
+    timed_out: bool = False,
+) -> str:
+    status = "timeout" if timed_out else f"exit {exit_code}"
+    return (
+        f"$ {command}\n"
+        f"# {status}\n\n"
+        "## stdout\n"
+        f"{stdout.rstrip()}\n\n"
+        "## stderr\n"
+        f"{stderr.rstrip()}\n"
+    )
+
+
+def _decode_timeout_value(value: object) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode(errors="replace")
+    return str(value)
+
+
+def _clean_line(value: str) -> str:
+    return " ".join(value.strip().split())
+
+
+def _is_noise(line: str) -> bool:
+    lowered = line.lower()
+    if len(line) < 3:
+        return True
+    if any(lowered.startswith(prefix) for prefix in NOISE_PREFIXES):
+        return True
+    if lowered.startswith("searched "):
+        return True
+    if "http://" in lowered or "https://" in lowered:
+        return True
+    if set(line) <= {"-", "=", "_", " ", "─"}:
+        return True
+    return False
+
+
+def _first_sentence(value: str) -> str:
+    match = re.search(r"(?<=[.!?])\s+(?=[A-Z0-9\"'“])", value)
+    if not match:
+        return value
+    return value[: match.start()].strip()

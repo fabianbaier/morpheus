@@ -11,6 +11,7 @@ from typing import Optional
 
 import typer
 from rich.console import Console
+from rich.markup import escape
 from rich.markdown import Markdown
 from rich.table import Table
 
@@ -18,7 +19,7 @@ from morpheus import ask as ask_mod
 from morpheus import brief as brief_mod
 from morpheus import config as cfg_mod
 from morpheus import context as ctx_mod
-from morpheus import core, daemon as daemon_mod, db, iterm_client, ledger as ledger_mod, mission_graph as graph_mod, naming, notifier as notifier_mod, prd_runs, trigger as trigger_mod, __version__
+from morpheus import core, daemon as daemon_mod, db, iterm_client, ledger as ledger_mod, loops as loops_mod, mission_graph as graph_mod, naming, notifier as notifier_mod, prd_runs, trigger as trigger_mod, __version__
 
 app = typer.Typer(
     name="morpheus",
@@ -210,6 +211,169 @@ def run_find_prds(
     for i, candidate in enumerate(candidates, start=1):
         table.add_row(str(i), candidate.label)
     console.print(table)
+
+
+# ───────── prompt loops ─────────
+
+loops_app = typer.Typer(help="Configure recurring prompt loops.")
+app.add_typer(loops_app, name="loops")
+
+
+@loops_app.command("add")
+def loops_add(
+    name: str = typer.Argument(..., help="Short name for the loop."),
+    prompt: str = typer.Argument(..., help="Prompt to run on each loop tick."),
+    every: str = typer.Option("30m", "--every", "-e", help="Interval, e.g. 15m, 2h, daily."),
+    command: str = typer.Option(loops_mod.DEFAULT_COMMAND, "--cmd", "-c", help="Command prefix or template. Use {prompt} to place the prompt."),
+    target: Optional[str] = typer.Option(None, "--target", "-t", help="Mission/tab prefix to receive loop output."),
+):
+    """Create a recurring prompt loop. Use `morpheus loops run-due` from cron/launchd."""
+    try:
+        interval = loops_mod.parse_interval(every)
+    except ValueError as e:
+        console.print(f"[red]{e}[/red]")
+        raise typer.Exit(1)
+
+    target_mission_id = ""
+    target_tab_id: Optional[str] = None
+    if target:
+        resolved = graph_mod.resolve(target)
+        if resolved is None:
+            console.print(f"[red]no mission matching '{target}'[/red]")
+            raise typer.Exit(1)
+        target_mission_id = resolved.mission_id
+        target_tab_id = resolved.live[0].tab_id if resolved.live else None
+
+    loop = db.create_loop(
+        name=name,
+        prompt=prompt,
+        interval_seconds=interval,
+        command=command,
+        target_mission_id=target_mission_id,
+        target_tab_id=target_tab_id,
+    )
+    ledger_mod.log_action(
+        "loop_create",
+        tab_id=target_tab_id,
+        details={
+            "loop_id": loop.id,
+            "name": loop.name,
+            "interval_seconds": loop.interval_seconds,
+            "target_mission_id": target_mission_id,
+        },
+    )
+    if target_mission_id:
+        db.add_event(
+            target_mission_id,
+            kind="loop_created",
+            actor="morpheus",
+            summary=f"Loop created: {loop.name} every {loops_mod.format_interval(interval)}",
+            source_ref=f"loop:{loop.id}",
+            metadata={"loop_id": loop.id, "target_tab_id": target_tab_id},
+        )
+    console.print(f"[green]loop #{loop.id} created[/green] {loop.name}")
+    console.print(f"  every: [cyan]{loops_mod.format_interval(loop.interval_seconds)}[/cyan]")
+    console.print(f"  next:  {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(loop.next_run_at))}")
+    console.print(f"  cmd:   [dim]{loop.command}[/dim]")
+    if target_mission_id:
+        console.print(f"  target mission: [cyan]{target_mission_id}[/cyan]")
+    else:
+        console.print("  target: ticker/context only")
+
+
+@loops_app.command("list")
+def loops_list(
+    all_statuses: bool = typer.Option(False, "--all", "-a", help="Include paused loops."),
+):
+    """List configured prompt loops."""
+    rows = db.all_loops(include_paused=all_statuses)
+    if not rows:
+        console.print("[dim]no loops configured yet[/dim]")
+        return
+    table = Table(title=f"MORPHEUS LOOPS — {len(rows)}", header_style="bold green")
+    table.add_column("ID", style="cyan", no_wrap=True)
+    table.add_column("ST")
+    table.add_column("NAME")
+    table.add_column("EVERY", no_wrap=True)
+    table.add_column("NEXT", no_wrap=True)
+    table.add_column("TARGET")
+    table.add_column("LAST", overflow="fold")
+    for loop in rows:
+        target = loop.target_mission_id[:14] if loop.target_mission_id else "ticker"
+        last = loop.last_summary or "—"
+        table.add_row(
+            str(loop.id),
+            loop.status,
+            loop.name,
+            loops_mod.format_interval(loop.interval_seconds),
+            loops_mod.format_due(loop.next_run_at),
+            target,
+            last,
+        )
+    console.print(table)
+
+
+@loops_app.command("run-due")
+def loops_run_due(
+    limit: int = typer.Option(5, "--limit", "-n", help="Maximum due loops to run."),
+    timeout: int = typer.Option(loops_mod.DEFAULT_TIMEOUT_SECONDS, "--timeout", help="Seconds before one loop run times out."),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Show due loops without running them."),
+):
+    """Run due loops once. Put this command behind cron/launchd."""
+    due = db.due_loops(limit=limit)
+    if dry_run:
+        if not due:
+            console.print("[dim]no loops due[/dim]")
+            return
+        for loop in due:
+            console.print(f"#{loop.id} {loop.name} due now")
+        return
+    runs = loops_mod.run_due(limit=limit, timeout=timeout)
+    if not runs:
+        console.print("[dim]no loops due[/dim]")
+        return
+    for run in runs:
+        status_style = "green" if run.status == "success" else "red"
+        console.print(f"[{status_style}]{run.status}[/{status_style}] loop #{run.loop_id}: {run.summary}")
+        console.print(f"  output: {run.output_path}")
+
+
+@loops_app.command("run")
+def loops_run(
+    loop_id: int = typer.Argument(..., help="Loop id to run immediately."),
+    timeout: int = typer.Option(loops_mod.DEFAULT_TIMEOUT_SECONDS, "--timeout", help="Seconds before the loop run times out."),
+):
+    """Run one loop immediately, regardless of its next due time."""
+    loop = db.get_loop(loop_id)
+    if loop is None:
+        console.print(f"[red]no loop #{loop_id}[/red]")
+        raise typer.Exit(1)
+    run = loops_mod.run_loop(loop, timeout=timeout)
+    status_style = "green" if run.status == "success" else "red"
+    console.print(f"[{status_style}]{run.status}[/{status_style}] loop #{loop.id}: {run.summary}")
+    console.print(f"  output: {run.output_path}")
+
+
+@loops_app.command("pause")
+def loops_pause(loop_id: int = typer.Argument(..., help="Loop id to pause.")):
+    """Pause a prompt loop."""
+    loop = db.set_loop_status(loop_id, "paused")
+    if loop is None:
+        console.print(f"[red]no loop #{loop_id}[/red]")
+        raise typer.Exit(1)
+    ledger_mod.log_action("loop_pause", tab_id=loop.target_tab_id, details={"loop_id": loop.id})
+    console.print(f"[yellow]paused[/yellow] loop #{loop.id} {loop.name}")
+
+
+@loops_app.command("resume")
+def loops_resume(loop_id: int = typer.Argument(..., help="Loop id to resume.")):
+    """Resume a prompt loop."""
+    loop = db.set_loop_status(loop_id, "active")
+    if loop is None:
+        console.print(f"[red]no loop #{loop_id}[/red]")
+        raise typer.Exit(1)
+    ledger_mod.log_action("loop_resume", tab_id=loop.target_tab_id, details={"loop_id": loop.id})
+    console.print(f"[green]active[/green] loop #{loop.id} {loop.name}")
 
 
 # ───────── list ─────────
@@ -640,11 +804,12 @@ def graph_show(
         raise typer.Exit(1)
 
     mem = resolved.memory
-    console.print(f"[bold green]{mem.title or mem.mission_id}[/bold green]")
+    console.print(f"[bold green]{escape(mem.title or mem.mission_id)}[/bold green]")
     console.print(f"  mission:   [cyan]{mem.mission_id}[/cyan]")
     console.print(f"  short:     [cyan]{graph_mod.short_id(mem.mission_id)}[/cyan]")
-    console.print(f"  phase:     {mem.phase}")
-    console.print(f"  source:    {mem.source_kind} {mem.source_ref or ''}".rstrip())
+    console.print(f"  phase:     {escape(mem.phase)}")
+    source_line = f"  source:    {mem.source_kind} {mem.source_ref or ''}".rstrip()
+    console.print(source_line, markup=False)
     console.print(f"  confidence:{mem.confidence:.2f}")
     if resolved.live:
         live_bits = ", ".join(f"{m.tab_id.split('-')[0]}:{m.state}" for m in resolved.live)
@@ -664,7 +829,7 @@ def graph_show(
     ]
     for label, value in fields:
         if value:
-            console.print(f"\n[bold]{label}[/bold]\n{value}")
+            console.print(f"\n[bold]{label}[/bold]\n{escape(value)}")
 
     events = db.recent_events(mem.mission_id, limit=8)
     if events:
@@ -672,19 +837,25 @@ def graph_show(
         for e in events:
             when = time.strftime("%Y-%m-%d %H:%M", time.localtime(e.ts))
             source = f" [{e.source_ref}]" if e.source_ref else ""
-            console.print(f"  {when} {e.kind}/{e.actor}: {e.summary}{source}")
+            console.print(f"  {when} {e.kind}/{e.actor}: {e.summary}{source}", markup=False)
 
     artifacts = db.artifacts_for_mission(mem.mission_id, limit=8)
     if artifacts:
         console.print("\n[bold]artifacts[/bold]")
         for a in artifacts:
-            console.print(f"  {a.status} {a.kind}: {a.path_or_url} {a.summary}")
+            console.print(
+                f"  {a.status} {a.kind}: {a.path_or_url} {a.summary}",
+                markup=False,
+            )
 
     edges = db.edges_for_id(mem.mission_id, limit=8)
     if edges:
         console.print("\n[bold]edges[/bold]")
         for e in edges:
-            console.print(f"  {e.from_id} -[{e.relation}]-> {e.to_id} {e.reason}")
+            console.print(
+                f"  {e.from_id} -[{e.relation}]-> {e.to_id} {e.reason}",
+                markup=False,
+            )
 
 
 @graph_app.command("event")

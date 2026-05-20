@@ -81,7 +81,9 @@ completed-session headlines, and ready-response headlines roll in there.
 Ready/completed headlines summarize the latest assistant answer block instead
 of blindly using the last terminal line, so Codex prompt chrome and separator
 rules do not become ticker text. The ticker renders newest-first, with the
-freshest item at the top.
+freshest item at the top. Press `l` to create a recurring prompt loop; loop
+outputs appear as ticker items and, when targeted, as graph events/artifacts for
+the selected mission.
 
 Core commands:
 
@@ -96,6 +98,8 @@ morpheus graph status
 morpheus graph show <mission-or-tab-prefix>
 morpheus run find-prds .
 morpheus run start ./PRD.md --cmd "codex"
+morpheus loops add "market scan" "summarize tomorrow's market catalysts" --every 30m
+morpheus loops run-due
 ```
 
 Cross-session notes:
@@ -121,6 +125,7 @@ first or switch worktrees.
 ```mermaid
 flowchart TD
     I["iTerm tabs: codex / claude / shell"] --> W["morpheus watch loop"]
+    L["cron/launchd: morpheus loops run-due"] --> D
     W --> D["~/.morpheus/morpheus.db"]
     D --> C["Textual cockpit"]
     D --> X["context.md / context.json"]
@@ -143,6 +148,8 @@ Runtime pieces:
   health helpers.
 - `morpheus/prd_runs.py` finds PRDs/specs and creates coordinator-led parent
   missions for v0.8 PRD Runs.
+- `morpheus/loops.py` runs due prompt loops, captures output under
+  `~/.morpheus/loops/`, and publishes ticker notes plus graph artifacts.
 - `morpheus/context.py` writes `~/.morpheus/context.md` and `.json` so agents can
   see sibling sessions.
 - `morpheus/mcp_server.py` exposes Morpheus state to Claude Code / Codex via MCP.
@@ -160,6 +167,8 @@ storage:
 - `mission_artifacts` stores proof and outputs: snapshots, tests, builds, PRs,
   issues, docs, logs.
 - `mission_edges` links missions, topics, artifacts, files, PRs, and decisions.
+- `prompt_loops` and `prompt_loop_runs` store recurring prompts, due times,
+  captured output, ticker summaries, and target mission routing.
 
 Inspect it:
 
@@ -192,6 +201,23 @@ The coordinator is responsible for reading the PRD, proposing safe child-worker
 slices, and recording status in Morpheus events/artifacts. Automatic fan-out is
 intentionally not enabled yet.
 
+## Prompt Loops
+
+Loops are recurring prompts for periodic checks or status feeds. They are
+cron-friendly: Morpheus stores the interval and routing, and launchd/cron calls
+`morpheus loops run-due` often enough to execute due loops.
+
+```bash
+morpheus loops add "market scan" "summarize tomorrow's market catalysts" --every 30m
+morpheus loops add "repo pulse" "what changed in this repo since last run?" --every 2h --target <mission-or-tab-prefix>
+morpheus loops list
+morpheus loops run-due
+```
+
+From the cockpit, press `l` to create a loop. If a mission is selected, loop
+results route back to that mission as `loop_output` events and `loop-output`
+artifacts; otherwise they report to the ticker/context only.
+
 ## State Files
 
 Morpheus keeps local state under `~/.morpheus/`:
@@ -203,6 +229,7 @@ Morpheus keeps local state under `~/.morpheus/`:
 - `daemon.log` - launchd daemon log
 - `daemon.beacon` - heartbeat used by `morpheus daemon-status`
 - `snapshots/` - transcript snapshots
+- `loops/` - captured stdout/stderr from prompt loop runs
 
 ## Troubleshooting
 
@@ -229,7 +256,8 @@ make daemon
 
 ## Roadmap
 
-Current status: v0.8.0a3 has PRD Runs foundation plus newest-first ready tickers.
+Current status: v0.8.0a4 has PRD Runs foundation, newest-first ready tickers,
+and prompt loops foundation.
 
 Next implementation phases:
 
@@ -241,12 +269,13 @@ Next implementation phases:
 6. Robust self-tab exclusion. Done in `0.7.0a6`.
 7. Ready-response rabbit ticker headlines. Done in `0.8.0a2`.
 8. Newest-first rabbit ticker. Done in `0.8.0a3`.
-9. PRD Runs foundation. Done in `0.8.0a1`.
-10. Collapsible PRD run tree in the cockpit.
-11. Manual child-worker spawn under a PRD run.
-12. Edit mission flow for why/plan/next/provenance/proof fields.
-13. `b` brief-selected using mission graph plus transcript tail.
-14. Resume-fresh flow that snapshots, archives old attachment, and spawns a new
+9. Prompt loops foundation. Done in `0.8.0a4`.
+10. PRD Runs foundation. Done in `0.8.0a1`.
+11. Collapsible PRD run tree in the cockpit.
+12. Manual child-worker spawn under a PRD run.
+13. Edit mission flow for why/plan/next/provenance/proof fields.
+14. `b` brief-selected using mission graph plus transcript tail.
+15. Resume-fresh flow that snapshots, archives old attachment, and spawns a new
    session linked by a `spawned_from` edge.
 
 > "I can only show you the door. You're the one that has to walk through it."

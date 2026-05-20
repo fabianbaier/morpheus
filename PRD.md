@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| **Status** | v0.8.0a3 implemented (newest-first ticker); next: child-worker tree UI |
+| **Status** | v0.8.0a4 implemented (prompt loops foundation); next: child-worker tree UI |
 | **Author** | Fabian Baier |
 | **Last updated** | 2026-05-20 |
 | **Target platform** | macOS + iTerm2 |
@@ -322,6 +322,7 @@ attach.
 | `s` | Snapshot | Writes transcript + mission card to `~/.morpheus/snapshots/` |
 | `r` | Resume fresh | Spawns a new session seeded with the snapshot + mission card |
 | `/` | Note / claim | Posts a note or path/worktree claim |
+| `l` | Loop control | Creates a recurring prompt loop routed to ticker/context or the selected mission |
 | `p` | Prune | Archives stale/finished sessions after confirmation |
 | `d` | Dismiss / close | Closes selected live tab or archives an already-dead mission |
 | `g` | Go to alert | Cycles through current 🐇 alerts |
@@ -370,6 +371,7 @@ The CLI remains the scriptable surface for the same mission model:
 | `morpheus ledger costs/actions` | Inspect cost and action ledgers |
 | `morpheus run find-prds [root]` | List PRD/spec candidates in a worktree |
 | `morpheus run start <prd> [--cmd codex]` | Create a PRD parent mission, spawn one coordinator tab, and link it |
+| `morpheus loops add/list/run/run-due/pause/resume` | Configure recurring prompt loops and execute due loops from cron/launchd |
 | `morpheus mcp serve` | Expose Morpheus state to agent tools |
 | `morpheus doctor` | Diagnose iTerm2 + Python API connectivity |
 
@@ -399,7 +401,41 @@ Future v0.8 work:
 - Add a run status updater that writes mission events and keeps the status file
   aligned with the graph.
 
-### 6.6 Cross-session context
+### 6.6 Prompt Loops
+
+Prompt loops are recurring prompts that behave like small cron-fed sensors or
+workers. They are not always-on agents. Morpheus stores their schedule, target,
+run history, output artifacts, and ticker summaries; launchd/cron should call
+`morpheus loops run-due` to execute due loops.
+
+Required behavior:
+
+- `l` opens a cockpit loop form. The selected mission becomes the default target
+  when one exists; otherwise the loop reports to ticker/context only.
+- Each loop stores: name, prompt, interval, command, target mission/tab,
+  active/paused state, next run time, last run status, and last summary.
+- Due loop execution captures stdout/stderr into
+  `~/.morpheus/loops/<loop-id>/<timestamp>.txt`.
+- Every run emits a one-line ticker note (`kind=loop`). If targeted, it also
+  writes a `loop_output` mission event and attaches a `loop-output` artifact so
+  other sessions can consume it through context, graph inspection, or MCP.
+- Loop output is a pipe-like input to other sessions: it must be visible in
+  `context.md`/`context.json`, linked to the target mission, and summarized in
+  the rabbit ticker newest-first.
+- The dashboard must not synchronously execute due loops. Long-running Codex or
+  Claude calls belong in `morpheus loops run-due` invoked by launchd/cron or run
+  manually.
+- Minimum interval is 60 seconds to avoid accidental runaway spend.
+
+Future work:
+
+- Dedicated loop management screen for pause/resume/delete/edit.
+- Optional fan-out where a loop result can draft an instruction for a target
+  session, with user approval before sending text.
+- Background LLM summarization for long loop outputs, recorded with provenance
+  and cost ledger entries.
+
+### 6.7 Cross-session context
 
 Two files maintained by the tick loop:
 
@@ -504,6 +540,7 @@ mission graph memory, provenance, loop phase, and proof tracking.
 | `morpheus/core.py` | The tick loop and `_tick()` |
 | `morpheus/dashboard.py` | Textual cockpit with live session streams, Matrix texture, mission table, mission card, alerts, keybindings |
 | `morpheus/db.py` | SQLite schema, `Mission`, `MissionMemory`, `MissionEvent`, `MissionArtifact`, `MissionEdge`, `Note`, CRUD |
+| `morpheus/loops.py` | Prompt loop interval parsing, due-run execution, output capture, ticker/graph publication |
 | `morpheus/detect.py` | State classifier from pane buffer |
 | `morpheus/iterm_client.py` | Thin async wrapper over iterm2 Python API |
 | `morpheus/naming.py` | Tab-title formatting, goal inference |
@@ -572,7 +609,7 @@ mission graph memory, provenance, loop phase, and proof tracking.
 | `id` | INTEGER PK AUTO | |
 | `mission_id` | TEXT FK | |
 | `ts` | REAL | Unix timestamp |
-| `kind` | TEXT | state_change / decision / blocker / prompt / answer / check / summary / archive / resume |
+| `kind` | TEXT | state_change / decision / blocker / prompt / answer / check / summary / archive / resume / loop_output |
 | `actor` | TEXT | user / morpheus / codex / claude / shell / imported |
 | `summary` | TEXT | Short event summary |
 | `source_ref` | TEXT | Transcript span, snapshot path, command, or URL |
@@ -618,8 +655,37 @@ untrusted hints, not as durable truth.
 | `tab_id` | TEXT | Source tab, nullable |
 | `session_id` | TEXT | Source iTerm session, nullable |
 | `text` | TEXT | The note body |
-| `kind` | TEXT | note / claim / broadcast |
+| `kind` | TEXT | note / claim / broadcast / loop |
 | `created_at` | REAL | Unix timestamp |
+
+**`prompt_loops`**
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | INTEGER PK AUTO | |
+| `name` | TEXT | Human-readable loop label |
+| `prompt` | TEXT | Prompt passed to command |
+| `interval_seconds` | REAL | Stored interval; minimum 60s |
+| `command` | TEXT | Command prefix/template, e.g. `codex exec` or `claude -p {prompt}` |
+| `target_mission_id` | TEXT | Optional mission to receive events/artifacts |
+| `target_tab_id` | TEXT | Optional live tab to attach ticker context |
+| `status` | TEXT | active / paused |
+| `last_run_at`, `next_run_at` | REAL | Scheduler timestamps |
+| `last_run_status`, `last_summary` | TEXT | Last run outcome |
+| `created_at`, `updated_at` | REAL | Lifecycle |
+
+**`prompt_loop_runs`**
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | INTEGER PK AUTO | |
+| `loop_id` | INTEGER | Parent prompt loop |
+| `started_at`, `finished_at` | REAL | Run timestamps |
+| `status` | TEXT | success / failed / timeout |
+| `exit_code` | INTEGER | Process exit code when available |
+| `output_path` | TEXT | Captured stdout/stderr artifact |
+| `summary` | TEXT | Ticker headline |
+| `target_mission_id`, `target_tab_id` | TEXT | Routing snapshot |
 
 ### 7.4 Detection
 
@@ -692,6 +758,7 @@ This table is the source of truth for where the product stands right now.
 | Robust self-tab exclusion | Implemented in v0.7.0a6 | Dashboard passes its own tab/session IDs into the watcher; core also recognizes the Morpheus screen by buffer if iTerm leaves the title as `Python"` |
 | Ready-response rabbit ticker | Implemented in v0.8.0a2 | `working → idle` now emits a `ready [...]` headline by extracting the latest assistant answer block, skipping Codex chrome/separators/source URLs, and compressing it to one sentence |
 | Newest-first rabbit ticker | Implemented in v0.8.0a3 | Bottom alert strip redraws from the newest-first alert deque so fresh session headlines stay at the top instead of appending chronologically |
+| Prompt loops foundation | Implemented in v0.8.0a4 | `l` creates recurring prompt loops; `morpheus loops run-due` runs due prompts, captures output, publishes ticker notes, and routes graph events/artifacts to target missions |
 | PRD Runs foundation | Implemented in v0.8.0a1 | PRD finder, new-session PRD selector, parent mission creation, coordinator prompt/status files, `morpheus run start`, and coordinator graph edge shipped |
 | PRD run tree UI | Not implemented | Show parent PRD rows with collapsible coordinator/worker children in the mission table |
 | PRD child worker spawn | Not implemented | Manual worker spawn under selected parent with file/path ownership and proof requirements |

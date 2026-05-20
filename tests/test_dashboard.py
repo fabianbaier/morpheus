@@ -9,6 +9,8 @@ from textual.widgets import Input
 from morpheus import dashboard
 from morpheus.dashboard import (
     LiveBuffer,
+    LoopRequest,
+    LoopScreen,
     MissionCardWidget,
     MorpheusApp,
     NewSessionRequest,
@@ -331,6 +333,13 @@ class DashboardTest(unittest.IsolatedAsyncioTestCase):
                 await pilot.pause()
                 self.assertIsInstance(app.screen, NoteScreen)
 
+                await app.pop_screen()
+                await pilot.pause()
+
+                await app.push_screen(LoopScreen(target_label="ticker/context only"))
+                await pilot.pause()
+                self.assertIsInstance(app.screen, LoopScreen)
+
     async def test_new_session_key_opens_modal_without_worker_crash(self) -> None:
         app = DashboardHarness()
 
@@ -465,6 +474,47 @@ class DashboardTest(unittest.IsolatedAsyncioTestCase):
                 "kind": "note",
             },
         )
+
+    async def test_loop_key_opens_modal_and_records_loop(self) -> None:
+        app = DashboardHarness()
+        done = asyncio.Event()
+        captured = {}
+
+        def fake_create_loop(**kwargs):
+            captured["loop"] = kwargs
+            done.set()
+            return SimpleNamespace(id=7, name=kwargs["name"], interval_seconds=kwargs["interval_seconds"])
+
+        with isolated_dashboard_runtime(), patch.object(
+            dashboard.db, "create_loop", new=fake_create_loop
+        ), patch.object(
+            dashboard.ledger_mod, "log_action", new=lambda *args, **kwargs: 1
+        ), patch.object(
+            dashboard.ctx_mod, "write_context_file", new=lambda: None
+        ), patch.object(
+            dashboard.ctx_mod, "write_context_json", new=lambda: None
+        ):
+            async with app.run_test(size=(120, 40)) as pilot:
+                await pilot.press("l")
+                await pilot.pause()
+
+                screen = app.screen
+                self.assertIsInstance(screen, LoopScreen)
+                screen.dismiss(LoopRequest(
+                    name="market scan",
+                    prompt="summarize tomorrow's market catalysts",
+                    interval="15m",
+                    command="codex exec",
+                ))
+
+                await asyncio.wait_for(done.wait(), timeout=1)
+
+        self.assertEqual(captured["loop"]["name"], "market scan")
+        self.assertEqual(captured["loop"]["prompt"], "summarize tomorrow's market catalysts")
+        self.assertEqual(captured["loop"]["interval_seconds"], 15 * 60)
+        self.assertEqual(captured["loop"]["command"], "codex exec")
+        self.assertEqual(captured["loop"]["target_mission_id"], "")
+        self.assertIsNone(captured["loop"]["target_tab_id"])
 
 
 if __name__ == "__main__":
