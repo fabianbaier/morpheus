@@ -184,6 +184,7 @@ class Rain:
         self.rows = max(1, rows)
         self.columns: list[_Column] = []
         self._mission_xs: dict[str, int] = {}
+        self._mission_signature: tuple[tuple[str, str, str, float, float], ...] | None = None
         self._fill_decorative_columns()
 
     # ── geometry ───────────────────────────────────────────────────────────
@@ -201,6 +202,7 @@ class Rain:
             col._reset_ambient()
             col._reset_head(initial=True)
         self.columns = [col for col in self.columns if 0 <= col.x < self.cols]
+        self._mission_signature = None
         self._fill_decorative_columns()
 
     def _new_decorative_column(self, x: int) -> _Column:
@@ -227,6 +229,12 @@ class Rain:
             [m for m in missions if m.state != "unknown" or m.goal],
             key=lambda m: (state_order.get(m.state, 9), -m.updated_at),
         )
+        signature = tuple(
+            (m.tab_id, m.state, m.goal, m.updated_at, m.buffer_changed_at)
+            for m in sorted_m
+        )
+        if signature == self._mission_signature:
+            return
 
         # Reserve every-other column for missions so the rain has visual breathing room.
         spacing = max(2, self.cols // max(1, len(sorted_m) or 1))
@@ -235,6 +243,13 @@ class Rain:
         new_cols: list[_Column] = []
         used_xs: set[int] = set()
         new_mission_xs: dict[str, int] = {}
+        previous_mission_cols = {
+            tab_id: col
+            for tab_id, old_x in self._mission_xs.items()
+            for col in self.columns
+            if not col.decorative and col.x == old_x
+        }
+        decorative_by_x = {col.x: col for col in self.columns if col.decorative}
 
         for i, m in enumerate(sorted_m):
             x = (i * spacing) % self.cols
@@ -243,8 +258,7 @@ class Rain:
             used_xs.add(x)
             new_mission_xs[m.tab_id] = x
 
-            col = next((c for c in self.columns
-                        if not c.decorative and c.x == self._mission_xs.get(m.tab_id, -1)), None)
+            col = previous_mission_cols.get(m.tab_id)
             if col is None:
                 col = _Column(x=x, height=self.rows, state=m.state, goal=m.goal)
             else:
@@ -257,7 +271,7 @@ class Rain:
             if x in used_xs:
                 continue
             # Reuse existing decorative col if at same x.
-            deco = next((c for c in self.columns if c.decorative and c.x == x), None)
+            deco = decorative_by_x.get(x)
             if deco is None:
                 deco = self._new_decorative_column(x)
             new_cols.append(deco)
@@ -265,6 +279,7 @@ class Rain:
         new_cols.sort(key=lambda c: c.x)
         self.columns = new_cols
         self._mission_xs = new_mission_xs
+        self._mission_signature = signature
 
     # ── per-frame advance ──────────────────────────────────────────────────
 

@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| **Status** | v0.8.0a15 implemented (dense Matrix rain); next: 48-hour recall eval |
+| **Status** | v0.8.0a16 implemented (rain performance path); next: 48-hour recall eval |
 | **Author** | Fabian Baier |
 | **Last updated** | 2026-05-20 |
 | **Target platform** | macOS + iTerm2 |
@@ -768,6 +768,7 @@ This table is the source of truth for where the product stands right now.
 | Session-end rabbit ticker | Implemented in v0.7.0a4 | Finished sessions now emit bottom-strip completion headlines from the latest substantive terminal output and store a mission summary event when possible |
 | Matrix rain output shards | Implemented in v0.7.0a5 | Left panel is rain-first again: real terminal output is embedded as falling bright shards inside the Matrix rain instead of rendered as a static terminal tail |
 | Dense Matrix rain baseline | Implemented in v0.8.0a15 | Decorative columns seed into the visible viewport, refill on resize, move faster, and render dim ambient glyphs outside active tails so the left panel keeps an operator-screen rain texture even when output shards are sparse |
+| Rain performance path | Implemented in v0.8.0a16 | Animation uses cached mission rows instead of hitting SQLite every 120ms, updates live buffers without forcing a second render, and skips rain-column reconciliation when the mission signature has not changed |
 | Robust self-tab exclusion | Implemented in v0.7.0a6 | Dashboard passes its own tab/session IDs into the watcher; core also recognizes the Morpheus screen by buffer if iTerm leaves the title as `Python"` |
 | Ready-response rabbit ticker | Implemented in v0.8.0a2 | `working → idle` now emits a `ready [...]` headline by extracting the latest assistant answer block, skipping Codex chrome/separators/source URLs, and compressing it to one sentence |
 | Newest-first rabbit ticker | Implemented in v0.8.0a3 | Bottom alert strip redraws from the newest-first alert deque so fresh session headlines stay at the top instead of appending chronologically |

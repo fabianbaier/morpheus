@@ -301,12 +301,12 @@ make daemon
 
 ## Roadmap
 
-Current status: v0.8.0a15 has PRD Runs foundation, PRD tree/manual workers,
+Current status: v0.8.0a16 has PRD Runs foundation, PRD tree/manual workers,
 newest-first ready tickers, prompt loops foundation, nonblocking/Markdown PRD
 picker, edit mission flow, selected mission briefs, PRD parent cleanup, and an
 output-first mission card, plus a user PATH install target, resume-fresh, and
-MCP mission graph update tools, direct terminal broadcast, and dense
-always-alive Matrix rain.
+MCP mission graph update tools, direct terminal broadcast, dense always-alive
+Matrix rain, and a lighter rain animation path.
 
 Next implementation phases:
 
@@ -334,6 +334,7 @@ Next implementation phases:
 21. MCP mission graph update tools. Done in `0.8.0a13`.
 22. Direct terminal broadcast via iTerm. Done in `0.8.0a14`.
 23. Dense Matrix rain baseline. Done in `0.8.0a15`.
-24. 48-hour recall eval.
+24. Rain performance path. Done in `0.8.0a16`.
+25. 48-hour recall eval.
 
 > "I can only show you the door. You're the one that has to walk through it."

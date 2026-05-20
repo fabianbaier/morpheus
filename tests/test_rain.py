@@ -35,6 +35,25 @@ class RainTest(unittest.TestCase):
 
         self.assertGreater(_visible_ratio(matrix.render()), 0.12)
 
+    def test_repeated_same_missions_skip_reconciliation(self) -> None:
+        random.seed(12)
+        matrix = rain.Rain(cols=60, rows=20)
+        missions = [
+            db.Mission(
+                tab_id="9",
+                goal="build dense rain",
+                state="working",
+                updated_at=1,
+                buffer_changed_at=1,
+            )
+        ]
+
+        matrix.update_missions(missions)
+        columns = matrix.columns
+        matrix.update_missions(missions)
+
+        self.assertIs(matrix.columns, columns)
+
     def test_resize_fills_new_columns_immediately(self) -> None:
         random.seed(13)
         matrix = rain.Rain(cols=20, rows=10)

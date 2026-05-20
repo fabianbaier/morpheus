@@ -312,6 +312,18 @@ class DashboardTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Two debate clusters", rendered)
         self.assertNotIn("Searching the web", rendered)
 
+    def test_live_stream_update_buffers_can_skip_render(self) -> None:
+        stream = dashboard.LiveStreamWidget()
+
+        with (
+            patch.object(stream, "_sync_shards") as sync_shards,
+            patch.object(stream, "_render_live") as render_live,
+        ):
+            stream.update_buffers({}, None, render=False)
+
+        sync_shards.assert_called_once()
+        render_live.assert_not_called()
+
     async def test_finished_session_pushes_summary_ticker_and_event(self) -> None:
         app = DashboardHarness()
         captured = {}

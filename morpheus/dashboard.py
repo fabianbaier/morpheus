@@ -265,12 +265,19 @@ class LiveStreamWidget(Static):
             cols, rows = self._inner_size()
             self.rain = rain_mod.Rain(cols=cols, rows=rows)
 
-    def update_buffers(self, buffers: dict[str, LiveBuffer], selected_tab_id: Optional[str]) -> None:
+    def update_buffers(
+        self,
+        buffers: dict[str, LiveBuffer],
+        selected_tab_id: Optional[str],
+        *,
+        render: bool = True,
+    ) -> None:
         self.buffers = buffers
         self.selected_tab_id = selected_tab_id
         self._idle_placeholder_rendered = False
         self._sync_shards()
-        self._render_live()
+        if render:
+            self._render_live()
 
     def tick_rain(self, missions: list[db.Mission]) -> None:
         if self.rain is None:
@@ -2002,6 +2009,7 @@ class MorpheusApp(App):
         self.summary_alert_hashes: dict[str, str] = {}
         self.self_tab_id: Optional[str] = None
         self.self_session_id: Optional[str] = None
+        self.current_missions: list[db.Mission] = []
         self.log_handle = None
 
     # ── compose ────────────────────────────────────────────────────────────
@@ -2088,6 +2096,7 @@ class MorpheusApp(App):
                 ignored_session_ids={self.self_session_id} if self.self_session_id else set(),
             )
             missions = db.all_missions()
+            self.current_missions = missions
             self._scan_new_missions(missions)
             self._scan_new_notes()
         except Exception as e:
@@ -2110,13 +2119,13 @@ class MorpheusApp(App):
 
     def _do_rain_animate(self) -> None:
         try:
-            missions = db.all_missions()
-        except Exception:
-            return
-        try:
             rain_widget = self.query_one(RainWidget)
-            rain_widget.tick_rain(missions)
-            self._refresh_live_stream()
+            rain_widget.update_buffers(
+                self.live_buffers,
+                self._selected_tab_id(),
+                render=False,
+            )
+            rain_widget.tick_rain(self.current_missions)
         except Exception:
             pass
 
@@ -2126,6 +2135,7 @@ class MorpheusApp(App):
             prd_parents, prd_edges = self._prd_tree_context()
         except Exception:
             return
+        self.current_missions = missions
         # Expire old flashes.
         now = time.time()
         self.flashing = {k: v for k, v in self.flashing.items() if v[0] > now}
