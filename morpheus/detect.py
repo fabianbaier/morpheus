@@ -44,6 +44,23 @@ BLOCKED_PATTERNS: list[tuple[re.Pattern, str]] = [
     (re.compile(r"^\s*Password:\s*$", re.MULTILINE), "sudo: password prompt"),
 ]
 
+
+def _user_blocked_patterns() -> list[tuple[re.Pattern, str]]:
+    """Load extra_blocked_patterns from ~/.morpheus/config.toml."""
+    try:
+        from morpheus import config as cfg_mod
+        extras = cfg_mod.load()["detection"].get("extra_blocked_patterns", [])
+    except Exception:
+        return []
+    out: list[tuple[re.Pattern, str]] = []
+    for raw in extras:
+        try:
+            out.append((re.compile(raw, re.IGNORECASE | re.MULTILINE),
+                        f"user: {raw[:40]}"))
+        except re.error:
+            continue
+    return out
+
 # Patterns indicating session ended.
 FINISHED_PATTERNS: list[tuple[re.Pattern, str]] = [
     (re.compile(r"\[Process completed\]", re.IGNORECASE), "process completed"),
@@ -103,6 +120,10 @@ def detect(
     blocked = _match_first(BLOCKED_PATTERNS, tail)
     if blocked:
         return Detection("blocked", blocked, h, changed)
+    # User-defined patterns from config.
+    user_blocked = _match_first(_user_blocked_patterns(), tail)
+    if user_blocked:
+        return Detection("blocked", user_blocked, h, changed)
 
     # Explicit "finished" markers.
     finished = _match_first(FINISHED_PATTERNS, tail)

@@ -26,6 +26,7 @@ class TabInfo:
     window_id: str
     buffer: str
     current_name: str
+    cwd: str = ""    # iTerm shell-integration "path" variable, empty if unavailable
 
 
 async def _read_buffer(session: "iterm2.Session", max_lines: int = 200) -> str:
@@ -55,6 +56,10 @@ async def enumerate_tabs(connection: "iterm2.Connection") -> list[TabInfo]:
             if session is None:
                 continue
             buf = await _read_buffer(session)
+            try:
+                cwd = await session.async_get_variable("path") or ""
+            except Exception:
+                cwd = ""
             tabs.append(
                 TabInfo(
                     tab_id=tab.tab_id,
@@ -62,6 +67,7 @@ async def enumerate_tabs(connection: "iterm2.Connection") -> list[TabInfo]:
                     window_id=window.window_id,
                     buffer=buf,
                     current_name=session.name or "",
+                    cwd=cwd,
                 )
             )
     return tabs

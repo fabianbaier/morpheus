@@ -508,12 +508,18 @@ class MorpheusApp(App):
             await core._tick(
                 self.iterm_conn, self.log_handle,
                 on_state_change=self._on_state_change,
+                on_alert=self._on_alert,
             )
             missions = db.all_missions()
             self._scan_new_missions(missions)
             self._scan_new_notes()
         except Exception as e:
             self.log_handle.exception("tick error: %s", e)
+
+    async def _on_alert(self, kind: str, mission, text: str) -> None:
+        """v0.4 derived alerts (token guard, worktree collision)."""
+        alert_kind = "state" if kind.startswith("token") else "error"
+        self._push_alert(Alert(time.time(), alert_kind, text))
 
     def _do_rain_animate(self) -> None:
         try:

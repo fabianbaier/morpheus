@@ -7,12 +7,21 @@ import logging
 import time
 from pathlib import Path
 
+from morpheus import config as cfg_mod
 from morpheus import context as ctx_mod
 from morpheus import daemon as daemon_mod
 from morpheus import db, detect, iterm_client, naming
 
 LOG_DIR = Path.home() / ".morpheus"
 LOG_PATH = LOG_DIR / "morpheus.log"
+
+# In-memory per-process tracking (rebuilt on restart):
+#   _working_since[tab_id] = unix ts when this tab entered the 'working' state
+#   _token_warned[tab_id]  = highest threshold (in minutes) already alerted for
+#   _collisions_seen       = set of frozenset({tab_id, tab_id, ...}) already alerted
+_working_since: dict[str, float] = {}
+_token_warned: dict[str, int] = {}
+_collisions_seen: set[frozenset] = set()
 
 
 def setup_logging(verbose: bool = False) -> logging.Logger:
@@ -27,11 +36,20 @@ def setup_logging(verbose: bool = False) -> logging.Logger:
     return log
 
 
-async def _tick(connection, log: logging.Logger, on_state_change=None) -> int:
-    """One observation cycle. Returns count of tabs processed."""
+async def _tick(connection, log: logging.Logger,
+                on_state_change=None, on_alert=None) -> int:
+    """One observation cycle. Returns count of tabs processed.
+
+    `on_alert(kind, mission, text)` fires for v0.4 derived alerts (token guard,
+    worktree collision). Callers wire it to push to UI + system notifications.
+    """
     tabs = await iterm_client.enumerate_tabs(connection)
     seen_ids = []
     now = time.time()
+    cfg = cfg_mod.load()
+
+    # tab_id -> cwd  for worktree-collision detection at end of tick.
+    cwd_by_tab: dict[str, str] = {}
 
     for tab in tabs:
         seen_ids.append(tab.tab_id)
@@ -68,6 +86,11 @@ async def _tick(connection, log: logging.Logger, on_state_change=None) -> int:
             if cand and cand.lower() not in ("zsh", "bash", "sh", "fish"):
                 prev.goal = cand
 
+        # Worktree tracking from iTerm shell-integration `path` variable.
+        if tab.cwd:
+            prev.linked_worktree = tab.cwd
+            cwd_by_tab[tab.tab_id] = tab.cwd
+
         prev.state = new_state
         db.upsert(prev)
 
@@ -83,10 +106,23 @@ async def _tick(connection, log: logging.Logger, on_state_change=None) -> int:
         if prev_state != new_state and on_state_change is not None:
             await on_state_change(prev, prev_state, new_state)
 
+        # ── token-budget guard ────────────────────────────────────────────
+        if cfg["token_guard"].get("enabled", True) and on_alert is not None:
+            await _check_token_guard(prev, prev_state, new_state, cfg, on_alert, now)
+
+    # ── worktree-collision detection (per-tick) ───────────────────────────
+    if cfg["worktree"].get("warn_on_collision", True) and on_alert is not None:
+        await _check_worktree_collisions(cwd_by_tab, on_alert)
+
     # Drop missions for tabs that no longer exist.
     deleted = db.reconcile_missing(seen_ids)
     if deleted:
         log.info("reconciled: removed %d stale missions", deleted)
+        # Clean per-process tracking for vanished tabs.
+        for k in list(_working_since.keys()):
+            if k not in seen_ids:
+                _working_since.pop(k, None)
+                _token_warned.pop(k, None)
 
     # Refresh shared context snapshot so agents in other tabs can read it.
     try:
@@ -101,12 +137,70 @@ async def _tick(connection, log: logging.Logger, on_state_change=None) -> int:
     return len(tabs)
 
 
+async def _check_token_guard(mission: db.Mission, prev_state: str, new_state: str,
+                              cfg: dict, on_alert, now: float) -> None:
+    """Fire warn / snapshot alerts when a session has been working too long."""
+    warn_min = int(cfg["token_guard"].get("warn_minutes", 60))
+    snap_min = int(cfg["token_guard"].get("snapshot_minutes", 120))
+
+    if new_state == "working":
+        if mission.tab_id not in _working_since:
+            _working_since[mission.tab_id] = now
+        elapsed_min = (now - _working_since[mission.tab_id]) / 60.0
+        already_warned = _token_warned.get(mission.tab_id, 0)
+        if elapsed_min >= snap_min and already_warned < snap_min:
+            _token_warned[mission.tab_id] = snap_min
+            await on_alert(
+                "token_snapshot", mission,
+                f"[{mission.goal or mission.tab_id.split('-')[0]}] working "
+                f"{int(elapsed_min)}min straight — SNAPSHOT NOW: `morpheus snapshot {mission.tab_id.split('-')[0]}`",
+            )
+        elif elapsed_min >= warn_min and already_warned < warn_min:
+            _token_warned[mission.tab_id] = warn_min
+            await on_alert(
+                "token_warn", mission,
+                f"[{mission.goal or mission.tab_id.split('-')[0]}] working "
+                f"{int(elapsed_min)}min — consider snapshotting before token blowup",
+            )
+    elif prev_state == "working":
+        # Left the working state; reset tracking so a fresh working stretch starts clean.
+        _working_since.pop(mission.tab_id, None)
+        _token_warned.pop(mission.tab_id, None)
+
+
+async def _check_worktree_collisions(cwd_by_tab: dict[str, str], on_alert) -> None:
+    """Push a 🐇 alert when two LIVE tabs share the same cwd."""
+    by_cwd: dict[str, list[str]] = {}
+    for tab_id, cwd in cwd_by_tab.items():
+        if not cwd:
+            continue
+        by_cwd.setdefault(cwd, []).append(tab_id)
+    for cwd, tabs in by_cwd.items():
+        if len(tabs) < 2:
+            continue
+        key = frozenset(tabs)
+        if key in _collisions_seen:
+            continue
+        _collisions_seen.add(key)
+        # Look up goals for nicer message.
+        goals = []
+        for tab_id in tabs:
+            m = db.get(tab_id)
+            label = m.goal if (m and m.goal) else tab_id.split("-")[0]
+            goals.append(label)
+        await on_alert(
+            "worktree_collision", None,
+            f"COLLISION in {cwd}: {' & '.join(goals)} — resolve before pushing.",
+        )
+
+
 def watch_loop(
     poll_interval: float = 5.0,
     on_state_change=None,
     on_new_mission=None,
     on_closed_mission=None,
     on_new_note=None,
+    on_alert=None,
 ) -> None:
     """Headless watch loop. Synchronous wrapper around an asyncio event loop.
 
@@ -133,7 +227,9 @@ def watch_loop(
         nonlocal last_seen_tabs, last_note_id
         while True:
             try:
-                n = await _tick(connection, log, on_state_change=on_state_change)
+                n = await _tick(connection, log,
+                                 on_state_change=on_state_change,
+                                 on_alert=on_alert)
                 log.debug("tick: %d tabs", n)
 
                 # Detect new + closed missions for notification hooks.

@@ -61,16 +61,34 @@ def is_available() -> bool:
     return _find_bin() is not None
 
 
+def _config_silenced(kind: str) -> bool:
+    """Per-config silencing — combines in-memory SILENCED with config-file rules."""
+    if kind in SILENCED:
+        return True
+    try:
+        from morpheus import config as cfg_mod
+        cfg = cfg_mod.load()
+        if not cfg["notifications"].get("enabled", True):
+            return True
+        if kind in cfg["notifications"].get("silence_kinds", []):
+            return True
+        if cfg_mod.in_quiet_hours():
+            return True
+    except Exception:
+        pass
+    return False
+
+
 def notify(n: Notification, force: bool = False) -> bool:
     """Fire a notification. Returns True if it was actually sent.
 
     Skipped when:
     - terminal-notifier isn't installed
-    - the kind is in SILENCED
+    - the kind is in SILENCED or config silence_kinds
+    - in configured quiet hours
     - rate-limited (same kind fired < RATE_LIMIT_SECS ago)
-    - `force=False` and Morpheus dashboard is the foreground app
     """
-    if n.kind in SILENCED:
+    if not force and _config_silenced(n.kind):
         return False
     last = _LAST_FIRED_AT.get(n.kind, 0.0)
     now = time.time()

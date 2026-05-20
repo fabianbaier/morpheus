@@ -70,7 +70,7 @@ def watch(
     console.print(f"  beacon: {daemon_mod.BEACON_PATH}")
 
     if no_notify:
-        on_state = on_spawn = on_note = None
+        on_state = on_spawn = on_note = on_alert = None
     else:
         async def on_state(m: db.Mission, old: str, new: str):
             notifier_mod.notify_state(m.goal or "(untitled)", new, m.last_event)
@@ -83,12 +83,24 @@ def watch(
             goal = owner.goal if owner else "?"
             notifier_mod.notify_note(goal, n.text)
 
+        async def on_alert(kind: str, mission, text: str):
+            # Map v0.4 alerts to notifications.
+            from morpheus.notifier import Notification, notify
+            sound = "Glass" if kind == "token_snapshot" else None
+            notify(Notification(
+                title="🐇 morpheus",
+                message=text,
+                kind=kind,
+                sound=sound,
+            ))
+
     try:
         core.watch_loop(
             poll_interval=poll,
             on_state_change=on_state,
             on_new_mission=on_spawn,
             on_new_note=on_note,
+            on_alert=on_alert,
         )
     except KeyboardInterrupt:
         console.print("\n[bright_black]stopped.[/bright_black]")
