@@ -263,6 +263,7 @@ class LoopRequest:
 class LoopActionRequest:
     action: str
     loop_id: int
+    run_id: Optional[int] = None
     target_mission_id: str = ""
     target_tab_id: Optional[str] = None
     name: Optional[str] = None
@@ -1432,6 +1433,8 @@ def _closed_resume_prompt(memory: db.MissionMemory) -> str:
         parts.append(f"Next step: {memory.next_step}")
     if memory.blocked_on:
         parts.append(f"Blocked on: {memory.blocked_on}")
+    if memory.topic == "loop-run" and memory.source_ref:
+        parts.append(f"Loop run output file: {memory.source_ref}")
     parts.append(
         "First recover context from the resumed conversation and Morpheus mission graph, "
         "then check git status before making changes."
@@ -1455,6 +1458,45 @@ def _post_spawn_resume_text(memory: db.MissionMemory) -> str:
     if memory.agent_kind == "gemini":
         return iterm_client.text_with_enter(prompt)
     return ""
+
+
+def _loop_run_agent_command(command: str) -> str:
+    try:
+        parts = shlex.split(command or "")
+    except ValueError:
+        parts = (command or "").split()
+    for part in parts:
+        exe = Path(part).name.lower()
+        if exe == "codex":
+            return "codex"
+        if exe == "claude":
+            return "claude"
+        if exe == "gemini":
+            return "gemini"
+    return "codex"
+
+
+def _loop_run_agent_kind(command: str) -> str:
+    return Path(_loop_run_agent_command(command).split()[0]).name.lower()
+
+
+def _loop_run_join_prompt(loop: db.PromptLoop, run: db.PromptLoopRun) -> str:
+    mode = "Join this active Morpheus loop run." if run.status == "running" else "Resume this completed Morpheus loop run."
+    instructions = (
+        "The output file may still be growing; inspect it before acting and do not restart the scheduled loop."
+        if run.status == "running"
+        else "Read the captured output first, summarize what happened, then continue from the run's result."
+    )
+    return (
+        f"{mode}\n\n"
+        f"Loop: #{loop.id} {loop.name}\n"
+        f"Run: #{run.id} ({run.status})\n"
+        f"Original prompt:\n{loop.prompt}\n\n"
+        f"Captured output file: {run.output_path or 'pending'}\n"
+        f"Run summary: {run.summary or 'run started'}\n\n"
+        f"{instructions}\n"
+        "Keep Morpheus updated through concise status output and preserve unrelated local changes."
+    )
 
 
 def _resume_prompt(
@@ -2399,11 +2441,15 @@ class LoopManagerScreen(ModalScreen[Optional[LoopActionRequest]]):
         margin-bottom: 1;
     }
     #loops_table {
-        height: 10;
+        height: 7;
+        margin-bottom: 1;
+    }
+    #loop_runs_table {
+        height: 7;
         margin-bottom: 1;
     }
     #loop_detail {
-        height: 13;
+        height: 10;
         border: round yellow;
         padding: 0 1;
         color: ansi_bright_yellow;
@@ -2428,7 +2474,9 @@ class LoopManagerScreen(ModalScreen[Optional[LoopActionRequest]]):
         Binding("k", "cursor_up", "prev"),
         Binding("down", "cursor_down", "next", show=False),
         Binding("up", "cursor_up", "prev", show=False),
-        Binding("enter", "edit_selected", "edit"),
+        Binding("tab", "switch_focus", "switch"),
+        Binding("enter", "join_run", "join/resume", priority=True),
+        Binding("upper_j", "join_run", "join", priority=True),
         Binding("e", "edit_selected", "edit"),
         Binding("o", "open_output", "output"),
         Binding("r", "run_selected", "run now"),
@@ -2459,6 +2507,7 @@ class LoopManagerScreen(ModalScreen[Optional[LoopActionRequest]]):
         self.join_target_mission_id = join_target_mission_id
         self.join_target_tab_id = join_target_tab_id
         self.confirm_delete_id: Optional[int] = None
+        self.focus_table = "loops"
 
     def compose(self) -> ComposeResult:
         with Container(id="loop-dialog"):
@@ -2468,14 +2517,16 @@ class LoopManagerScreen(ModalScreen[Optional[LoopActionRequest]]):
                 classes="hint",
             )
             yield DataTable(id="loops_table")
+            yield DataTable(id="loop_runs_table")
             yield Static("", id="loop_detail")
             yield Static(
-                "Enter/e edit · o output · r run now · p pause/resume · t target selected mission · d delete · q/Esc close",
+                "tab loops/runs · enter/J join/resume run · e edit loop · o output · r run now · p pause · t target · d delete",
                 id="loop_actions",
             )
             with Horizontal():
                 yield Button("edit", variant="primary", id="loop_edit")
                 yield Button("output", variant="primary", id="loop_output")
+                yield Button("join/resume", variant="primary", id="loop_join_run")
                 yield Button("run now", variant="primary", id="loop_run")
                 yield Button("target", variant="primary", id="loop_join")
                 yield Button("pause/resume", id="loop_toggle")
@@ -2486,6 +2537,9 @@ class LoopManagerScreen(ModalScreen[Optional[LoopActionRequest]]):
         table = self.query_one("#loops_table", DataTable)
         table.cursor_type = "row"
         table.add_columns("ID", "ST", "NAME", "EVERY", "NEXT", "TARGET", "RUNS", "LAST")
+        runs_table = self.query_one("#loop_runs_table", DataTable)
+        runs_table.cursor_type = "row"
+        runs_table.add_columns("RUN", "ST", "START", "SESSION", "SUMMARY")
         selected_row = 0
         for idx, loop in enumerate(self.loops):
             if loop.id == self.selected_loop_id:
@@ -2502,11 +2556,18 @@ class LoopManagerScreen(ModalScreen[Optional[LoopActionRequest]]):
             )
         if self.loops:
             table.cursor_coordinate = (selected_row, 0)
-        table.focus()
+        self._refresh_runs()
+        if self._runs_for_selected_loop():
+            self.focus_table = "runs"
+            runs_table.focus()
+        else:
+            table.focus()
         self._refresh_detail()
 
     def on_data_table_row_highlighted(self, event) -> None:
         self.confirm_delete_id = None
+        if getattr(event.data_table, "id", "") == "loops_table":
+            self._refresh_runs()
         self._refresh_detail()
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
@@ -2514,6 +2575,8 @@ class LoopManagerScreen(ModalScreen[Optional[LoopActionRequest]]):
             self.action_edit_selected()
         elif event.button.id == "loop_output":
             self.action_open_output()
+        elif event.button.id == "loop_join_run":
+            self.action_join_run()
         elif event.button.id == "loop_run":
             self.action_run_selected()
         elif event.button.id == "loop_join":
@@ -2526,15 +2589,26 @@ class LoopManagerScreen(ModalScreen[Optional[LoopActionRequest]]):
             self.action_close()
 
     def action_cursor_down(self) -> None:
-        table = self.query_one("#loops_table", DataTable)
+        table = self._focused_table()
         table.action_cursor_down()
         self.confirm_delete_id = None
         self._refresh_detail()
 
     def action_cursor_up(self) -> None:
-        table = self.query_one("#loops_table", DataTable)
+        table = self._focused_table()
         table.action_cursor_up()
         self.confirm_delete_id = None
+        self._refresh_detail()
+
+    def action_switch_focus(self) -> None:
+        loops_table = self.query_one("#loops_table", DataTable)
+        runs_table = self.query_one("#loop_runs_table", DataTable)
+        if self.focus_table == "loops" and self._runs_for_selected_loop():
+            self.focus_table = "runs"
+            runs_table.focus()
+        else:
+            self.focus_table = "loops"
+            loops_table.focus()
         self._refresh_detail()
 
     def action_toggle_selected(self) -> None:
@@ -2560,7 +2634,24 @@ class LoopManagerScreen(ModalScreen[Optional[LoopActionRequest]]):
         loop = self._selected_loop()
         if loop is None:
             return
-        self.dismiss(LoopActionRequest(action="output", loop_id=loop.id))
+        run = self._selected_run()
+        self.dismiss(LoopActionRequest(
+            action="output",
+            loop_id=loop.id,
+            run_id=run.id if run else None,
+        ))
+
+    def action_join_run(self) -> None:
+        loop = self._selected_loop()
+        if loop is None:
+            return
+        run = self._selected_run()
+        if run is None:
+            self.query_one("#loop_detail", Static).update(
+                "No loop run selected yet. Press r to start one, or wait for the loop runner."
+            )
+            return
+        self.dismiss(LoopActionRequest(action="join-run", loop_id=loop.id, run_id=run.id))
 
     def action_join_selected(self) -> None:
         loop = self._selected_loop()
@@ -2613,6 +2704,43 @@ class LoopManagerScreen(ModalScreen[Optional[LoopActionRequest]]):
             return None
         return self.loops[row]
 
+    def _runs_for_selected_loop(self) -> list[db.PromptLoopRun]:
+        loop = self._selected_loop()
+        if loop is None:
+            return []
+        return self.runs_by_loop.get(loop.id, [])
+
+    def _selected_run(self) -> Optional[db.PromptLoopRun]:
+        runs = self._runs_for_selected_loop()
+        if not runs:
+            return None
+        table = self.query_one("#loop_runs_table", DataTable)
+        row = table.cursor_row or 0
+        if row < 0 or row >= len(runs):
+            return None
+        return runs[row]
+
+    def _focused_table(self) -> DataTable:
+        if self.focus_table == "runs" and self._runs_for_selected_loop():
+            return self.query_one("#loop_runs_table", DataTable)
+        self.focus_table = "loops"
+        return self.query_one("#loops_table", DataTable)
+
+    def _refresh_runs(self) -> None:
+        table = self.query_one("#loop_runs_table", DataTable)
+        table.clear()
+        for run in self._runs_for_selected_loop():
+            session = run.tab_id.split("-")[0] if run.tab_id else ("resumable" if run.mission_id else "capture")
+            table.add_row(
+                str(run.id),
+                run.status,
+                _format_dashboard_ts(run.started_at),
+                session,
+                run.summary or run.output_path or "no summary",
+            )
+        if self._runs_for_selected_loop():
+            table.cursor_coordinate = (0, 0)
+
     def _refresh_detail(self) -> None:
         loop = self._selected_loop()
         detail = (
@@ -2622,22 +2750,24 @@ class LoopManagerScreen(ModalScreen[Optional[LoopActionRequest]]):
         self.query_one("#loop_detail", Static).update(detail)
 
     def _detail(self, loop: db.PromptLoop, *, confirm_delete: bool = False) -> str:
+        run = self._selected_run()
         lines = [
             f"#{loop.id} {loop.name}",
             f"status {loop.status} · every {loops_mod.format_interval(loop.interval_seconds)} · next {loops_mod.format_due(loop.next_run_at)}",
             f"target {_loop_target_label(loop)} · command {loop.command}",
             f"prompt {loop.prompt}",
-            "keys Enter/e edit · o output · r run now · p pause/resume · t target/focus mission · d delete",
+            "keys tab loops/runs · enter/J join/resume selected run · e edit loop · o output · r run now",
         ]
         runs = self.runs_by_loop.get(loop.id, [])
         if runs:
             count = self.run_counts_by_loop.get(loop.id, len(runs))
-            lines.append(f"recent runs ({count} total, newest first):")
-            for run in runs[:4]:
+            lines.append(f"recent runs ({count} total, newest first) · select a run above")
+            if run is not None:
+                session = run.tab_id.split("-")[0] if run.tab_id else "no tab yet"
                 lines.append(
-                    f"  #{run.id} {_format_dashboard_ts(run.started_at)} {run.status} "
-                    f"{run.summary or run.output_path or 'no summary'}"
+                    f"selected run #{run.id} {run.status} · {session} · output {run.output_path or 'pending'}"
                 )
+                lines.append(f"summary {run.summary or 'run started'}")
         else:
             lines.append("recent runs: none yet")
             if loop.last_run_status == "running":
@@ -2690,9 +2820,10 @@ class LoopOutputScreen(ModalScreen[None]):
         Binding("r", "refresh_output", "refresh"),
     ]
 
-    def __init__(self, loop_id: int):
+    def __init__(self, loop_id: int, run_id: Optional[int] = None):
         super().__init__()
         self.loop_id = loop_id
+        self.run_id = run_id
 
     def compose(self) -> ComposeResult:
         with Container(id="loop-output-dialog"):
@@ -2718,14 +2849,16 @@ class LoopOutputScreen(ModalScreen[None]):
         if loop is None:
             log.write(f"loop #{self.loop_id} not found")
             return
-        runs = db.loop_runs(self.loop_id, limit=1)
-        if not runs:
+        run = db.get_loop_run(self.run_id) if self.run_id is not None else None
+        runs = [] if run is not None else db.loop_runs(self.loop_id, limit=1)
+        if run is None and runs:
+            run = runs[0]
+        if run is None:
             status = loop.last_run_status or "never run"
             log.write(f"#{loop.id} {loop.name} · {status}")
             log.write("No run output exists yet. Press r/run now or wait for the loop runner.")
             return
 
-        run = runs[0]
         finished = "running" if run.status == "running" else _format_dashboard_ts(run.finished_at)
         log.write(f"#{loop.id} {loop.name} · run #{run.id} · {run.status} · {finished}")
         log.write(f"output {run.output_path}")
@@ -4004,10 +4137,13 @@ class MorpheusApp(App):
             self._open_loop_editor(loop.id)
             return
         if result.action == "output":
-            self.push_screen(LoopOutputScreen(loop.id))
+            self.push_screen(LoopOutputScreen(loop.id, result.run_id))
             return
         if result.action == "run":
             self._start_loop_run(loop.id, reason="manual")
+            return
+        if result.action == "join-run":
+            asyncio.create_task(self._join_loop_run(loop.id, result.run_id))
             return
         if result.action == "focus-target":
             self._focus_loop_target(result)
@@ -4108,6 +4244,161 @@ class MorpheusApp(App):
             "error",
             "loop target mission is not visible in the current project/table",
         ))
+
+    async def _join_loop_run(self, loop_id: int, run_id: Optional[int]) -> None:
+        if self.iterm_conn is None:
+            self._push_alert(Alert(time.time(), "error", "cannot join loop run without iTerm connection"))
+            return
+        if run_id is None:
+            self._push_alert(Alert(time.time(), "error", "no loop run selected to join"))
+            return
+        loop = db.get_loop(loop_id)
+        run = db.get_loop_run(run_id)
+        if loop is None or run is None or run.loop_id != loop_id:
+            self._push_alert(Alert(time.time(), "error", f"loop run #{run_id} not found"))
+            return
+
+        if run.tab_id and await self._focus_tab_id(run.tab_id):
+            self._push_alert(Alert(time.time(), "summary", f"focused loop run #{run.id} tab"))
+            return
+
+        if run.mission_id:
+            memory = db.get_memory(run.mission_id)
+            if memory is not None and memory.archived_at is not None and memory.resume_command:
+                await self._resume_closed_mission(run.mission_id)
+                return
+
+        project_root = loop.project_root or (self.project.root_path if self.project else "")
+        cmd = _loop_run_agent_command(loop.command)
+        if project_root:
+            cmd = tenant_mod.command_in_project(cmd, project_root)
+        goal = f"loop {loop.name} run #{run.id}"
+        try:
+            info = await iterm_client.spawn_tab(self.iterm_conn, command=cmd, goal=goal)
+        except Exception as e:
+            self._push_alert(Alert(time.time(), "error", f"loop run join failed: {e}"))
+            return
+        if info is None:
+            self._push_alert(Alert(time.time(), "error", "loop run join failed — is iTerm focused?"))
+            return
+
+        prompt = _loop_run_join_prompt(loop, run)
+        try:
+            await asyncio.sleep(0.7)
+            await iterm_client.send_text_to_tabs(
+                self.iterm_conn,
+                [info.tab_id],
+                iterm_client.text_with_enter(prompt),
+            )
+        except Exception:
+            pass
+
+        now = time.time()
+        mission_id = run.mission_id or db.loop_run_mission_id(loop.id, run.id)
+        mission = db.Mission(
+            tab_id=info.tab_id,
+            session_id=info.session_id,
+            mission_id=mission_id,
+            tenant_id=loop.tenant_id,
+            project_root=loop.project_root,
+            goal=goal,
+            state="working",
+            cmd=cmd,
+            linked_worktree=project_root,
+            buffer_changed_at=now,
+            last_event_at=now,
+            created_at=now,
+        )
+        db.upsert(mission)
+        db.attach_loop_run_session(
+            run.id,
+            mission_id=mission.mission_id,
+            tab_id=info.tab_id,
+            session_id=info.session_id,
+        )
+        db.upsert_memory(db.MissionMemory(
+            mission_id=mission.mission_id,
+            tenant_id=loop.tenant_id,
+            project_root=loop.project_root,
+            title=goal,
+            current_plan=f"Continue from loop run #{run.id}.",
+            next_step=f"Read {run.output_path or 'the loop output'} and continue the loop investigation.",
+            last_summary=run.summary,
+            phase="working",
+            confidence=1.0,
+            source_kind="loop-run",
+            source_ref=run.output_path,
+            topic="loop-run",
+            agent_kind=_loop_run_agent_kind(loop.command),
+            resume_command=cmd,
+            resume_confidence="loop-run",
+            last_tab_id=info.tab_id,
+        ))
+        if loop.target_mission_id:
+            db.add_edge(
+                loop.target_mission_id,
+                mission.mission_id,
+                relation="loop-run",
+                reason=f"Loop {loop.id} run {run.id} joined in tab",
+            )
+            db.add_event(
+                loop.target_mission_id,
+                kind="loop_run_joined",
+                actor="morpheus",
+                summary=f"Loop run joined: {loop.name} #{run.id}",
+                source_ref=run.output_path,
+                metadata={"loop_id": loop.id, "run_id": run.id, "tab_id": info.tab_id},
+            )
+        db.add_event(
+            mission.mission_id,
+            kind="loop_run_joined",
+            actor="morpheus",
+            summary=f"Joined loop run #{run.id} from loop [{loop.name}]",
+            source_ref=run.output_path,
+            metadata={"loop_id": loop.id, "run_id": run.id, "status": run.status},
+        )
+        ledger_mod.log_action(
+            "loop_run_join",
+            tab_id=info.tab_id,
+            details={
+                "loop_id": loop.id,
+                "run_id": run.id,
+                "mission_id": mission.mission_id,
+                "status": run.status,
+            },
+        )
+        try:
+            ctx_mod.write_context_file()
+            ctx_mod.write_context_json()
+        except Exception:
+            pass
+        self._push_alert(Alert(
+            time.time(),
+            "spawn",
+            f"joined loop run #{run.id} → {info.tab_id.split('-')[0]}",
+        ))
+        self._refresh_table()
+
+    async def _focus_tab_id(self, tab_id: str) -> bool:
+        app = await iterm2.async_get_app(self.iterm_conn)
+        if app is None:
+            return False
+        for window in app.windows:
+            for tab in window.tabs:
+                if tab.tab_id == tab_id:
+                    try:
+                        await window.async_activate()
+                    except Exception:
+                        pass
+                    try:
+                        await tab.async_select()
+                    except Exception:
+                        try:
+                            await tab.async_activate()
+                        except Exception:
+                            pass
+                    return True
+        return False
 
     def _open_loop_editor(self, loop_id: int) -> None:
         loop = db.get_loop(loop_id)

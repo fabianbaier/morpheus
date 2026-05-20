@@ -552,13 +552,18 @@ Required behavior:
 Implemented cockpit controls:
 
 - `Shift+L` / `L` opens the loop manager for the current project, with recent
-  run history plus edit/output/run/pause/target/delete controls. If a `LOOP`
+  run history plus edit/join/output/run/pause/target/delete controls. If a `LOOP`
   row is already selected, the manager opens on that loop. Editing can change
   name, prompt, interval, and command without leaving the cockpit.
-- Pressing `o` in the loop manager opens the latest captured run output and
+- The loop manager has separate loop and run tables. Pressing `Tab` switches
+  between them; pressing `Enter` or `J` on a run joins/resumes that specific
+  run in an iTerm tab. Active captured runs open a companion session seeded with
+  the live output file; completed runs resume from the captured output and stable
+  loop-run mission id.
+- Pressing `o` in the loop manager opens the selected captured run output and
   refreshes while that run is still marked running. Runs insert a `running`
-  history row and output path as soon as they start, so background loop work is
-  inspectable before completion.
+  history row, stable mission id, and output path as soon as they start, so
+  background loop work is inspectable before completion.
 - Pressing `t` targets a loop to the mission selected before opening the loop
   manager. If no candidate mission was selected and the loop already has a
   target, `t` focuses that existing target mission instead of silently doing
@@ -918,7 +923,8 @@ This table is the source of truth for where the product stands right now.
 | Loop row inspect/edit UX | Implemented in v0.8.0a29 | Selecting a `LOOP` row renders a loop card with prompt/config/history; `Enter` opens the loop manager preselected to that loop, and `e` edits the loop instead of falling into mission-edit errors |
 | Immediate loop first run | Implemented in v0.8.0a30 | New loops are due at creation and the cockpit starts the first run in a background task; the loop manager also exposes `r`/run-now for existing loops while recurring execution remains cron/launchd-friendly |
 | Loop runner LaunchAgent | Implemented in v0.8.0a31 | `morpheus install-loop-runner` installs `com.morpheus.loop-runner`, a separate launchd job that wakes every interval to run due loops without blocking the watcher; status/log/beacon commands mirror the watcher daemon |
-| Loop run output inspection | Implemented in v0.8.0a32 | Loop runs now record a `running` history row and output file at start, stream command output to that file, and expose `o` in the loop manager to inspect/follow the latest output; `t` now targets/focuses missions instead of reading like a run join |
+| Loop run output inspection | Implemented in v0.8.0a32 | Loop runs now record a `running` history row and output file at start, stream command output to that file, and expose `o` in the loop manager to inspect/follow selected run output; `t` now targets/focuses missions instead of reading like a run join |
+| Loop run join/resume | Implemented in v0.8.0a33 | The loop manager now has selectable run rows; `Enter`/`J` joins or resumes the selected run in an iTerm tab, run rows keep stable `looprun_<loop>_<run>` mission ids plus attached tab/session ids, and `o` follows selected run output |
 | PRD Runs foundation | Implemented in v0.8.0a1 | PRD finder, new-session PRD selector, parent mission creation, coordinator prompt/status files, `morpheus run start`, and coordinator graph edge shipped |
 | PRD run tree UI | Partially implemented in v0.8.0a5 | Shows virtual PRD parent rows with coordinator/worker sessions rendered underneath them; collapse/expand remains future polish |
 | PRD child worker spawn | Implemented in v0.8.0a5 | `w` spawns a manual child worker under the selected PRD parent/coordinator/worker with scope and verification prompts |

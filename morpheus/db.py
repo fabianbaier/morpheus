@@ -227,6 +227,9 @@ class PromptLoopRun:
     exit_code: Optional[int]
     output_path: str
     summary: str
+    mission_id: str = ""
+    tab_id: Optional[str] = None
+    session_id: Optional[str] = None
     target_mission_id: str = ""
     target_tab_id: Optional[str] = None
 
@@ -387,6 +390,9 @@ CREATE TABLE IF NOT EXISTS prompt_loop_runs (
     exit_code         INTEGER,
     output_path       TEXT NOT NULL DEFAULT '',
     summary           TEXT NOT NULL DEFAULT '',
+    mission_id        TEXT NOT NULL DEFAULT '',
+    tab_id            TEXT,
+    session_id        TEXT,
     target_mission_id TEXT NOT NULL DEFAULT '',
     target_tab_id     TEXT
 );
@@ -427,13 +433,18 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
     _ensure_column(conn, "mission_memory", "closed_at", "REAL NOT NULL DEFAULT 0")
     _ensure_column(conn, "prompt_loops", "tenant_id", "TEXT NOT NULL DEFAULT ''")
     _ensure_column(conn, "prompt_loops", "project_root", "TEXT NOT NULL DEFAULT ''")
+    _ensure_column(conn, "prompt_loop_runs", "mission_id", "TEXT NOT NULL DEFAULT ''")
+    _ensure_column(conn, "prompt_loop_runs", "tab_id", "TEXT")
+    _ensure_column(conn, "prompt_loop_runs", "session_id", "TEXT")
     conn.execute("CREATE INDEX IF NOT EXISTS missions_mission_id_idx ON missions(mission_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS missions_tenant_idx ON missions(tenant_id, updated_at DESC)")
     conn.execute("CREATE INDEX IF NOT EXISTS missions_project_root_idx ON missions(project_root)")
     conn.execute("CREATE INDEX IF NOT EXISTS mission_memory_tenant_idx ON mission_memory(tenant_id, updated_at DESC)")
     conn.execute("CREATE INDEX IF NOT EXISTS mission_memory_project_root_idx ON mission_memory(project_root)")
     conn.execute("CREATE INDEX IF NOT EXISTS prompt_loops_tenant_idx ON prompt_loops(tenant_id, next_run_at)")
+    conn.execute("CREATE INDEX IF NOT EXISTS prompt_loop_runs_mission_idx ON prompt_loop_runs(mission_id)")
     _backfill_loop_project_columns(conn)
+    _backfill_loop_run_mission_ids(conn)
 
 
 def _ensure_column(conn: sqlite3.Connection, table: str, column: str, ddl: str) -> None:
@@ -471,6 +482,17 @@ def _backfill_loop_project_columns(conn: sqlite3.Connection) -> None:
                 """,
                 (tenant_id, project_root, now, row["id"]),
             )
+
+
+def _backfill_loop_run_mission_ids(conn: sqlite3.Connection) -> None:
+    rows = conn.execute(
+        "SELECT id, loop_id FROM prompt_loop_runs WHERE mission_id = ''"
+    ).fetchall()
+    for row in rows:
+        conn.execute(
+            "UPDATE prompt_loop_runs SET mission_id = ? WHERE id = ?",
+            (loop_run_mission_id(row["loop_id"], row["id"]), row["id"]),
+        )
 
 
 def _loop_project_from_target(
@@ -2027,7 +2049,13 @@ def record_loop_run(
                 target_tab_id,
             ),
         )
-        row = conn.execute("SELECT * FROM prompt_loop_runs WHERE id = ?", (cur.lastrowid,)).fetchone()
+        run_id = int(cur.lastrowid)
+        mission_id = loop_run_mission_id(loop_id, run_id)
+        conn.execute(
+            "UPDATE prompt_loop_runs SET mission_id = ? WHERE id = ?",
+            (mission_id, run_id),
+        )
+        row = conn.execute("SELECT * FROM prompt_loop_runs WHERE id = ?", (run_id,)).fetchone()
     return _row_to_prompt_loop_run(row)
 
 
@@ -2059,7 +2087,13 @@ def start_loop_run(
                 target_tab_id,
             ),
         )
-        row = conn.execute("SELECT * FROM prompt_loop_runs WHERE id = ?", (cur.lastrowid,)).fetchone()
+        run_id = int(cur.lastrowid)
+        mission_id = loop_run_mission_id(loop_id, run_id)
+        conn.execute(
+            "UPDATE prompt_loop_runs SET mission_id = ? WHERE id = ?",
+            (mission_id, run_id),
+        )
+        row = conn.execute("SELECT * FROM prompt_loop_runs WHERE id = ?", (run_id,)).fetchone()
     return _row_to_prompt_loop_run(row)
 
 
@@ -2085,6 +2119,38 @@ def finish_loop_run(
         )
         row = conn.execute("SELECT * FROM prompt_loop_runs WHERE id = ?", (run_id,)).fetchone()
     return _row_to_prompt_loop_run(row)
+
+
+def loop_run_mission_id(loop_id: int, run_id: int) -> str:
+    return f"looprun_{loop_id}_{run_id}"
+
+
+def get_loop_run(run_id: int) -> Optional[PromptLoopRun]:
+    with _connect() as conn:
+        row = conn.execute("SELECT * FROM prompt_loop_runs WHERE id = ?", (run_id,)).fetchone()
+    return _row_to_prompt_loop_run(row) if row else None
+
+
+def attach_loop_run_session(
+    run_id: int,
+    *,
+    mission_id: str,
+    tab_id: str,
+    session_id: str = "",
+) -> Optional[PromptLoopRun]:
+    with _connect() as conn:
+        conn.execute(
+            """
+            UPDATE prompt_loop_runs
+               SET mission_id = ?,
+                   tab_id = ?,
+                   session_id = ?
+             WHERE id = ?
+            """,
+            (mission_id, tab_id, session_id, run_id),
+        )
+        row = conn.execute("SELECT * FROM prompt_loop_runs WHERE id = ?", (run_id,)).fetchone()
+    return _row_to_prompt_loop_run(row) if row else None
 
 
 def loop_runs(loop_id: int, limit: int = 20) -> list[PromptLoopRun]:
@@ -2297,6 +2363,9 @@ def _row_to_prompt_loop_run(row: sqlite3.Row) -> PromptLoopRun:
         exit_code=row["exit_code"],
         output_path=row["output_path"],
         summary=row["summary"],
+        mission_id=row["mission_id"],
+        tab_id=row["tab_id"],
+        session_id=row["session_id"],
         target_mission_id=row["target_mission_id"],
         target_tab_id=row["target_tab_id"],
     )

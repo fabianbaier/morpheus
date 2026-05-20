@@ -159,6 +159,7 @@ class LoopsTest(unittest.TestCase):
             text = Path(run.output_path).read_text(encoding="utf-8")
             self.assertEqual(observed["running_status"], "running")
             self.assertTrue(observed["output_exists_during_run"])
+            self.assertEqual(run.mission_id, f"looprun_{loop.id}_{run.id}")
             self.assertEqual(run.status, "success")
             self.assertIn("Summary: streamed while running.", run.summary)
             self.assertIn("Summary: streamed while running.", text)
