@@ -29,6 +29,14 @@ class TabInfo:
     cwd: str = ""    # iTerm shell-integration "path" variable, empty if unavailable
 
 
+@dataclass
+class SendTextResult:
+    tab_id: str
+    session_id: str
+    ok: bool
+    error: str = ""
+
+
 async def _read_buffer(session: "iterm2.Session", max_lines: int = 200) -> str:
     """Read the trailing `max_lines` of the session's visible buffer."""
     try:
@@ -149,6 +157,60 @@ async def close_tab(connection: "iterm2.Connection", tab_id: str) -> bool:
                 except Exception:
                     return False
     return False
+
+
+async def send_text_to_tabs(
+    connection: "iterm2.Connection",
+    tab_ids: list[str],
+    text: str,
+) -> list[SendTextResult]:
+    """Send exact text to the current session of each selected tab."""
+    app = await iterm2.async_get_app(connection)
+    if app is None:
+        return [
+            SendTextResult(tab_id=tab_id, session_id="", ok=False, error="iTerm app not available")
+            for tab_id in tab_ids
+        ]
+
+    pending = dict.fromkeys(tab_ids)
+    results: dict[str, SendTextResult] = {}
+    for window in app.windows:
+        for tab in window.tabs:
+            if tab.tab_id not in pending or tab.tab_id in results:
+                continue
+            session = tab.current_session
+            if session is None:
+                results[tab.tab_id] = SendTextResult(
+                    tab_id=tab.tab_id,
+                    session_id="",
+                    ok=False,
+                    error="tab has no current session",
+                )
+                continue
+            try:
+                await session.async_send_text(text)
+                results[tab.tab_id] = SendTextResult(
+                    tab_id=tab.tab_id,
+                    session_id=session.session_id,
+                    ok=True,
+                )
+            except Exception as e:
+                results[tab.tab_id] = SendTextResult(
+                    tab_id=tab.tab_id,
+                    session_id=session.session_id,
+                    ok=False,
+                    error=str(e),
+                )
+
+    for tab_id in tab_ids:
+        if tab_id not in results:
+            results[tab_id] = SendTextResult(
+                tab_id=tab_id,
+                session_id="",
+                ok=False,
+                error="tab not found",
+            )
+    return [results[tab_id] for tab_id in tab_ids]
 
 
 def run(coro_factory: Callable[["iterm2.Connection"], Awaitable]):

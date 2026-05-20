@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| **Status** | v0.8.0a13 implemented (MCP mission tools); next: 48-hour recall eval |
+| **Status** | v0.8.0a14 implemented (direct terminal broadcast); next: 48-hour recall eval |
 | **Author** | Fabian Baier |
 | **Last updated** | 2026-05-20 |
 | **Target platform** | macOS + iTerm2 |
@@ -783,6 +783,7 @@ This table is the source of truth for where the product stands right now.
 | User PATH CLI install | Implemented in v0.8.0a11 | `make install-cli` installs a safe user shim and prints a PATH hint when `~/.local/bin` is not visible to the shell |
 | Resume fresh | Implemented in v0.8.0a12 | `r` snapshots the selected live tab, spawns a seeded replacement, links new -> old with `spawned_from`, and closes/archives the old tab after spawn |
 | MCP mission tools | Implemented in v0.8.0a13 | MCP exposes durable graph list/show/update, event/artifact, and mission-link tools; spawn/kill remain outside MCP |
+| Direct terminal broadcast | Implemented in v0.8.0a14 | `morpheus broadcast` uses the iTerm API to type a message into selected live sessions; `--submit` explicitly presses Enter |
 | 48-hour recall eval | Not implemented | Add fixture or dogfood checklist: stale mission → press `b` → know next action in <10s |
 
 ---
@@ -1287,6 +1288,7 @@ claim, defers.
 | `morpheus snapshot <tab_prefix> [--out FILE]` | Dump tab buffer + mission to markdown |
 | `morpheus context [-f md/json/short] [--refresh]` | Print the shared cross-session snapshot |
 | `morpheus note "<text>" [--tab ID] [--kind note/claim/broadcast]` | Post a cross-session note |
+| `morpheus broadcast "<text>" [--target ID] [--submit]` | Type a direct message into live iTerm sessions |
 | `morpheus notes [--limit 15] [--tab ID]` | List recent cross-session notes |
 | `morpheus brief [--out FILE] [--notify] [--no-llm] [--no-gh]` | Generate digest of current state via claude-p |
 | `morpheus ask "<query>" [--no-llm]` | Ask morpheus about its own state (claude-p answer) |

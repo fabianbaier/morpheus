@@ -120,6 +120,7 @@ morpheus run find-prds .
 morpheus run start ./PRD.md --cmd "codex"
 morpheus loops add "market scan" "summarize tomorrow's market catalysts" --every 30m
 morpheus loops run-due
+morpheus broadcast "please verify remote commits before finishing" --submit
 morpheus mcp serve
 ```
 
@@ -131,6 +132,12 @@ morpheus note "touching src/auth/*, hold off"
 morpheus note --kind claim "claiming PR #224 worktree"
 morpheus notes -n 20
 ```
+
+`morpheus note --kind broadcast` is passive: it writes the shared context that
+agents can read later. `morpheus broadcast "..."` is active: it types into live
+iTerm sessions. By default it stages the message without pressing Enter; add
+`--submit` to send it immediately, and `--target <tab-or-mission-prefix>` to
+limit delivery.
 
 Suggested `AGENTS.md` / `CLAUDE.md` snippet for repos you work on in parallel:
 
@@ -294,11 +301,11 @@ make daemon
 
 ## Roadmap
 
-Current status: v0.8.0a13 has PRD Runs foundation, PRD tree/manual workers,
+Current status: v0.8.0a14 has PRD Runs foundation, PRD tree/manual workers,
 newest-first ready tickers, prompt loops foundation, nonblocking/Markdown PRD
 picker, edit mission flow, selected mission briefs, PRD parent cleanup, and an
 output-first mission card, plus a user PATH install target, resume-fresh, and
-MCP mission graph update tools.
+MCP mission graph update tools and direct terminal broadcast.
 
 Next implementation phases:
 
@@ -324,6 +331,7 @@ Next implementation phases:
 20. Resume-fresh flow that snapshots, archives old attachment, and spawns a new
    session linked by a `spawned_from` edge. Done in `0.8.0a12`.
 21. MCP mission graph update tools. Done in `0.8.0a13`.
-22. 48-hour recall eval.
+22. Direct terminal broadcast via iTerm. Done in `0.8.0a14`.
+23. 48-hour recall eval.
 
 > "I can only show you the door. You're the one that has to walk through it."

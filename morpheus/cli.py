@@ -843,6 +843,57 @@ def _tab_id_for_session(session_id: str) -> Optional[str]:
     return None
 
 
+def _broadcast_payload(text: str, *, submit: bool, raw: bool = False) -> str:
+    body = text if raw else f"[morpheus broadcast] {text}"
+    return body + ("\n" if submit else "")
+
+
+def _resolve_broadcast_targets(
+    refs: Optional[list[str]],
+    *,
+    include_self: bool,
+    self_session_id: Optional[str] = None,
+) -> tuple[list[db.Mission], list[str]]:
+    live = db.all_missions()
+    self_session_id = self_session_id if self_session_id is not None else _current_iterm_session_id()
+    self_tab_id = _tab_id_for_session(self_session_id) if self_session_id else None
+    errors: list[str] = []
+    targets: list[db.Mission] = []
+    seen: set[str] = set()
+
+    def add(mission: db.Mission) -> None:
+        if not mission.tab_id or mission.tab_id in seen:
+            return
+        if not include_self and (
+            (self_tab_id and mission.tab_id == self_tab_id)
+            or (self_session_id and mission.session_id == self_session_id)
+        ):
+            return
+        seen.add(mission.tab_id)
+        targets.append(mission)
+
+    if refs:
+        for ref in refs:
+            ref = ref.strip()
+            matches = [
+                mission for mission in live
+                if mission.tab_id == ref
+                or mission.tab_id.startswith(ref)
+                or mission.mission_id == ref
+                or mission.mission_id.startswith(ref)
+            ]
+            if not matches:
+                errors.append(f"no live mission matching '{ref}'")
+                continue
+            for mission in matches:
+                add(mission)
+    else:
+        for mission in sorted(live, key=lambda m: (m.goal or "", m.tab_id)):
+            add(mission)
+
+    return targets, errors
+
+
 @app.command()
 def context(
     fmt: str = typer.Option("md", "--format", "-f", help="md | json | short"),
@@ -907,6 +958,103 @@ def note(
     marker = {"note": "•", "claim": "⚑", "broadcast": "📡"}.get(kind, "•")
     where = tab_id.split("-")[0] if tab_id else "unattached"
     console.print(f"[green]{marker} note #{nid}[/green] [dim]({where})[/dim]: {text}")
+
+
+@app.command()
+def broadcast(
+    text: str = typer.Argument(..., help="Message to type into target iTerm sessions."),
+    targets: Optional[list[str]] = typer.Option(
+        None,
+        "--target",
+        "-t",
+        help="Target live tab/mission id or prefix. Repeat for multiple. Default: all live Morpheus sessions except this one.",
+    ),
+    submit: bool = typer.Option(
+        False,
+        "--submit",
+        help="Append Enter so target agents receive the message immediately.",
+    ),
+    include_self: bool = typer.Option(
+        False,
+        "--include-self",
+        help="Also send to the iTerm session running this command.",
+    ),
+    raw: bool = typer.Option(
+        False,
+        "--raw",
+        help="Send text exactly as provided instead of adding the Morpheus prefix.",
+    ),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="Show target sessions without typing anything.",
+    ),
+    record_note: bool = typer.Option(
+        True,
+        "--note/--no-note",
+        help="Also record a passive broadcast note in Morpheus context.",
+    ),
+):
+    """Directly type a broadcast into live iTerm sessions.
+
+    By default this stages the message without pressing Enter. Add --submit
+    when you want target agents to receive it immediately.
+    """
+    selected, errors = _resolve_broadcast_targets(targets, include_self=include_self)
+    for error in errors:
+        console.print(f"[yellow]{error}[/yellow]")
+    if not selected:
+        console.print("[red]no target sessions found[/red]")
+        raise typer.Exit(1)
+
+    payload = _broadcast_payload(text, submit=submit, raw=raw)
+    table = Table(title="Direct broadcast targets", header_style="bold green")
+    table.add_column("tab", style="cyan")
+    table.add_column("state")
+    table.add_column("goal")
+    for mission in selected:
+        table.add_row(mission.tab_id.split("-")[0], mission.state or "unknown", mission.goal or "(untitled)")
+    console.print(table)
+
+    if dry_run:
+        console.print("[yellow]dry run:[/yellow] no text sent")
+        return
+
+    tab_ids = [mission.tab_id for mission in selected]
+
+    async def _do(connection):
+        return await iterm_client.send_text_to_tabs(connection, tab_ids, payload)
+
+    results = iterm_client.run(_do)
+    ok = [result for result in results if result.ok]
+    failed = [result for result in results if not result.ok]
+
+    for result in failed:
+        console.print(f"[red]failed[/red] {result.tab_id.split('-')[0]}: {result.error}")
+
+    if record_note and ok:
+        session_id = _current_iterm_session_id()
+        tab_id = _tab_id_for_session(session_id) if session_id else None
+        db.add_note(text=text, tab_id=tab_id, session_id=session_id, kind="broadcast")
+        ledger_mod.log_action(
+            "broadcast_direct",
+            tab_id=tab_id,
+            details={
+                "targets": [result.tab_id for result in ok],
+                "submit": submit,
+                "text": text[:160],
+            },
+        )
+        try:
+            ctx_mod.write_context_file()
+            ctx_mod.write_context_json()
+        except Exception:
+            pass
+
+    mode = "submitted" if submit else "staged"
+    console.print(f"[green]{mode} broadcast[/green] to {len(ok)}/{len(results)} session(s)")
+    if failed:
+        raise typer.Exit(1)
 
 
 @app.command()
