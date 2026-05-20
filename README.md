@@ -197,9 +197,8 @@ Current status: v0.6 runtime is shipped. v0.7 is the Mission Graph Cockpit.
 
 Next implementation phases:
 
-1. Stable mission IDs and graph storage. Done in the first v0.7 foundation
-   slice.
-2. Mission card panel in the cockpit.
+1. Stable mission IDs and graph storage. Done in `0.7.0a1`.
+2. Mission card panel in the cockpit. Done in `0.7.0a2`.
 3. Edit mission flow for why/plan/next/provenance/proof fields.
 4. `b` brief-selected using mission graph plus transcript tail.
 5. Resume-fresh flow that snapshots, archives old attachment, and spawns a new

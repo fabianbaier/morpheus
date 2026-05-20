@@ -207,6 +207,130 @@ class MissionsTable(DataTable):
         return self.row_tab_ids[self.cursor_row]
 
 
+# ── selected mission card ─────────────────────────────────────────────────
+
+class MissionCardWidget(Static):
+    """Right-side durable mission graph card for the selected session."""
+
+    def on_mount(self) -> None:
+        self.update(self._empty())
+
+    def update_card(self, mission: Optional[db.Mission]) -> None:
+        if mission is None:
+            self.update(self._empty())
+            return
+
+        memory = db.get_memory(mission.mission_id) if mission.mission_id else None
+        events = db.recent_events(mission.mission_id, limit=5) if mission.mission_id else []
+        artifacts = db.artifacts_for_mission(mission.mission_id, limit=5) if mission.mission_id else []
+        self.update(self._render_card(mission, memory, events, artifacts))
+
+    def _empty(self) -> Text:
+        text = Text()
+        text.append("MISSION CARD\n", style="bold bright_green")
+        text.append("select a session", style=COL_DIMMER)
+        return text
+
+    def _render_card(
+        self,
+        mission: db.Mission,
+        memory: Optional[db.MissionMemory],
+        events: list[db.MissionEvent],
+        artifacts: list[db.MissionArtifact],
+    ) -> Text:
+        text = Text()
+        title = (memory.title if memory else "") or mission.goal or "(untitled)"
+        text.append("MISSION CARD\n", style="bold bright_green")
+        text.append(f"{title}\n", style="bold white")
+        text.append("\n")
+
+        self._field(text, "mission", mission.mission_id or "unset", muted=not mission.mission_id)
+        self._field(text, "tab", (mission.tab_id or "?").split("-")[0])
+        self._field(text, "state", mission.state, style=STATE_TEXT_STYLE.get(mission.state, COL_BODY))
+        self._field(text, "phase", memory.phase if memory else "unset", muted=not (memory and memory.phase))
+        self._field(text, "cmd", mission.cmd or "unset", muted=not mission.cmd)
+        if mission.linked_worktree:
+            self._field(text, "worktree", mission.linked_worktree)
+        if mission.linked_pr:
+            self._field(text, "pr", f"#{mission.linked_pr}")
+
+        text.append("\n")
+        if memory is None:
+            text.append("graph memory: unset\n", style=COL_DIMMER)
+            return text
+
+        self._section_field(text, "why", memory.why)
+        self._section_field(text, "done", memory.done_definition)
+        self._section_field(text, "criteria", memory.acceptance_criteria)
+        self._section_field(text, "plan", memory.current_plan)
+        self._section_field(text, "next", memory.next_step)
+        self._section_field(text, "blocked", memory.blocked_on)
+        self._section_field(text, "decision", memory.last_decision)
+
+        text.append("\n")
+        self._field(text, "source", _join_nonempty(memory.source_kind, memory.source_ref))
+        self._field(text, "confidence", f"{memory.confidence:.2f}")
+        if memory.topic:
+            self._field(text, "topic", memory.topic)
+
+        text.append("\nEVENTS\n", style="bold bright_green")
+        if events:
+            for event in events:
+                when = time.strftime("%H:%M", time.localtime(event.ts))
+                text.append(f"{when} ", style=COL_DIMMER)
+                text.append(f"{event.kind}", style=COL_ACCENT)
+                text.append(f" {event.summary}\n", style=COL_BODY)
+        else:
+            text.append("unset\n", style=COL_DIMMER)
+
+        text.append("\nARTIFACTS\n", style="bold bright_green")
+        if artifacts:
+            for artifact in artifacts:
+                status_style = {
+                    "pass": "bright_green",
+                    "fail": "bright_red",
+                    "pending": "bright_yellow",
+                }.get(artifact.status, COL_DIMMER)
+                text.append(f"{artifact.status}", style=status_style)
+                text.append(f" {artifact.kind} ", style=COL_ACCENT)
+                text.append(f"{artifact.path_or_url}\n", style=COL_BODY)
+        else:
+            text.append("unset\n", style=COL_DIMMER)
+
+        return text
+
+    def _field(
+        self,
+        text: Text,
+        label: str,
+        value: str,
+        style: str = COL_BODY,
+        muted: bool = False,
+    ) -> None:
+        text.append(f"{label}: ", style="bold bright_green")
+        text.append(value or "unset", style=COL_DIMMER if muted or not value else style)
+        text.append("\n")
+
+    def _section_field(self, text: Text, label: str, value: str) -> None:
+        text.append(f"{label}: ", style="bold bright_green")
+        if value:
+            text.append(_single_line(value), style=COL_BODY)
+        else:
+            text.append("unset", style=COL_DIMMER)
+        text.append("\n")
+
+
+def _single_line(value: str, limit: int = 140) -> str:
+    cleaned = " ".join(value.split())
+    if len(cleaned) <= limit:
+        return cleaned
+    return cleaned[: limit - 1] + "…"
+
+
+def _join_nonempty(*parts: str) -> str:
+    return " ".join(part for part in parts if part).strip() or "unset"
+
+
 # ── modal: spawn new session ──────────────────────────────────────────────
 
 class NewSessionScreen(ModalScreen[Optional[tuple[str, str]]]):
@@ -388,15 +512,22 @@ class MorpheusApp(App):
         height: 1fr;
     }
     #rain-panel {
-        width: 40%;
+        width: 28%;
         border: round green;
         background: black;
         padding: 0 0;
     }
     #missions-panel {
-        width: 60%;
+        width: 42%;
         border: round green;
         background: black;
+    }
+    #mission-card-panel {
+        width: 30%;
+        border: round green;
+        background: black;
+        color: white;
+        padding: 0 1;
     }
     #alerts-panel {
         height: 14;
@@ -445,6 +576,7 @@ class MorpheusApp(App):
         with Horizontal(id="body"):
             yield RainWidget(id="rain-panel")
             yield MissionsTable(id="missions-panel")
+            yield MissionCardWidget(id="mission-card-panel")
         yield RichLog(id="alerts-panel", markup=False, wrap=False, highlight=False)
         yield Footer()
 
@@ -543,8 +675,28 @@ class MorpheusApp(App):
         try:
             table = self.query_one(MissionsTable)
             table.refresh_rows(missions, self.flashing)
+            self._refresh_mission_card(missions)
         except Exception:
             pass
+
+    def _refresh_mission_card(self, missions: Optional[list[db.Mission]] = None) -> None:
+        try:
+            table = self.query_one(MissionsTable)
+            card = self.query_one(MissionCardWidget)
+        except Exception:
+            return
+
+        tab_id = table.selected_tab_id()
+        if not tab_id:
+            card.update_card(None)
+            return
+
+        mission = None
+        if missions is not None:
+            mission = next((m for m in missions if m.tab_id == tab_id), None)
+        if mission is None:
+            mission = db.get(tab_id)
+        card.update_card(mission)
 
     # ── change detection / alerts ──────────────────────────────────────────
 
@@ -610,12 +762,14 @@ class MorpheusApp(App):
     def action_cursor_down(self) -> None:
         try:
             self.query_one(MissionsTable).action_cursor_down()
+            self._refresh_mission_card()
         except Exception:
             pass
 
     def action_cursor_up(self) -> None:
         try:
             self.query_one(MissionsTable).action_cursor_up()
+            self._refresh_mission_card()
         except Exception:
             pass
 

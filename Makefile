@@ -56,8 +56,9 @@ graph-status: bootstrap
 logs:
 	tail -f $(HOME)/.morpheus/daemon.log
 
-test:
-	$(PYTHON) -m compileall morpheus
+test: bootstrap
+	$(VENV_PY) -m compileall morpheus
+	$(VENV_PY) -m unittest discover
 	git diff --check
 
 clean:

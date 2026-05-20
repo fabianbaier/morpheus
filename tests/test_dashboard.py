@@ -7,7 +7,7 @@ from unittest.mock import patch
 from textual.widgets import Input
 
 from morpheus import dashboard
-from morpheus.dashboard import MorpheusApp, NewSessionScreen, NoteScreen
+from morpheus.dashboard import MissionCardWidget, MorpheusApp, NewSessionScreen, NoteScreen
 
 
 class DashboardHarness(MorpheusApp):
@@ -38,6 +38,56 @@ def isolated_dashboard_runtime():
 
 
 class DashboardTest(unittest.IsolatedAsyncioTestCase):
+    def test_mission_card_render_includes_graph_memory(self) -> None:
+        card = MissionCardWidget()
+        mission = dashboard.db.Mission(
+            tab_id="tab-123456",
+            mission_id="m_20260520000102_abcd1234",
+            goal="ship the graph card",
+            state="working",
+            cmd="codex",
+        )
+        memory = dashboard.db.MissionMemory(
+            mission_id=mission.mission_id,
+            title="Graph card",
+            why="recover stale agent intent",
+            done_definition="card shows durable context",
+            acceptance_criteria="- phase visible\n- next step visible",
+            current_plan="render selected mission",
+            next_step="wire edit flow",
+            blocked_on="",
+            phase="planning",
+            confidence=0.75,
+            source_kind="user",
+            source_ref="PRD.md",
+        )
+        event = dashboard.db.MissionEvent(
+            id=1,
+            mission_id=mission.mission_id,
+            ts=0,
+            kind="decision",
+            actor="user",
+            summary="build card before edit flow",
+        )
+        artifact = dashboard.db.MissionArtifact(
+            id=1,
+            mission_id=mission.mission_id,
+            kind="test",
+            path_or_url="tests/test_dashboard.py",
+            status="pass",
+            summary="dashboard test",
+            created_at=0,
+        )
+
+        rendered = card._render_card(mission, memory, [event], [artifact]).plain
+
+        self.assertIn("Graph card", rendered)
+        self.assertIn("phase: planning", rendered)
+        self.assertIn("why: recover stale agent intent", rendered)
+        self.assertIn("next: wire edit flow", rendered)
+        self.assertIn("decision build card before edit flow", rendered)
+        self.assertIn("pass test tests/test_dashboard.py", rendered)
+
     async def test_dashboard_and_modal_css_mounts(self) -> None:
         app = DashboardHarness()
 
