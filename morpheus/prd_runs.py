@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Optional
 
-from morpheus import db
+from morpheus import db, tenant as tenant_mod
 
 RUNS_DIR = Path.home() / ".morpheus" / "runs"
 
@@ -124,6 +124,7 @@ def create_prd_run(prd_path: Path | str, title: Optional[str] = None) -> PRDRun:
     now = time.time()
     parent_id = db.new_mission_id(now)
     run_title = title or title_from_prd(path)
+    project = tenant_mod.ensure_project_tenant(path)
     run_dir = RUNS_DIR / parent_id
     run_dir.mkdir(parents=True, exist_ok=True)
     status_path = run_dir / "status.md"
@@ -140,6 +141,8 @@ def create_prd_run(prd_path: Path | str, title: Optional[str] = None) -> PRDRun:
     db.upsert_memory(
         db.MissionMemory(
             mission_id=parent_id,
+            tenant_id=project.tenant_id,
+            project_root=project.root_path,
             title=run_title,
             why=f"Implement PRD run from {path.name}.",
             done_definition="PRD acceptance criteria are satisfied, verified, and recorded in Morpheus.",

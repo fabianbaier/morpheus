@@ -20,7 +20,7 @@ from morpheus import ask as ask_mod
 from morpheus import brief as brief_mod
 from morpheus import config as cfg_mod
 from morpheus import context as ctx_mod
-from morpheus import core, daemon as daemon_mod, db, iterm_client, ledger as ledger_mod, loops as loops_mod, mission_graph as graph_mod, naming, notifier as notifier_mod, prd_runs, trigger as trigger_mod, __version__
+from morpheus import core, daemon as daemon_mod, db, iterm_client, ledger as ledger_mod, loops as loops_mod, mission_graph as graph_mod, naming, notifier as notifier_mod, prd_runs, tenant as tenant_mod, trigger as trigger_mod, __version__
 
 app = typer.Typer(
     name="morpheus",
@@ -34,17 +34,22 @@ console = Console()
 # ───────── default entry: launch dashboard ─────────
 
 @app.callback(invoke_without_command=True)
-def _default(ctx: typer.Context):
+def _default(
+    ctx: typer.Context,
+    all_projects: bool = typer.Option(False, "--all", help="Show the global fleet instead of the cwd project."),
+):
     if ctx.invoked_subcommand is None:
         from morpheus import dashboard
-        dashboard.run()
+        dashboard.run(show_all=all_projects)
 
 
 @app.command()
-def dashboard():
+def dashboard(
+    all_projects: bool = typer.Option(False, "--all", help="Show the global fleet instead of the cwd project."),
+):
     """Launch the Matrix-rain dashboard (same as running `morpheus` with no args)."""
     from morpheus import dashboard as dash_mod
-    dash_mod.run()
+    dash_mod.run(show_all=all_projects)
 
 
 # ───────── version ─────────
@@ -122,9 +127,11 @@ def spawn(
     command: str = typer.Argument(..., help="Shell command to run in the new tab."),
 ):
     """Open a new iTerm tab, run COMMAND, register a mission card with GOAL."""
+    project = tenant_mod.ensure_project_tenant(Path.cwd())
+    launch_command = tenant_mod.command_in_project(command, project.root_path)
 
     async def _do(connection):
-        info = await iterm_client.spawn_tab(connection, command=command, goal=goal)
+        info = await iterm_client.spawn_tab(connection, command=launch_command, goal=goal)
         if info is None:
             console.print("[red]failed to spawn tab — is iTerm focused?[/red]")
             raise typer.Exit(1)
@@ -132,9 +139,12 @@ def spawn(
         m = db.Mission(
             tab_id=info.tab_id,
             session_id=info.session_id,
+            tenant_id=project.tenant_id,
+            project_root=project.root_path,
             goal=goal,
             state="working",
-            cmd=command,
+            cmd=launch_command,
+            linked_worktree=project.root_path,
             buffer_changed_at=now,
             last_event_at=now,
             created_at=now,
@@ -161,8 +171,12 @@ def run_start(
 ):
     """Create a PRD parent mission, spawn one coordinator tab, and link it."""
     run = prd_runs.create_prd_run(prd, title=title)
+    project = tenant_mod.ensure_project_tenant(run.prd_path)
     coordinator_goal = f"{run.title} coordinator"
-    coordinator_cmd = prd_runs.coordinator_command(command, run)
+    coordinator_cmd = tenant_mod.command_in_project(
+        prd_runs.coordinator_command(command, run),
+        project.root_path,
+    )
 
     async def _do(connection):
         info = await iterm_client.spawn_tab(
@@ -178,9 +192,12 @@ def run_start(
         mission = db.Mission(
             tab_id=info.tab_id,
             session_id=info.session_id,
+            tenant_id=project.tenant_id,
+            project_root=project.root_path,
             goal=coordinator_goal,
             state="working",
             cmd=coordinator_cmd,
+            linked_worktree=project.root_path,
             buffer_changed_at=now,
             last_event_at=now,
             created_at=now,
@@ -675,20 +692,25 @@ def _format_loop_duration(started_at: float, finished_at: float) -> str:
 @app.command("list")
 def list_cmd(
     stale_hours: float = typer.Option(4.0, "--stale", help="Hours of idle before flagged stale."),
+    all_projects: bool = typer.Option(False, "--all", help="Show every project instead of the cwd project."),
 ):
     """List every registered tab with state, goal, age, last event."""
+    tenant_mod.backfill_known_tenants()
+    project = None if all_projects else tenant_mod.ensure_project_tenant(Path.cwd())
 
     async def _do(connection):
         live_tabs = await iterm_client.enumerate_tabs(connection)
         live_ids = {t.tab_id for t in live_tabs}
 
-        rows = db.all_missions()
+        rows = db.all_missions(tenant_id=project.tenant_id if project else None)
         if not rows:
-            console.print("[dim]no missions registered yet — start `morpheus watch` or spawn a tab.[/dim]")
+            scope = "global" if project is None else project.name
+            console.print(f"[dim]no missions registered for {scope} — start `morpheus watch` or spawn a tab.[/dim]")
             return
 
+        title_scope = "global" if project is None else project.name
         table = Table(
-            title=f"MORPHEUS — {len(rows)} mission(s)",
+            title=f"MORPHEUS — {title_scope} — {len(rows)} mission(s)",
             header_style="bold green",
             show_lines=False,
             row_styles=["", "dim"],
@@ -696,9 +718,15 @@ def list_cmd(
         table.add_column("ID", style="green", no_wrap=True)
         table.add_column("ST")
         table.add_column("GOAL")
+        if project is None:
+            table.add_column("PROJECT")
         table.add_column("AGE", justify="right")
         table.add_column("LAST EVENT", overflow="fold")
         table.add_column("LIVE?", justify="center")
+        tenants = {
+            item.tenant_id: item.name or item.root_path
+            for item in db.all_project_tenants(include_archived=True)
+        }
 
         for m in rows:
             emoji = naming.STATE_EMOJI.get(m.state, "⚪")
@@ -710,7 +738,11 @@ def list_cmd(
             age_secs = naming.now_minus(m.buffer_changed_at)
             if age_secs >= stale_hours * 3600 and m.state in ("idle", "finished"):
                 stale_marker = " [yellow](stale)[/yellow]"
-            table.add_row(tab_short, emoji, goal_disp + stale_marker, age, m.last_event, live)
+            row = [tab_short, emoji, goal_disp + stale_marker]
+            if project is None:
+                row.append(tenants.get(m.tenant_id, m.project_root or "unknown"))
+            row.extend([age, m.last_event, live])
+            table.add_row(*row)
 
         console.print(table)
 
@@ -725,15 +757,17 @@ def prune(
                                            help="Hours of idle to consider stale."),
     yes: bool = typer.Option(False, "--yes", "-y",
                              help="Close all candidates without prompting."),
+    all_projects: bool = typer.Option(False, "--all", help="Prune every project instead of the cwd project."),
 ):
     """Close stale iTerm tabs (idle/finished, idle > --older-than)."""
+    project = None if all_projects else tenant_mod.ensure_project_tenant(Path.cwd())
 
     async def _do(connection):
         live = await iterm_client.enumerate_tabs(connection)
         live_by_id = {t.tab_id: t for t in live}
 
         candidates = []
-        for m in db.all_missions():
+        for m in db.all_missions(tenant_id=project.tenant_id if project else None):
             if m.tab_id not in live_by_id:
                 continue
             if m.state not in ("idle", "finished"):
@@ -909,6 +943,7 @@ def context(
     fmt: str = typer.Option("md", "--format", "-f", help="md | json | short"),
     refresh: bool = typer.Option(False, "--refresh", "-r",
                                   help="Force re-poll iTerm before printing (slower)."),
+    all_projects: bool = typer.Option(False, "--all", help="Show every project instead of the cwd project."),
 ):
     """Print the shared cross-session snapshot.
 
@@ -927,13 +962,16 @@ def context(
 
     self_session = _current_iterm_session_id()
     self_tab = _tab_id_for_session(self_session) if self_session else None
+    tenant_mod.backfill_known_tenants()
+    project = None if all_projects else tenant_mod.ensure_project_tenant(Path.cwd())
+    tenant_id = project.tenant_id if project else None
 
     if fmt == "json":
-        console.print_json(json.dumps(ctx_mod.build_json(self_tab, self_session)))
+        console.print_json(json.dumps(ctx_mod.build_json(self_tab, self_session, tenant_id=tenant_id)))
     elif fmt == "short":
-        console.print(ctx_mod.build_short(self_tab))
+        console.print(ctx_mod.build_short(self_tab, tenant_id=tenant_id))
     else:
-        md = ctx_mod.build_markdown(self_tab, self_session)
+        md = ctx_mod.build_markdown(self_tab, self_session, tenant_id=tenant_id)
         # Render with Rich's markdown for terminal display.
         console.print(Markdown(md))
 
@@ -1278,12 +1316,17 @@ app.add_typer(graph_app, name="graph")
 
 
 @graph_app.command("status")
-def graph_status():
+def graph_status(
+    all_projects: bool = typer.Option(False, "--all", help="Show every project instead of the cwd project."),
+):
     """Show mission graph table counts and basic health checks."""
-    health = graph_mod.graph_health()
+    tenant_mod.backfill_known_tenants()
+    project = None if all_projects else tenant_mod.ensure_project_tenant(Path.cwd())
+    health = graph_mod.graph_health(tenant_id=project.tenant_id if project else None)
     counts = health["counts"]
 
-    table = Table(title="MORPHEUS mission graph", header_style="bold green")
+    scope = "global" if project is None else project.name
+    table = Table(title=f"MORPHEUS mission graph — {scope}", header_style="bold green")
     table.add_column("table / check")
     table.add_column("count", justify="right", style="cyan")
     for key in (

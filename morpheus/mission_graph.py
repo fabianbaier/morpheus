@@ -62,10 +62,10 @@ def short_id(mission_id: str) -> str:
     return mission_id[:12]
 
 
-def graph_health() -> dict[str, object]:
+def graph_health(tenant_id: Optional[str] = None) -> dict[str, object]:
     """Return simple health facts for `morpheus graph status`."""
-    live = db.all_missions()
-    memories = db.all_memory(include_archived=True)
+    live = db.all_missions(tenant_id=tenant_id)
+    memories = db.all_memory(include_archived=True, tenant_id=tenant_id)
     memory_ids = {m.mission_id for m in memories}
     live_without_memory = [
         m for m in live
@@ -77,7 +77,7 @@ def graph_health() -> dict[str, object]:
         if not any(l.mission_id == m.mission_id for l in live)
     ]
     return {
-        "counts": db.graph_counts(),
+        "counts": db.graph_counts(tenant_id=tenant_id),
         "live_without_memory": live_without_memory,
         "active_without_live": active_without_live,
     }

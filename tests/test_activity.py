@@ -86,10 +86,10 @@ class ActivitySnapshotTest(unittest.TestCase):
             }
         }
 
-        with patch.object(ctx_mod.db, "all_missions", new=lambda: [mission]), patch.object(
-            ctx_mod.db, "recent_notes", new=lambda limit=15: []
+        with patch.object(ctx_mod.db, "all_missions", new=lambda tenant_id=None: [mission]), patch.object(
+            ctx_mod.db, "recent_notes", new=lambda limit=15, tenant_id=None: []
         ), patch.object(
-            ctx_mod.db, "all_memory", new=lambda include_archived=True: []
+            ctx_mod.db, "all_memory", new=lambda include_archived=True, tenant_id=None: []
         ), patch.object(
             ctx_mod.activity_mod, "activities_by_tab", new=lambda: cached
         ):

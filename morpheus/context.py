@@ -35,16 +35,20 @@ def _format_note_line(n: db.Note, missions_by_tab: dict[str, db.Mission]) -> str
     return f"- [{ts}] {kind_marker} **{tab_short}** ({goal}): {n.text}"
 
 
-def build_markdown(self_tab_id: Optional[str] = None, self_session_id: Optional[str] = None) -> str:
+def build_markdown(
+    self_tab_id: Optional[str] = None,
+    self_session_id: Optional[str] = None,
+    tenant_id: Optional[str] = None,
+) -> str:
     """Build the markdown snapshot. Marks `self_*` so the reader can tell which
     session is themselves vs others."""
-    missions = db.all_missions()
-    notes = db.recent_notes(limit=15)
+    missions = db.all_missions(tenant_id=tenant_id)
+    notes = db.recent_notes(limit=15, tenant_id=tenant_id)
     now = time.strftime("%Y-%m-%d %H:%M:%S")
     counts = _state_counts(missions)
     missions_by_tab = {m.tab_id: m for m in missions}
     memories_by_id = {
-        mem.mission_id: mem for mem in db.all_memory(include_archived=True)
+        mem.mission_id: mem for mem in db.all_memory(include_archived=True, tenant_id=tenant_id)
     }
     activity_by_tab = activity_mod.activities_by_tab()
 
@@ -115,11 +119,15 @@ def build_markdown(self_tab_id: Optional[str] = None, self_session_id: Optional[
     return "\n".join(lines) + "\n"
 
 
-def build_json(self_tab_id: Optional[str] = None, self_session_id: Optional[str] = None) -> dict:
-    missions = db.all_missions()
-    notes = db.recent_notes(limit=15)
+def build_json(
+    self_tab_id: Optional[str] = None,
+    self_session_id: Optional[str] = None,
+    tenant_id: Optional[str] = None,
+) -> dict:
+    missions = db.all_missions(tenant_id=tenant_id)
+    notes = db.recent_notes(limit=15, tenant_id=tenant_id)
     memories_by_id = {
-        mem.mission_id: mem for mem in db.all_memory(include_archived=True)
+        mem.mission_id: mem for mem in db.all_memory(include_archived=True, tenant_id=tenant_id)
     }
     activity_by_tab = activity_mod.activities_by_tab()
 
@@ -147,6 +155,8 @@ def build_json(self_tab_id: Optional[str] = None, self_session_id: Optional[str]
                 "linked_pr": m.linked_pr,
                 "linked_worktree": m.linked_worktree,
                 "activity": activity_by_tab.get(m.tab_id),
+                "tenant_id": m.tenant_id,
+                "project_root": m.project_root,
                 "memory": (
                     {
                         "title": memories_by_id[m.mission_id].title,
@@ -176,9 +186,12 @@ def build_json(self_tab_id: Optional[str] = None, self_session_id: Optional[str]
     }
 
 
-def build_short(self_tab_id: Optional[str] = None) -> str:
+def build_short(
+    self_tab_id: Optional[str] = None,
+    tenant_id: Optional[str] = None,
+) -> str:
     """One-line summary suitable for an agent prompt."""
-    missions = db.all_missions()
+    missions = db.all_missions(tenant_id=tenant_id)
     counts = _state_counts(missions)
     parts = [f"{len(missions)} sessions"]
     for emoji, key in [("🔴", "blocked"), ("🟢", "working"), ("🟡", "idle"), ("⚫", "finished")]:
