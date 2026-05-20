@@ -550,6 +550,29 @@ def uninstall_daemon():
         raise typer.Exit(1)
 
 
+mcp_app = typer.Typer(help="MCP server (Model Context Protocol) for Claude Code / Codex.")
+app.add_typer(mcp_app, name="mcp")
+
+
+@mcp_app.command("serve")
+def mcp_serve():
+    """Run morpheus's MCP stdio server. Wire into ~/.claude.json or .mcp.json.
+
+    Example MCP client config (drop into ~/.claude.json or a project .mcp.json):
+
+        {
+          "mcpServers": {
+            "morpheus": {
+              "command": "morpheus",
+              "args": ["mcp", "serve"]
+            }
+          }
+        }
+    """
+    from morpheus import mcp_server
+    mcp_server.serve()
+
+
 @app.command("daemon-status")
 def daemon_status():
     """Show launchd daemon status (loaded? PID? beacon age? log size?)."""
