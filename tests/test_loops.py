@@ -69,6 +69,58 @@ class LoopsTest(unittest.TestCase):
                 self.assertIsNotNone(refreshed)
                 self.assertGreater(refreshed.next_run_at, run.finished_at)
 
+    def test_loop_lifecycle_helpers_update_target_history_and_delete(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            with patch.object(db, "DB_DIR", tmp_path), patch.object(
+                db, "DB_PATH", tmp_path / "morpheus.db"
+            ):
+                loop = db.create_loop(
+                    name="news",
+                    prompt="summarize news",
+                    interval_seconds=300,
+                    command="printf ok",
+                    next_run_at=0,
+                )
+
+                edited = db.update_loop_details(
+                    loop.id,
+                    name="market news",
+                    interval_seconds=600,
+                )
+                self.assertIsNotNone(edited)
+                self.assertEqual(edited.name, "market news")
+                self.assertEqual(edited.interval_seconds, 600)
+                self.assertGreater(edited.next_run_at, loop.next_run_at)
+
+                joined = db.set_loop_target(
+                    loop.id,
+                    target_mission_id="m_target",
+                    target_tab_id="tab-target",
+                )
+                self.assertIsNotNone(joined)
+                self.assertEqual(joined.target_mission_id, "m_target")
+                self.assertEqual(joined.target_tab_id, "tab-target")
+
+                run = db.record_loop_run(
+                    loop.id,
+                    started_at=1,
+                    finished_at=3,
+                    status="success",
+                    exit_code=0,
+                    output_path="/tmp/out.txt",
+                    summary="done",
+                    target_mission_id="m_target",
+                    target_tab_id="tab-target",
+                )
+                self.assertEqual(db.loop_runs(loop.id), [run])
+
+                deleted = db.delete_loop(loop.id)
+                self.assertIsNotNone(deleted)
+                self.assertEqual(deleted.name, "market news")
+                self.assertIsNone(db.get_loop(loop.id))
+                self.assertEqual(db.loop_runs(loop.id), [])
+
 
 if __name__ == "__main__":
     unittest.main()

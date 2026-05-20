@@ -159,6 +159,14 @@ class LoopRequest:
 
 
 @dataclass
+class LoopActionRequest:
+    action: str
+    loop_id: int
+    target_mission_id: str = ""
+    target_tab_id: Optional[str] = None
+
+
+@dataclass
 class EditMissionRequest:
     tab_id: str
     mission_id: str
@@ -904,6 +912,21 @@ def _join_nonempty(*parts: str) -> str:
     return " ".join(part for part in parts if part).strip() or "unset"
 
 
+def _loop_target_label(loop: db.PromptLoop) -> str:
+    if not loop.target_mission_id:
+        return "ticker"
+    target = loop.target_mission_id[:14]
+    if loop.target_tab_id:
+        target += f"/{loop.target_tab_id.split('-')[0]}"
+    return target
+
+
+def _format_dashboard_ts(ts: float) -> str:
+    if not ts:
+        return "—"
+    return time.strftime("%m-%d %H:%M", time.localtime(ts))
+
+
 def _snapshot_markdown(
     mission: db.Mission,
     *,
@@ -1513,6 +1536,200 @@ class LoopScreen(ModalScreen[Optional[LoopRequest]]):
         self.dismiss(None)
 
 
+class LoopManagerScreen(ModalScreen[Optional[LoopActionRequest]]):
+    """Manage configured prompt loops without running long commands in the TUI."""
+
+    CSS = """
+    LoopManagerScreen { align: center middle; }
+    #loop-dialog {
+        width: 104;
+        height: 31;
+        border: round ansi_bright_yellow;
+        background: black;
+        padding: 1 2;
+    }
+    #loop-dialog Label.title {
+        color: ansi_bright_yellow;
+        text-style: bold;
+        margin-bottom: 1;
+    }
+    #loop-dialog Label.hint {
+        color: grey;
+        margin-bottom: 1;
+    }
+    #loops_table {
+        height: 10;
+        margin-bottom: 1;
+    }
+    #loop_detail {
+        height: 11;
+        border: round yellow;
+        padding: 0 1;
+        color: ansi_bright_yellow;
+        margin-bottom: 1;
+    }
+    Button { margin-right: 2; }
+    """
+
+    BINDINGS = [
+        Binding("escape", "close", "close"),
+        Binding("q", "close", "close"),
+        Binding("j", "cursor_down", "next"),
+        Binding("k", "cursor_up", "prev"),
+        Binding("down", "cursor_down", "next", show=False),
+        Binding("up", "cursor_up", "prev", show=False),
+        Binding("p", "toggle_selected", "pause/resume"),
+        Binding("t", "join_selected", "join"),
+        Binding("d", "delete_selected", "delete"),
+    ]
+
+    def __init__(
+        self,
+        *,
+        loops: list[db.PromptLoop],
+        runs_by_loop: dict[int, list[db.PromptLoopRun]],
+        join_target_label: str,
+        join_target_mission_id: str = "",
+        join_target_tab_id: Optional[str] = None,
+    ):
+        super().__init__()
+        self.loops = loops
+        self.runs_by_loop = runs_by_loop
+        self.join_target_label = join_target_label
+        self.join_target_mission_id = join_target_mission_id
+        self.join_target_tab_id = join_target_tab_id
+        self.confirm_delete_id: Optional[int] = None
+
+    def compose(self) -> ComposeResult:
+        with Container(id="loop-dialog"):
+            yield Label(f"{RABBIT}  LOOPS", classes="title")
+            yield Label(f"join target: {self.join_target_label}", classes="hint")
+            yield DataTable(id="loops_table")
+            yield Static("", id="loop_detail")
+            with Horizontal():
+                yield Button("join target", variant="primary", id="loop_join")
+                yield Button("pause/resume", id="loop_toggle")
+                yield Button("delete", variant="error", id="loop_delete")
+                yield Button("close", id="loop_close")
+
+    def on_mount(self) -> None:
+        table = self.query_one("#loops_table", DataTable)
+        table.cursor_type = "row"
+        table.add_columns("ID", "ST", "NAME", "EVERY", "NEXT", "TARGET", "LAST")
+        for loop in self.loops:
+            table.add_row(
+                str(loop.id),
+                loop.status,
+                loop.name,
+                loops_mod.format_interval(loop.interval_seconds),
+                loops_mod.format_due(loop.next_run_at),
+                _loop_target_label(loop),
+                loop.last_summary or "—",
+            )
+        table.focus()
+        self._refresh_detail()
+
+    def on_data_table_row_highlighted(self, event) -> None:
+        self.confirm_delete_id = None
+        self._refresh_detail()
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "loop_join":
+            self.action_join_selected()
+        elif event.button.id == "loop_toggle":
+            self.action_toggle_selected()
+        elif event.button.id == "loop_delete":
+            self.action_delete_selected()
+        else:
+            self.action_close()
+
+    def action_cursor_down(self) -> None:
+        table = self.query_one("#loops_table", DataTable)
+        table.action_cursor_down()
+        self.confirm_delete_id = None
+        self._refresh_detail()
+
+    def action_cursor_up(self) -> None:
+        table = self.query_one("#loops_table", DataTable)
+        table.action_cursor_up()
+        self.confirm_delete_id = None
+        self._refresh_detail()
+
+    def action_toggle_selected(self) -> None:
+        loop = self._selected_loop()
+        if loop is None:
+            return
+        action = "pause" if loop.status == "active" else "resume"
+        self.dismiss(LoopActionRequest(action=action, loop_id=loop.id))
+
+    def action_join_selected(self) -> None:
+        loop = self._selected_loop()
+        if loop is None:
+            return
+        if not self.join_target_mission_id:
+            self.query_one("#loop_detail", Static).update(
+                "Select a mission row before opening loops to join a loop to it."
+            )
+            return
+        self.dismiss(LoopActionRequest(
+            action="join",
+            loop_id=loop.id,
+            target_mission_id=self.join_target_mission_id,
+            target_tab_id=self.join_target_tab_id,
+        ))
+
+    def action_delete_selected(self) -> None:
+        loop = self._selected_loop()
+        if loop is None:
+            return
+        if self.confirm_delete_id != loop.id:
+            self.confirm_delete_id = loop.id
+            self.query_one("#loop_detail", Static).update(
+                self._detail(loop, confirm_delete=True)
+            )
+            return
+        self.dismiss(LoopActionRequest(action="delete", loop_id=loop.id))
+
+    def action_close(self) -> None:
+        self.dismiss(None)
+
+    def _selected_loop(self) -> Optional[db.PromptLoop]:
+        if not self.loops:
+            return None
+        table = self.query_one("#loops_table", DataTable)
+        row = table.cursor_row or 0
+        if row < 0 or row >= len(self.loops):
+            return None
+        return self.loops[row]
+
+    def _refresh_detail(self) -> None:
+        loop = self._selected_loop()
+        detail = "no loops configured yet" if loop is None else self._detail(loop)
+        self.query_one("#loop_detail", Static).update(detail)
+
+    def _detail(self, loop: db.PromptLoop, *, confirm_delete: bool = False) -> str:
+        lines = [
+            f"#{loop.id} {loop.name}",
+            f"status {loop.status} · every {loops_mod.format_interval(loop.interval_seconds)} · next {loops_mod.format_due(loop.next_run_at)}",
+            f"target {_loop_target_label(loop)} · command {loop.command}",
+            f"prompt {loop.prompt}",
+        ]
+        runs = self.runs_by_loop.get(loop.id, [])
+        if runs:
+            lines.append("recent runs:")
+            for run in runs[:4]:
+                lines.append(
+                    f"  #{run.id} {_format_dashboard_ts(run.started_at)} {run.status} "
+                    f"{run.summary or run.output_path or 'no summary'}"
+                )
+        else:
+            lines.append("recent runs: none")
+        if confirm_delete:
+            lines.append("")
+            lines.append("Press delete again to remove this loop. Output files remain on disk.")
+        return "\n".join(lines)
+
+
 class SelectedBriefScreen(ModalScreen[None]):
     """Read-only selected mission brief."""
 
@@ -1674,6 +1891,7 @@ FOOTER_BINDINGS = [
     Binding("s", "snapshot_session", "snapshot"),
     Binding("slash", "post_note", "note"),
     Binding("l", "new_loop", "loop"),
+    Binding("shift+l", "manage_loops", "loops"),
     Binding("w", "new_worker", "worker"),
     Binding("r", "resume_fresh", "resume"),
     Binding("ctrl+r", "refresh_now", "refresh", show=False),
@@ -2184,7 +2402,7 @@ class MorpheusApp(App):
         )
         self.push_screen(SelectedBriefScreen(BriefScreenContent(brief.title, brief.body)))
 
-    def action_new_loop(self) -> None:
+    def _loop_target_for_selection(self) -> tuple[str, str, Optional[str]]:
         target_tab_id = self._selected_tab_id()
         target_mission_id = ""
         target_label = "ticker/context only"
@@ -2203,13 +2421,32 @@ class MorpheusApp(App):
                 if memory is not None:
                     target_mission_id = memory.mission_id
                     target_label = memory.title or memory.mission_id
+        return target_label, target_mission_id, target_tab_id if target_mission_id else None
+
+    def action_new_loop(self) -> None:
+        target_label, target_mission_id, target_tab_id = self._loop_target_for_selection()
         self.push_screen(
             LoopScreen(
                 target_label=target_label,
                 target_mission_id=target_mission_id,
-                target_tab_id=target_tab_id if target_mission_id else None,
+                target_tab_id=target_tab_id,
             ),
             self._handle_loop_result,
+        )
+
+    def action_manage_loops(self) -> None:
+        target_label, target_mission_id, target_tab_id = self._loop_target_for_selection()
+        loops = db.all_loops(include_paused=True)
+        runs_by_loop = {loop.id: db.loop_runs(loop.id, limit=5) for loop in loops}
+        self.push_screen(
+            LoopManagerScreen(
+                loops=loops,
+                runs_by_loop=runs_by_loop,
+                join_target_label=target_label,
+                join_target_mission_id=target_mission_id,
+                join_target_tab_id=target_tab_id,
+            ),
+            self._handle_loop_action_result,
         )
 
     def action_toggle_card_details(self) -> None:
@@ -2300,6 +2537,86 @@ class MorpheusApp(App):
             "spawn",
             f"loop [{loop.name}] every {loops_mod.format_interval(loop.interval_seconds)}{target}",
         ))
+
+    def _handle_loop_action_result(self, result: Optional[LoopActionRequest]) -> None:
+        if result is None:
+            return
+        loop = db.get_loop(result.loop_id)
+        if loop is None:
+            self._push_alert(Alert(time.time(), "error", f"loop #{result.loop_id} not found"))
+            return
+
+        try:
+            if result.action in {"pause", "resume"}:
+                status = "paused" if result.action == "pause" else "active"
+                updated = db.set_loop_status(loop.id, status)
+                if updated is None:
+                    raise ValueError(f"loop #{loop.id} not found")
+                ledger_mod.log_action(
+                    f"loop_{result.action}",
+                    tab_id=updated.target_tab_id,
+                    details={"loop_id": updated.id, "target_mission_id": updated.target_mission_id},
+                )
+                if updated.target_mission_id:
+                    db.add_event(
+                        updated.target_mission_id,
+                        kind=f"loop_{result.action}d",
+                        actor="morpheus",
+                        summary=f"Loop {result.action}d: {updated.name}",
+                        source_ref=f"loop:{updated.id}",
+                        metadata={"loop_id": updated.id, "target_tab_id": updated.target_tab_id},
+                    )
+                message = f"{result.action}d loop [{updated.name}]"
+            elif result.action == "join":
+                updated = db.set_loop_target(
+                    loop.id,
+                    target_mission_id=result.target_mission_id,
+                    target_tab_id=result.target_tab_id,
+                )
+                if updated is None:
+                    raise ValueError(f"loop #{loop.id} not found")
+                ledger_mod.log_action(
+                    "loop_join",
+                    tab_id=updated.target_tab_id,
+                    details={"loop_id": updated.id, "target_mission_id": updated.target_mission_id},
+                )
+                db.add_event(
+                    updated.target_mission_id,
+                    kind="loop_joined",
+                    actor="morpheus",
+                    summary=f"Loop joined: {updated.name}",
+                    source_ref=f"loop:{updated.id}",
+                    metadata={"loop_id": updated.id, "target_tab_id": updated.target_tab_id},
+                )
+                message = f"joined loop [{updated.name}] → {_loop_target_label(updated)}"
+            elif result.action == "delete":
+                deleted = db.delete_loop(loop.id)
+                if deleted is None:
+                    raise ValueError(f"loop #{loop.id} not found")
+                ledger_mod.log_action(
+                    "loop_delete",
+                    tab_id=deleted.target_tab_id,
+                    details={"loop_id": deleted.id, "target_mission_id": deleted.target_mission_id},
+                )
+                if deleted.target_mission_id:
+                    db.add_event(
+                        deleted.target_mission_id,
+                        kind="loop_deleted",
+                        actor="morpheus",
+                        summary=f"Loop deleted: {deleted.name}",
+                        source_ref=f"loop:{deleted.id}",
+                        metadata={"loop_id": deleted.id, "target_tab_id": deleted.target_tab_id},
+                    )
+                message = f"deleted loop [{deleted.name}]"
+            else:
+                return
+            ctx_mod.write_context_file()
+            ctx_mod.write_context_json()
+        except Exception as e:
+            self._push_alert(Alert(time.time(), "error", f"loop action failed: {e}"))
+            return
+
+        self._push_alert(Alert(time.time(), "summary", message))
 
     async def _handle_worker_result(self, result: Optional[WorkerRequest]) -> None:
         if result is None:

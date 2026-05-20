@@ -935,6 +935,92 @@ def record_loop_run(
     return _row_to_prompt_loop_run(row)
 
 
+def loop_runs(loop_id: int, limit: int = 20) -> list[PromptLoopRun]:
+    with _connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT * FROM prompt_loop_runs
+             WHERE loop_id = ?
+             ORDER BY started_at DESC
+             LIMIT ?
+            """,
+            (loop_id, limit),
+        ).fetchall()
+    return [_row_to_prompt_loop_run(row) for row in rows]
+
+
+def update_loop_details(
+    loop_id: int,
+    *,
+    name: Optional[str] = None,
+    prompt: Optional[str] = None,
+    interval_seconds: Optional[float] = None,
+    command: Optional[str] = None,
+) -> Optional[PromptLoop]:
+    updates: list[str] = []
+    params: list[Any] = []
+    if name is not None:
+        updates.append("name = ?")
+        params.append(name)
+    if prompt is not None:
+        updates.append("prompt = ?")
+        params.append(prompt)
+    if interval_seconds is not None:
+        updates.append("interval_seconds = ?")
+        params.append(interval_seconds)
+        updates.append("next_run_at = ?")
+        params.append(time.time() + interval_seconds)
+    if command is not None:
+        updates.append("command = ?")
+        params.append(command)
+    if not updates:
+        return get_loop(loop_id)
+
+    updates.append("updated_at = ?")
+    params.append(time.time())
+    params.append(loop_id)
+    with _connect() as conn:
+        conn.execute(
+            f"UPDATE prompt_loops SET {', '.join(updates)} WHERE id = ?",
+            params,
+        )
+        row = conn.execute("SELECT * FROM prompt_loops WHERE id = ?", (loop_id,)).fetchone()
+    return _row_to_prompt_loop(row) if row else None
+
+
+def set_loop_target(
+    loop_id: int,
+    *,
+    target_mission_id: str = "",
+    target_tab_id: Optional[str] = None,
+) -> Optional[PromptLoop]:
+    now = time.time()
+    with _connect() as conn:
+        conn.execute(
+            """
+            UPDATE prompt_loops
+               SET target_mission_id = ?,
+                   target_tab_id = ?,
+                   updated_at = ?
+             WHERE id = ?
+            """,
+            (target_mission_id, target_tab_id, now, loop_id),
+        )
+        row = conn.execute("SELECT * FROM prompt_loops WHERE id = ?", (loop_id,)).fetchone()
+    return _row_to_prompt_loop(row) if row else None
+
+
+def delete_loop(loop_id: int) -> Optional[PromptLoop]:
+    with _connect() as conn:
+        row = conn.execute("SELECT * FROM prompt_loops WHERE id = ?", (loop_id,)).fetchone()
+        if row is None:
+            return None
+        loop = _row_to_prompt_loop(row)
+        conn.execute("DELETE FROM prompt_loop_runs WHERE loop_id = ?", (loop_id,))
+        conn.execute("DELETE FROM prompt_loops WHERE id = ?", (loop_id,))
+    return loop
+
+
 def _archive_mission(
     conn: sqlite3.Connection,
     mission_id: str,

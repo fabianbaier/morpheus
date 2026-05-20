@@ -13,6 +13,8 @@ from morpheus.dashboard import (
     BriefScreenContent,
     EditMissionScreen,
     LiveBuffer,
+    LoopActionRequest,
+    LoopManagerScreen,
     LoopRequest,
     LoopScreen,
     MissionCardWidget,
@@ -441,6 +443,26 @@ class DashboardTest(unittest.IsolatedAsyncioTestCase):
                 await app.push_screen(LoopScreen(target_label="ticker/context only"))
                 await pilot.pause()
                 self.assertIsInstance(app.screen, LoopScreen)
+
+                await app.pop_screen()
+                await pilot.pause()
+
+                await app.push_screen(LoopManagerScreen(
+                    loops=[
+                        dashboard.db.PromptLoop(
+                            id=1,
+                            name="news",
+                            prompt="summarize news",
+                            interval_seconds=300,
+                            command="printf ok",
+                            next_run_at=0,
+                        )
+                    ],
+                    runs_by_loop={},
+                    join_target_label="ticker/context only",
+                ))
+                await pilot.pause()
+                self.assertIsInstance(app.screen, LoopManagerScreen)
 
                 await app.pop_screen()
                 await pilot.pause()
@@ -1148,6 +1170,107 @@ class DashboardTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(captured["loop"]["command"], "codex exec")
         self.assertEqual(captured["loop"]["target_mission_id"], "")
         self.assertIsNone(captured["loop"]["target_tab_id"])
+
+    async def test_manage_loops_action_opens_manager_with_history(self) -> None:
+        app = DashboardHarness()
+        loop = dashboard.db.PromptLoop(
+            id=7,
+            name="market scan",
+            prompt="summarize catalysts",
+            interval_seconds=900,
+            command="codex exec",
+            target_mission_id="m_20260520000102_abcd1234",
+            target_tab_id="tab-123456",
+            last_summary="WMT disciplined zone",
+            next_run_at=0,
+        )
+        run = dashboard.db.PromptLoopRun(
+            id=3,
+            loop_id=loop.id,
+            started_at=1,
+            finished_at=2,
+            status="success",
+            exit_code=0,
+            output_path="/tmp/loop.txt",
+            summary="WMT disciplined zone",
+            target_mission_id=loop.target_mission_id,
+            target_tab_id=loop.target_tab_id,
+        )
+
+        with isolated_dashboard_runtime(), patch.object(
+            dashboard.db, "all_loops", new=lambda include_paused=True: [loop]
+        ), patch.object(
+            dashboard.db, "loop_runs", new=lambda loop_id, limit=5: [run]
+        ):
+            async with app.run_test(size=(120, 40)) as pilot:
+                app.action_manage_loops()
+                await pilot.pause()
+
+                self.assertIsInstance(app.screen, LoopManagerScreen)
+                detail = app.screen._detail(loop)
+                self.assertIn("market scan", str(detail))
+                self.assertIn("WMT disciplined zone", str(detail))
+
+    async def test_loop_manager_join_action_updates_target_and_records_event(self) -> None:
+        app = DashboardHarness()
+        captured = {}
+        loop = dashboard.db.PromptLoop(
+            id=7,
+            name="market scan",
+            prompt="summarize catalysts",
+            interval_seconds=900,
+            command="codex exec",
+        )
+        updated = dashboard.db.PromptLoop(
+            id=7,
+            name="market scan",
+            prompt="summarize catalysts",
+            interval_seconds=900,
+            command="codex exec",
+            target_mission_id="m_target",
+            target_tab_id="tab-target",
+        )
+
+        def fake_set_loop_target(loop_id, *, target_mission_id="", target_tab_id=None):
+            captured["target"] = (loop_id, target_mission_id, target_tab_id)
+            return updated
+
+        def fake_add_event(mission_id, kind, summary, actor="user", source_ref="", metadata=None):
+            captured["event"] = {
+                "mission_id": mission_id,
+                "kind": kind,
+                "summary": summary,
+                "actor": actor,
+                "source_ref": source_ref,
+                "metadata": metadata,
+            }
+            return 1
+
+        with patch.object(
+            dashboard.db, "get_loop", new=lambda loop_id: loop if loop_id == loop.id else None
+        ), patch.object(
+            dashboard.db, "set_loop_target", new=fake_set_loop_target
+        ), patch.object(
+            dashboard.db, "add_event", new=fake_add_event
+        ), patch.object(
+            dashboard.ledger_mod, "log_action", new=lambda action, tab_id, details: captured.setdefault("ledger", (action, tab_id, details))
+        ), patch.object(
+            dashboard.ctx_mod, "write_context_file", new=lambda: None
+        ), patch.object(
+            dashboard.ctx_mod, "write_context_json", new=lambda: None
+        ):
+            app._handle_loop_action_result(LoopActionRequest(
+                action="join",
+                loop_id=loop.id,
+                target_mission_id="m_target",
+                target_tab_id="tab-target",
+            ))
+
+        self.assertEqual(captured["target"], (7, "m_target", "tab-target"))
+        self.assertEqual(captured["event"]["kind"], "loop_joined")
+        self.assertEqual(captured["event"]["actor"], "morpheus")
+        self.assertEqual(captured["ledger"][0], "loop_join")
+        self.assertIn("joined loop", app.alerts[0].text)
 
     async def test_space_toggles_mission_card_details(self) -> None:
         app = DashboardHarness()

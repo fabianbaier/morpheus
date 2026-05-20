@@ -322,9 +322,10 @@ def loops_list(
     table.add_column("EVERY", no_wrap=True)
     table.add_column("NEXT", no_wrap=True)
     table.add_column("TARGET")
+    table.add_column("RUNS", justify="right", no_wrap=True)
     table.add_column("LAST", overflow="fold")
     for loop in rows:
-        target = loop.target_mission_id[:14] if loop.target_mission_id else "ticker"
+        run_count = len(db.loop_runs(loop.id, limit=1000))
         last = loop.last_summary or "—"
         table.add_row(
             str(loop.id),
@@ -332,10 +333,37 @@ def loops_list(
             loop.name,
             loops_mod.format_interval(loop.interval_seconds),
             loops_mod.format_due(loop.next_run_at),
-            target,
+            _loop_target_label(loop),
+            str(run_count),
             last,
         )
     console.print(table)
+
+
+@loops_app.command("show")
+def loops_show(
+    loop_id: int = typer.Argument(..., help="Loop id to inspect."),
+    history: int = typer.Option(5, "--history", "-n", help="Number of recent runs to show."),
+):
+    """Show loop configuration and recent run history."""
+    loop = db.get_loop(loop_id)
+    if loop is None:
+        console.print(f"[red]no loop #{loop_id}[/red]")
+        raise typer.Exit(1)
+    _print_loop_detail(loop, history=history)
+
+
+@loops_app.command("history")
+def loops_history(
+    loop_id: int = typer.Argument(..., help="Loop id to inspect."),
+    limit: int = typer.Option(20, "--limit", "-n", help="Maximum run rows to print."),
+):
+    """Show prior runs for one prompt loop."""
+    loop = db.get_loop(loop_id)
+    if loop is None:
+        console.print(f"[red]no loop #{loop_id}[/red]")
+        raise typer.Exit(1)
+    _print_loop_history(loop, limit=limit)
 
 
 @loops_app.command("run-due")
@@ -399,6 +427,246 @@ def loops_resume(loop_id: int = typer.Argument(..., help="Loop id to resume.")):
         raise typer.Exit(1)
     ledger_mod.log_action("loop_resume", tab_id=loop.target_tab_id, details={"loop_id": loop.id})
     console.print(f"[green]active[/green] loop #{loop.id} {loop.name}")
+
+
+@loops_app.command("edit")
+def loops_edit(
+    loop_id: int = typer.Argument(..., help="Loop id to update."),
+    name: Optional[str] = typer.Option(None, "--name", help="New loop name."),
+    prompt: Optional[str] = typer.Option(None, "--prompt", help="New prompt."),
+    every: Optional[str] = typer.Option(None, "--every", "-e", help="New interval, e.g. 15m, 2h, daily."),
+    command: Optional[str] = typer.Option(None, "--cmd", "-c", help="New command prefix/template."),
+):
+    """Edit loop name, prompt, interval, or command."""
+    existing = db.get_loop(loop_id)
+    if existing is None:
+        console.print(f"[red]no loop #{loop_id}[/red]")
+        raise typer.Exit(1)
+    interval = None
+    if every is not None:
+        try:
+            interval = loops_mod.parse_interval(every)
+        except ValueError as e:
+            console.print(f"[red]{e}[/red]")
+            raise typer.Exit(1)
+    if name is None and prompt is None and interval is None and command is None:
+        _print_loop_detail(existing)
+        return
+    loop = db.update_loop_details(
+        loop_id,
+        name=name,
+        prompt=prompt,
+        interval_seconds=interval,
+        command=command,
+    )
+    if loop is None:
+        console.print(f"[red]no loop #{loop_id}[/red]")
+        raise typer.Exit(1)
+    ledger_mod.log_action(
+        "loop_edit",
+        tab_id=loop.target_tab_id,
+        details={"loop_id": loop.id, "name": loop.name},
+    )
+    if loop.target_mission_id:
+        db.add_event(
+            loop.target_mission_id,
+            kind="loop_updated",
+            actor="morpheus",
+            summary=f"Loop updated: {loop.name}",
+            source_ref=f"loop:{loop.id}",
+            metadata={"loop_id": loop.id, "target_tab_id": loop.target_tab_id},
+        )
+    _refresh_context_files()
+    console.print(f"[green]updated[/green] loop #{loop.id} {loop.name}")
+
+
+@loops_app.command("join")
+def loops_join(
+    loop_id: int = typer.Argument(..., help="Loop id to attach."),
+    target: str = typer.Argument(..., help="Mission/tab prefix to receive loop output."),
+):
+    """Attach a loop to a mission so future runs write events/artifacts there."""
+    loop = db.get_loop(loop_id)
+    if loop is None:
+        console.print(f"[red]no loop #{loop_id}[/red]")
+        raise typer.Exit(1)
+    target_mission_id, target_tab_id = _resolve_loop_target(target)
+    updated = db.set_loop_target(
+        loop_id,
+        target_mission_id=target_mission_id,
+        target_tab_id=target_tab_id,
+    )
+    if updated is None:
+        console.print(f"[red]no loop #{loop_id}[/red]")
+        raise typer.Exit(1)
+    _record_loop_join(updated)
+    console.print(f"[green]joined[/green] loop #{updated.id} {updated.name} → {_loop_target_label(updated)}")
+
+
+@loops_app.command("unjoin")
+def loops_unjoin(loop_id: int = typer.Argument(..., help="Loop id to detach from its target.")):
+    """Detach a loop back to ticker/context only."""
+    loop = db.get_loop(loop_id)
+    if loop is None:
+        console.print(f"[red]no loop #{loop_id}[/red]")
+        raise typer.Exit(1)
+    old_target = loop.target_mission_id
+    updated = db.set_loop_target(loop_id, target_mission_id="", target_tab_id=None)
+    if updated is None:
+        console.print(f"[red]no loop #{loop_id}[/red]")
+        raise typer.Exit(1)
+    ledger_mod.log_action(
+        "loop_unjoin",
+        tab_id=loop.target_tab_id,
+        details={"loop_id": loop.id, "old_target_mission_id": old_target},
+    )
+    if old_target:
+        db.add_event(
+            old_target,
+            kind="loop_unjoined",
+            actor="morpheus",
+            summary=f"Loop detached: {loop.name}",
+            source_ref=f"loop:{loop.id}",
+            metadata={"loop_id": loop.id, "old_target_tab_id": loop.target_tab_id},
+        )
+    _refresh_context_files()
+    console.print(f"[yellow]unjoined[/yellow] loop #{updated.id} {updated.name} → ticker/context")
+
+
+@loops_app.command("delete")
+def loops_delete(
+    loop_id: int = typer.Argument(..., help="Loop id to delete."),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Do not ask for confirmation."),
+):
+    """Delete a prompt loop and its stored run rows. Output files are left on disk."""
+    loop = db.get_loop(loop_id)
+    if loop is None:
+        console.print(f"[red]no loop #{loop_id}[/red]")
+        raise typer.Exit(1)
+    if not yes and not typer.confirm(f"Delete loop #{loop.id} {loop.name}? Run output files will remain on disk."):
+        raise typer.Exit(1)
+    deleted = db.delete_loop(loop_id)
+    if deleted is None:
+        console.print(f"[red]no loop #{loop_id}[/red]")
+        raise typer.Exit(1)
+    ledger_mod.log_action(
+        "loop_delete",
+        tab_id=deleted.target_tab_id,
+        details={"loop_id": deleted.id, "target_mission_id": deleted.target_mission_id},
+    )
+    if deleted.target_mission_id:
+        db.add_event(
+            deleted.target_mission_id,
+            kind="loop_deleted",
+            actor="morpheus",
+            summary=f"Loop deleted: {deleted.name}",
+            source_ref=f"loop:{deleted.id}",
+            metadata={"loop_id": deleted.id, "target_tab_id": deleted.target_tab_id},
+        )
+    _refresh_context_files()
+    console.print(f"[red]deleted[/red] loop #{deleted.id} {deleted.name}")
+
+
+def _resolve_loop_target(target: str) -> tuple[str, Optional[str]]:
+    resolved = graph_mod.resolve(target)
+    if resolved is None:
+        console.print(f"[red]no mission matching '{target}'[/red]")
+        raise typer.Exit(1)
+    target_tab_id = resolved.live[0].tab_id if resolved.live else None
+    return resolved.mission_id, target_tab_id
+
+
+def _record_loop_join(loop: db.PromptLoop) -> None:
+    ledger_mod.log_action(
+        "loop_join",
+        tab_id=loop.target_tab_id,
+        details={"loop_id": loop.id, "target_mission_id": loop.target_mission_id},
+    )
+    if loop.target_mission_id:
+        db.add_event(
+            loop.target_mission_id,
+            kind="loop_joined",
+            actor="morpheus",
+            summary=f"Loop joined: {loop.name}",
+            source_ref=f"loop:{loop.id}",
+            metadata={"loop_id": loop.id, "target_tab_id": loop.target_tab_id},
+        )
+    _refresh_context_files()
+
+
+def _refresh_context_files() -> None:
+    try:
+        ctx_mod.write_context_file()
+        ctx_mod.write_context_json()
+    except Exception:
+        pass
+
+
+def _loop_target_label(loop: db.PromptLoop) -> str:
+    if not loop.target_mission_id:
+        return "ticker"
+    suffix = f"/{loop.target_tab_id.split('-')[0]}" if loop.target_tab_id else ""
+    return f"{graph_mod.short_id(loop.target_mission_id)}{suffix}"
+
+
+def _print_loop_detail(loop: db.PromptLoop, history: int = 5) -> None:
+    console.print(f"[bold green]loop #{loop.id} {escape(loop.name)}[/bold green]")
+    console.print(f"  status:  {loop.status}")
+    console.print(f"  every:   [cyan]{loops_mod.format_interval(loop.interval_seconds)}[/cyan]")
+    console.print(f"  next:    {loops_mod.format_due(loop.next_run_at)} ({_format_loop_ts(loop.next_run_at)})")
+    console.print(f"  target:  {_loop_target_label(loop)}")
+    console.print(f"  command: [dim]{escape(loop.command)}[/dim]")
+    console.print(f"  prompt:  {escape(loop.prompt)}")
+    console.print(f"  created: {_format_loop_ts(loop.created_at)}")
+    console.print(f"  updated: {_format_loop_ts(loop.updated_at)}")
+    if loop.last_run_at:
+        console.print(f"  last:    {loop.last_run_status or 'unknown'} at {_format_loop_ts(loop.last_run_at)}")
+        if loop.last_summary:
+            console.print(f"           {escape(loop.last_summary)}")
+    _print_loop_history(loop, limit=history)
+
+
+def _print_loop_history(loop: db.PromptLoop, limit: int = 20) -> None:
+    runs = db.loop_runs(loop.id, limit=limit)
+    if not runs:
+        console.print("[dim]no runs recorded yet[/dim]")
+        return
+    table = Table(title=f"loop #{loop.id} run history", header_style="bold green")
+    table.add_column("RUN", style="cyan", no_wrap=True)
+    table.add_column("STARTED", no_wrap=True)
+    table.add_column("DUR", no_wrap=True)
+    table.add_column("STATUS", no_wrap=True)
+    table.add_column("EXIT", no_wrap=True)
+    table.add_column("OUTPUT")
+    table.add_column("SUMMARY", overflow="fold")
+    for run in runs:
+        table.add_row(
+            str(run.id),
+            _format_loop_ts(run.started_at),
+            _format_loop_duration(run.started_at, run.finished_at),
+            run.status,
+            str(run.exit_code) if run.exit_code is not None else "—",
+            run.output_path or "—",
+            run.summary or "—",
+        )
+    console.print(table)
+
+
+def _format_loop_ts(ts: float) -> str:
+    if not ts:
+        return "—"
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts))
+
+
+def _format_loop_duration(started_at: float, finished_at: float) -> str:
+    seconds = max(0, int(finished_at - started_at))
+    if seconds < 60:
+        return f"{seconds}s"
+    minutes, seconds = divmod(seconds, 60)
+    if minutes < 60:
+        return f"{minutes}m{seconds:02d}s"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h{minutes:02d}m"
 
 
 # ───────── list ─────────
