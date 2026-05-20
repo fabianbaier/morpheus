@@ -8,7 +8,7 @@ version = "0.8.0a12"
 description = "Mission graph cockpit for your terminal — keeps track of parallel agent sessions running in iTerm."
 readme = "README.md"
 requires-python = ">=3.10"
-license = { text = "MIT" }
+license = { text = "Apache-2.0" }
 authors = [{ name = "Fabian Baier" }]
 keywords = ["iterm", "tmux", "agents", "claude", "codex", "tui", "matrix"]
 classifiers = [
