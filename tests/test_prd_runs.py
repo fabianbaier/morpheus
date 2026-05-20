@@ -1,9 +1,22 @@
 import tempfile
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import patch
 
-from morpheus import prd_runs
+from morpheus import db, prd_runs
+
+
+@contextmanager
+def isolated_prd_runtime():
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        db_dir = root / "db"
+        runs_dir = root / "runs"
+        with patch.object(db, "DB_DIR", db_dir), patch.object(
+            db, "DB_PATH", db_dir / "morpheus.db"
+        ), patch.object(prd_runs, "RUNS_DIR", runs_dir):
+            yield root
 
 
 class PRDRunsTest(unittest.TestCase):
@@ -94,6 +107,84 @@ class PRDRunsTest(unittest.TestCase):
         self.assertTrue(command.startswith("codex "))
         self.assertIn("coordinator_prompt.md", command)
         self.assertIn("PRD.md", command)
+
+    def test_attach_worker_updates_status_file_from_graph(self) -> None:
+        with isolated_prd_runtime() as root:
+            prd = root / "PRD.md"
+            prd.write_text("# Sync PRD\n", encoding="utf-8")
+            run = prd_runs.create_prd_run(prd, title="Sync PRD")
+            coordinator = db.Mission(
+                tab_id="tab-coordinator",
+                mission_id="m_coordinator",
+                goal="sync coordinator",
+                state="working",
+                cmd="codex",
+            )
+            db.upsert(coordinator)
+            prd_runs.attach_coordinator(run, coordinator)
+            worker = db.Mission(
+                tab_id="tab-worker",
+                mission_id="m_worker",
+                goal="implement status updater",
+                state="working",
+                cmd="codex",
+            )
+            db.upsert(worker)
+
+            prd_runs.attach_worker(
+                run,
+                worker,
+                scope="morpheus/prd_runs.py",
+                verification="python -m unittest tests.test_prd_runs",
+            )
+
+            text = run.status_path.read_text(encoding="utf-8")
+
+        self.assertIn("- mode: `graph-synced`", text)
+        self.assertNotIn("coordinator-only", text)
+        self.assertIn("coordinator: sync coordinator (`m_coordinator`) live tab `tab-coordinator`", text)
+        self.assertIn("worker: implement status updater (`m_worker`) live tab `tab-worker`", text)
+        self.assertIn("scope: morpheus/prd_runs.py", text)
+        self.assertIn("verification: python -m unittest tests.test_prd_runs", text)
+
+    def test_status_refresh_for_child_includes_events_and_artifacts(self) -> None:
+        with isolated_prd_runtime() as root:
+            prd = root / "PRD.md"
+            prd.write_text("# Sync PRD\n", encoding="utf-8")
+            run = prd_runs.create_prd_run(prd, title="Sync PRD")
+            worker = db.Mission(
+                tab_id="tab-worker",
+                mission_id="m_worker",
+                goal="prove status updater",
+                state="working",
+                cmd="codex",
+            )
+            db.upsert(worker)
+            prd_runs.attach_worker(run, worker, scope="tests/test_prd_runs.py")
+            run.status_path.write_text("stale coordinator-only status", encoding="utf-8")
+            db.add_event(
+                worker.mission_id,
+                kind="check",
+                actor="codex",
+                summary="status updater test passed",
+                source_ref="python -m unittest tests.test_prd_runs",
+            )
+            db.add_artifact(
+                worker.mission_id,
+                kind="test",
+                path_or_url="tests/test_prd_runs.py",
+                status="pass",
+                summary="PRD run status tests",
+            )
+
+            refreshed = prd_runs.update_status_for_mission(worker.mission_id)
+            text = run.status_path.read_text(encoding="utf-8")
+
+        self.assertIsNotNone(refreshed)
+        self.assertEqual(refreshed.parent_id, run.parent_id)
+        self.assertNotIn("stale coordinator-only status", text)
+        self.assertIn("check/codex: status updater test passed", text)
+        self.assertIn("pass test: `tests/test_prd_runs.py` - PRD run status tests", text)
 
 
 if __name__ == "__main__":

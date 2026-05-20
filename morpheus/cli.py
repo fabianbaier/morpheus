@@ -213,6 +213,31 @@ def run_find_prds(
     console.print(table)
 
 
+@run_app.command("status")
+def run_status(
+    ref: str = typer.Argument(..., help="PRD parent mission id/prefix, or a coordinator/worker mission id/prefix."),
+    record: bool = typer.Option(True, "--record/--no-record", help="Record a status_refreshed graph event."),
+):
+    """Refresh and print the graph-rendered status file for a PRD run."""
+    resolved = graph_mod.resolve(ref)
+    if resolved is None:
+        console.print(f"[red]no mission matching '{ref}'[/red]")
+        raise typer.Exit(1)
+
+    try:
+        parent_id = prd_runs.prd_parent_for_mission(resolved.mission_id)
+        if not parent_id:
+            console.print(f"[red]mission is not part of a PRD run: {resolved.mission_id}[/red]")
+            raise typer.Exit(1)
+        status_path = prd_runs.update_status_from_graph(parent_id, record_event=record)
+    except ValueError as e:
+        console.print(f"[red]{e}[/red]")
+        raise typer.Exit(1)
+
+    console.print(Markdown(status_path.read_text(encoding="utf-8")))
+    console.print(f"\n[green]status refreshed:[/green] {status_path}")
+
+
 # ───────── prompt loops ─────────
 
 loops_app = typer.Typer(help="Configure recurring prompt loops.")
@@ -882,6 +907,7 @@ def graph_event(
         source_ref=source_ref,
     )
     console.print(f"[green]event #{event_id}[/green] → {resolved.mission_id}")
+    _refresh_prd_run_status_for_mission(resolved.mission_id)
 
 
 @graph_app.command("artifact")
@@ -907,6 +933,17 @@ def graph_artifact(
         summary=summary,
     )
     console.print(f"[green]artifact #{artifact_id}[/green] → {resolved.mission_id}")
+    _refresh_prd_run_status_for_mission(resolved.mission_id)
+
+
+def _refresh_prd_run_status_for_mission(mission_id: str) -> None:
+    try:
+        run = prd_runs.update_status_for_mission(mission_id)
+    except Exception as e:
+        console.print(f"[yellow]warning: PRD run status refresh failed: {e}[/yellow]")
+        return
+    if run is not None:
+        console.print(f"  status: {run.status_path}")
 
 
 # ───────── daemon (launchd) ─────────
