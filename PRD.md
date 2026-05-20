@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| **Status** | v0.8.0a2 implemented (ready-response headlines); next: child-worker tree UI |
+| **Status** | v0.8.0a3 implemented (newest-first ticker); next: child-worker tree UI |
 | **Author** | Fabian Baier |
 | **Last updated** | 2026-05-20 |
 | **Target platform** | macOS + iTerm2 |
@@ -300,6 +300,9 @@ Required live-stream behavior:
   separator rules, then select a one-sentence response headline. A future
   background LLM summarizer may improve this, but the cockpit must never block
   on a synchronous summarization call.
+- The ticker display order is newest-first. A new ready/completed/headline item
+  should appear at the top of the rabbit strip so the freshest thing demanding
+  attention is visible without scrolling.
 
 Acceptance test: start a Codex session that performs a web search, keep focus
 in Morpheus, and verify the cockpit shows the search/tool progress and latest
@@ -688,6 +691,7 @@ This table is the source of truth for where the product stands right now.
 | Matrix rain output shards | Implemented in v0.7.0a5 | Left panel is rain-first again: real terminal output is embedded as falling bright shards inside the Matrix rain instead of rendered as a static terminal tail |
 | Robust self-tab exclusion | Implemented in v0.7.0a6 | Dashboard passes its own tab/session IDs into the watcher; core also recognizes the Morpheus screen by buffer if iTerm leaves the title as `Python"` |
 | Ready-response rabbit ticker | Implemented in v0.8.0a2 | `working → idle` now emits a `ready [...]` headline by extracting the latest assistant answer block, skipping Codex chrome/separators/source URLs, and compressing it to one sentence |
+| Newest-first rabbit ticker | Implemented in v0.8.0a3 | Bottom alert strip redraws from the newest-first alert deque so fresh session headlines stay at the top instead of appending chronologically |
 | PRD Runs foundation | Implemented in v0.8.0a1 | PRD finder, new-session PRD selector, parent mission creation, coordinator prompt/status files, `morpheus run start`, and coordinator graph edge shipped |
 | PRD run tree UI | Not implemented | Show parent PRD rows with collapsible coordinator/worker children in the mission table |
 | PRD child worker spawn | Not implemented | Manual worker spawn under selected parent with file/path ownership and proof requirements |

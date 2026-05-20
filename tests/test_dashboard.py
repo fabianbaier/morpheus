@@ -33,6 +33,19 @@ class FakeLogger:
         pass
 
 
+class FakeRichLog:
+    def __init__(self) -> None:
+        self.lines: list[str] = []
+        self.clear_count = 0
+
+    def clear(self) -> None:
+        self.clear_count += 1
+        self.lines = []
+
+    def write(self, value) -> None:
+        self.lines.append(value.plain if hasattr(value, "plain") else str(value))
+
+
 @contextmanager
 def isolated_dashboard_runtime():
     async def fake_async_create():
@@ -113,6 +126,19 @@ class DashboardTest(unittest.IsolatedAsyncioTestCase):
         rendered = _tail_lines("old\n\nmiddle\nlatest and very long", limit=2, width=12)
 
         self.assertEqual(rendered, ["middle", "latest and …"])
+
+    def test_alert_panel_renders_newest_first(self) -> None:
+        app = DashboardHarness()
+        rich_log = FakeRichLog()
+
+        with patch.object(app, "query_one", return_value=rich_log):
+            app._push_alert(dashboard.Alert(1, "summary", "older ready headline"))
+            app._push_alert(dashboard.Alert(2, "summary", "newer ready headline"))
+
+        self.assertEqual(len(app.alerts), 2)
+        self.assertIn("newer ready headline", rich_log.lines[0])
+        self.assertIn("older ready headline", rich_log.lines[1])
+        self.assertGreaterEqual(rich_log.clear_count, 2)
 
     def test_session_headline_prefers_final_substantive_line(self) -> None:
         rendered = _session_headline(

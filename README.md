@@ -80,7 +80,8 @@ strip acts like a ticker: blocked prompts, collisions, spawns, notes,
 completed-session headlines, and ready-response headlines roll in there.
 Ready/completed headlines summarize the latest assistant answer block instead
 of blindly using the last terminal line, so Codex prompt chrome and separator
-rules do not become ticker text.
+rules do not become ticker text. The ticker renders newest-first, with the
+freshest item at the top.
 
 Core commands:
 
@@ -228,7 +229,7 @@ make daemon
 
 ## Roadmap
 
-Current status: v0.8 PRD Runs foundation is underway.
+Current status: v0.8.0a3 has PRD Runs foundation plus newest-first ready tickers.
 
 Next implementation phases:
 
@@ -239,12 +240,13 @@ Next implementation phases:
 5. Matrix rain output shards. Done in `0.7.0a5`.
 6. Robust self-tab exclusion. Done in `0.7.0a6`.
 7. Ready-response rabbit ticker headlines. Done in `0.8.0a2`.
-8. PRD Runs foundation. Done in `0.8.0a1`.
-9. Collapsible PRD run tree in the cockpit.
-10. Manual child-worker spawn under a PRD run.
-11. Edit mission flow for why/plan/next/provenance/proof fields.
-12. `b` brief-selected using mission graph plus transcript tail.
-13. Resume-fresh flow that snapshots, archives old attachment, and spawns a new
+8. Newest-first rabbit ticker. Done in `0.8.0a3`.
+9. PRD Runs foundation. Done in `0.8.0a1`.
+10. Collapsible PRD run tree in the cockpit.
+11. Manual child-worker spawn under a PRD run.
+12. Edit mission flow for why/plan/next/provenance/proof fields.
+13. `b` brief-selected using mission graph plus transcript tail.
+14. Resume-fresh flow that snapshots, archives old attachment, and spawns a new
    session linked by a `spawned_from` edge.
 
 > "I can only show you the door. You're the one that has to walk through it."

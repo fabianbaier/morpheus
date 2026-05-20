@@ -1273,9 +1273,14 @@ class MorpheusApp(App):
 
     def _push_alert(self, alert: Alert) -> None:
         self.alerts.appendleft(alert)
+        self._redraw_alerts()
+
+    def _redraw_alerts(self) -> None:
         try:
             rich_log = self.query_one("#alerts-panel", RichLog)
-            rich_log.write(alert.render())
+            rich_log.clear()
+            for alert in self.alerts:
+                rich_log.write(alert.render())
         except Exception:
             pass
 
