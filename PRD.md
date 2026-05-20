@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| **Status** | v0.6.2 PRD alignment (v0.6.0 shipped; v0.7 Mission Graph Cockpit specified, not implemented) |
+| **Status** | v0.7.0a1 foundation started (v0.6.0 shipped; Mission Graph storage + dev launch flow implemented) |
 | **Author** | Fabian Baier |
 | **Last updated** | 2026-05-20 |
 | **Target platform** | macOS + iTerm2 |
@@ -597,10 +597,12 @@ This table is the source of truth for where the product stands right now.
 | v0.6 runtime foundation | Shipped | iTerm observation, Textual cockpit, launchd, notifications, briefings, trigger spawn, ledgers, MCP |
 | PRD strategic pivot | Done in v0.6.2 | Product stance now says Mission Graph Cockpit, not tab-title manager |
 | Competitive research | Done in v0.6.2 | CCPM, Claude Code, Karpathy LLM Wiki, and open-source session managers folded into requirements |
-| Stable mission ID design | Specified, not implemented | Add `mission_id` to live sessions and make `tab_id` an attachment |
-| Mission graph schema | Specified, not implemented | Add `mission_memory`, `mission_events`, `mission_artifacts`, `mission_edges` |
-| Provenance model | Specified, not implemented | Store user-authored, transcript-derived, and inferred facts separately |
-| Loop phase / proof tracking | Specified, not implemented | Track phase, checks, artifacts, confidence, and `last_verified_at` |
+| Local dev launch flow | Implemented in v0.7.0 foundation | `Makefile` creates `.venv`, installs editable checkout, reloads daemon, opens cockpit |
+| Quickstart/architecture README | Implemented in v0.7.0 foundation | README now documents `make start`, architecture, mission graph, state files |
+| Stable mission ID design | Implemented in v0.7.0 foundation | `missions.mission_id` added; live tabs attach to durable mission IDs |
+| Mission graph schema | Implemented in v0.7.0 foundation | `mission_memory`, `mission_events`, `mission_artifacts`, `mission_edges` added |
+| Provenance model | Foundation implemented | Graph fields store source kind/ref and confidence; UI trust treatment still pending |
+| Loop phase / proof tracking | Foundation implemented | `phase`, `last_verified_at`, events, artifacts exist; cockpit display still pending |
 | Mission card panel | Not implemented | Build selected-session card in the Textual cockpit |
 | Edit mission flow | Not implemented | `e` opens goal/why/plan/next/criteria/source/proof editor |
 | Brief selected | Not implemented | `b` renders a cited why/status/next card from graph + transcript tail |

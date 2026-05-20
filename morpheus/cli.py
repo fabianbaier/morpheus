@@ -18,7 +18,7 @@ from morpheus import ask as ask_mod
 from morpheus import brief as brief_mod
 from morpheus import config as cfg_mod
 from morpheus import context as ctx_mod
-from morpheus import core, daemon as daemon_mod, db, iterm_client, ledger as ledger_mod, naming, notifier as notifier_mod, trigger as trigger_mod, __version__
+from morpheus import core, daemon as daemon_mod, db, iterm_client, ledger as ledger_mod, mission_graph as graph_mod, naming, notifier as notifier_mod, trigger as trigger_mod, __version__
 
 app = typer.Typer(
     name="morpheus",
@@ -139,6 +139,7 @@ def spawn(
         )
         db.upsert(m)
         console.print(f"[green]spawned[/green] tab {info.tab_id} — goal: [bold]{goal}[/bold]")
+        console.print(f"  mission: [cyan]{m.mission_id}[/cyan]")
         console.print(f"  cmd: [dim]{command}[/dim]")
 
     iterm_client.run(_do)
@@ -289,6 +290,14 @@ def snapshot(
             f"## Buffer (tail)\n\n```\n{tab.buffer}\n```\n"
         )
         out_path.write_text(body)
+        if m.mission_id:
+            db.add_artifact(
+                m.mission_id,
+                kind="snapshot",
+                path_or_url=str(out_path),
+                status="unknown",
+                summary=f"Snapshot for {m.goal or tab.tab_id}",
+            )
         console.print(f"[green]snapshot written:[/green] {out_path}")
 
     iterm_client.run(_do)
@@ -521,6 +530,145 @@ def ledger_actions(
         details = ", ".join(f"{k}={v}" for k, v in r.details.items())
         table.add_row(when, r.action, tab, details[:80])
     console.print(table)
+
+
+# ───────── mission graph (v0.7 foundation) ─────────
+
+graph_app = typer.Typer(help="Inspect and annotate the v0.7 mission graph.")
+app.add_typer(graph_app, name="graph")
+
+
+@graph_app.command("status")
+def graph_status():
+    """Show mission graph table counts and basic health checks."""
+    health = graph_mod.graph_health()
+    counts = health["counts"]
+
+    table = Table(title="MORPHEUS mission graph", header_style="bold green")
+    table.add_column("table / check")
+    table.add_column("count", justify="right", style="cyan")
+    for key in (
+        "live_sessions", "missions", "active_missions", "archived_missions",
+        "events", "artifacts", "edges",
+    ):
+        table.add_row(key, str(counts[key]))
+    table.add_row("live_without_memory", str(len(health["live_without_memory"])))
+    table.add_row("active_without_live", str(len(health["active_without_live"])))
+    console.print(table)
+
+    if health["live_without_memory"]:
+        console.print("[yellow]live sessions missing memory rows:[/yellow]")
+        for m in health["live_without_memory"]:
+            console.print(f"  - {m.tab_id.split('-')[0]} {m.goal or '(untitled)'}")
+
+
+@graph_app.command("show")
+def graph_show(
+    ref: str = typer.Argument(..., help="Mission id, mission id prefix, tab id, or tab id prefix."),
+):
+    """Show one durable mission graph card."""
+    resolved = graph_mod.resolve(ref)
+    if resolved is None:
+        console.print(f"[red]no mission matching '{ref}'[/red]")
+        raise typer.Exit(1)
+
+    mem = resolved.memory
+    console.print(f"[bold green]{mem.title or mem.mission_id}[/bold green]")
+    console.print(f"  mission:   [cyan]{mem.mission_id}[/cyan]")
+    console.print(f"  short:     [cyan]{graph_mod.short_id(mem.mission_id)}[/cyan]")
+    console.print(f"  phase:     {mem.phase}")
+    console.print(f"  source:    {mem.source_kind} {mem.source_ref or ''}".rstrip())
+    console.print(f"  confidence:{mem.confidence:.2f}")
+    if resolved.live:
+        live_bits = ", ".join(f"{m.tab_id.split('-')[0]}:{m.state}" for m in resolved.live)
+        console.print(f"  live:      {live_bits}")
+    else:
+        console.print("  live:      [dim]no live tab attachment[/dim]")
+
+    fields = [
+        ("why", mem.why),
+        ("done", mem.done_definition),
+        ("criteria", mem.acceptance_criteria),
+        ("plan", mem.current_plan),
+        ("next", mem.next_step),
+        ("blocked", mem.blocked_on),
+        ("decision", mem.last_decision),
+        ("summary", mem.last_summary),
+    ]
+    for label, value in fields:
+        if value:
+            console.print(f"\n[bold]{label}[/bold]\n{value}")
+
+    events = db.recent_events(mem.mission_id, limit=8)
+    if events:
+        console.print("\n[bold]recent events[/bold]")
+        for e in events:
+            when = time.strftime("%Y-%m-%d %H:%M", time.localtime(e.ts))
+            source = f" [{e.source_ref}]" if e.source_ref else ""
+            console.print(f"  {when} {e.kind}/{e.actor}: {e.summary}{source}")
+
+    artifacts = db.artifacts_for_mission(mem.mission_id, limit=8)
+    if artifacts:
+        console.print("\n[bold]artifacts[/bold]")
+        for a in artifacts:
+            console.print(f"  {a.status} {a.kind}: {a.path_or_url} {a.summary}")
+
+    edges = db.edges_for_id(mem.mission_id, limit=8)
+    if edges:
+        console.print("\n[bold]edges[/bold]")
+        for e in edges:
+            console.print(f"  {e.from_id} -[{e.relation}]-> {e.to_id} {e.reason}")
+
+
+@graph_app.command("event")
+def graph_event(
+    ref: str = typer.Argument(..., help="Mission id/prefix or tab id/prefix."),
+    summary: str = typer.Argument(..., help="Event summary to attach."),
+    kind: str = typer.Option("decision", "--kind", "-k",
+                              help="decision | blocker | check | summary | note"),
+    actor: str = typer.Option("user", "--actor", "-a",
+                               help="user | morpheus | codex | claude | shell"),
+    source_ref: str = typer.Option("", "--source-ref", "-s",
+                                    help="Transcript span, file path, command, or URL."),
+):
+    """Append a provenance-friendly event to a mission."""
+    resolved = graph_mod.resolve(ref)
+    if resolved is None:
+        console.print(f"[red]no mission matching '{ref}'[/red]")
+        raise typer.Exit(1)
+    event_id = db.add_event(
+        resolved.mission_id,
+        kind=kind,
+        actor=actor,
+        summary=summary,
+        source_ref=source_ref,
+    )
+    console.print(f"[green]event #{event_id}[/green] → {resolved.mission_id}")
+
+
+@graph_app.command("artifact")
+def graph_artifact(
+    ref: str = typer.Argument(..., help="Mission id/prefix or tab id/prefix."),
+    path_or_url: str = typer.Argument(..., help="Local path or external URL."),
+    kind: str = typer.Option("proof", "--kind", "-k",
+                              help="snapshot | diff | test | build | pr | issue | doc | log | proof"),
+    status: str = typer.Option("unknown", "--status", "-s",
+                                help="pending | pass | fail | unknown"),
+    summary: str = typer.Option("", "--summary", help="Short artifact summary."),
+):
+    """Attach a proof/output artifact to a mission."""
+    resolved = graph_mod.resolve(ref)
+    if resolved is None:
+        console.print(f"[red]no mission matching '{ref}'[/red]")
+        raise typer.Exit(1)
+    artifact_id = db.add_artifact(
+        resolved.mission_id,
+        kind=kind,
+        path_or_url=path_or_url,
+        status=status,
+        summary=summary,
+    )
+    console.print(f"[green]artifact #{artifact_id}[/green] → {resolved.mission_id}")
 
 
 # ───────── daemon (launchd) ─────────

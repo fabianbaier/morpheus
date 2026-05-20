@@ -1,3 +1,3 @@
-"""Morpheus — mission control for your iTerm tabs."""
+"""Morpheus — mission graph cockpit for parallel iTerm agents."""
 
-__version__ = "0.6.0"
+__version__ = "0.7.0a1"

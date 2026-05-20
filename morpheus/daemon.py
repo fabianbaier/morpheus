@@ -15,6 +15,7 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -57,7 +58,11 @@ def find_morpheus_binary() -> Optional[str]:
         cand = Path(venv) / "bin" / "morpheus"
         if cand.exists():
             return str(cand)
-    # 2. PATH lookup
+    # 2. The interpreter currently running this command (works for `.venv/bin/morpheus`).
+    cand = Path(sys.executable).with_name("morpheus")
+    if cand.exists():
+        return str(cand)
+    # 3. PATH lookup
     found = shutil.which("morpheus")
     if found:
         return found

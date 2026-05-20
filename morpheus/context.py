@@ -42,6 +42,9 @@ def build_markdown(self_tab_id: Optional[str] = None, self_session_id: Optional[
     now = time.strftime("%Y-%m-%d %H:%M:%S")
     counts = _state_counts(missions)
     missions_by_tab = {m.tab_id: m for m in missions}
+    memories_by_id = {
+        mem.mission_id: mem for mem in db.all_memory(include_archived=True)
+    }
 
     def _is_self(m: db.Mission) -> bool:
         if self_tab_id and m.tab_id == self_tab_id:
@@ -71,8 +74,8 @@ def build_markdown(self_tab_id: Optional[str] = None, self_session_id: Optional[
 
     lines.append("## Sessions")
     lines.append("")
-    lines.append("| State | ID | Goal | Age | Last event | |")
-    lines.append("|-------|-----|------|-----|------------|---|")
+    lines.append("| State | Tab | Mission | Goal | Phase | Age | Last event | |")
+    lines.append("|-------|-----|---------|------|-------|-----|------------|---|")
     for m in sorted_missions:
         emoji = naming.STATE_EMOJI.get(m.state, "⚪")
         age = naming.format_age(naming.now_minus(m.buffer_changed_at))
@@ -80,7 +83,13 @@ def build_markdown(self_tab_id: Optional[str] = None, self_session_id: Optional[
         goal = m.goal or "(untitled)"
         last = (m.last_event or "—").replace("|", "\\|")
         tab_short = (m.tab_id or "?").split("-")[0]
-        lines.append(f"| {emoji} {m.state} | `{tab_short}` | {goal} | {age} | {last} | {you} |")
+        mission_short = m.mission_id[:12] if m.mission_id else "?"
+        memory = memories_by_id.get(m.mission_id)
+        phase = memory.phase if memory else "unknown"
+        lines.append(
+            f"| {emoji} {m.state} | `{tab_short}` | `{mission_short}` | "
+            f"{goal} | {phase} | {age} | {last} | {you} |"
+        )
 
     lines.append("")
     lines.append("## Recent cross-session notes")
@@ -105,6 +114,9 @@ def build_markdown(self_tab_id: Optional[str] = None, self_session_id: Optional[
 def build_json(self_tab_id: Optional[str] = None, self_session_id: Optional[str] = None) -> dict:
     missions = db.all_missions()
     notes = db.recent_notes(limit=15)
+    memories_by_id = {
+        mem.mission_id: mem for mem in db.all_memory(include_archived=True)
+    }
 
     def _is_self(m: db.Mission) -> bool:
         if self_tab_id and m.tab_id == self_tab_id:
@@ -119,6 +131,7 @@ def build_json(self_tab_id: Optional[str] = None, self_session_id: Optional[str]
         "sessions": [
             {
                 "tab_id": m.tab_id,
+                "mission_id": m.mission_id,
                 "session_id": m.session_id,
                 "goal": m.goal,
                 "state": m.state,
@@ -128,6 +141,17 @@ def build_json(self_tab_id: Optional[str] = None, self_session_id: Optional[str]
                 "cmd": m.cmd,
                 "linked_pr": m.linked_pr,
                 "linked_worktree": m.linked_worktree,
+                "memory": (
+                    {
+                        "title": memories_by_id[m.mission_id].title,
+                        "phase": memories_by_id[m.mission_id].phase,
+                        "why": memories_by_id[m.mission_id].why,
+                        "next_step": memories_by_id[m.mission_id].next_step,
+                        "blocked_on": memories_by_id[m.mission_id].blocked_on,
+                        "confidence": memories_by_id[m.mission_id].confidence,
+                    }
+                    if m.mission_id in memories_by_id else None
+                ),
                 "is_self": _is_self(m),
             }
             for m in missions

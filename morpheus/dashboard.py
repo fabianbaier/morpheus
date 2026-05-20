@@ -219,12 +219,12 @@ class NewSessionScreen(ModalScreen[Optional[tuple[str, str]]]):
     #dialog {
         width: 70;
         height: 16;
-        border: round bright_green;
+        border: round ansi_bright_green;
         background: black;
         padding: 1 2;
     }
     #dialog Label.title {
-        color: bright_green;
+        color: ansi_bright_green;
         text-style: bold;
         margin-bottom: 1;
     }
@@ -233,12 +233,12 @@ class NewSessionScreen(ModalScreen[Optional[tuple[str, str]]]):
     }
     Input {
         background: black;
-        color: bright_green;
+        color: ansi_bright_green;
         border: round green;
         margin: 0 0 1 0;
     }
     Input:focus {
-        border: round bright_green;
+        border: round ansi_bright_green;
     }
     #buttons {
         height: 3;
@@ -299,21 +299,21 @@ class NoteScreen(ModalScreen[Optional[tuple[str, str, Optional[str]]]]):
     #dialog {
         width: 70;
         height: 12;
-        border: round bright_yellow;
+        border: round ansi_bright_yellow;
         background: black;
         padding: 1 2;
     }
     #dialog Label.title {
-        color: bright_yellow;
+        color: ansi_bright_yellow;
         text-style: bold;
         margin-bottom: 1;
     }
     Input {
         background: black;
-        color: bright_yellow;
+        color: ansi_bright_yellow;
         border: round yellow;
     }
-    Input:focus { border: round bright_yellow; }
+    Input:focus { border: round ansi_bright_yellow; }
     """
 
     BINDINGS = [
@@ -381,7 +381,7 @@ class MorpheusApp(App):
     #header {
         height: 9;
         background: black;
-        color: bright_green;
+        color: ansi_bright_green;
         content-align: center middle;
     }
     #body {
@@ -400,7 +400,7 @@ class MorpheusApp(App):
     }
     #alerts-panel {
         height: 14;
-        border: round bright_yellow;
+        border: round ansi_bright_yellow;
         background: black;
         color: white;
     }
@@ -409,18 +409,18 @@ class MorpheusApp(App):
     }
     DataTable > .datatable--header {
         background: black;
-        color: bright_green;
+        color: ansi_bright_green;
         text-style: bold;
     }
     DataTable > .datatable--cursor {
-        background: bright_green 25%;
+        background: ansi_bright_green 25%;
     }
     DataTable > .datatable--hover {
         background: green 15%;
     }
     Footer {
         background: black;
-        color: bright_green;
+        color: ansi_bright_green;
     }
     """
 
@@ -741,6 +741,14 @@ class MorpheusApp(App):
             f"## Buffer\n\n```\n{tab.buffer}\n```\n"
         )
         out_path.write_text(body)
+        if m.mission_id:
+            db.add_artifact(
+                m.mission_id,
+                kind="snapshot",
+                path_or_url=str(out_path),
+                status="unknown",
+                summary=f"Snapshot for {m.goal or tab_id}",
+            )
         self._push_alert(Alert(
             time.time(), "spawn",
             f"snapshot → {out_path.name}",

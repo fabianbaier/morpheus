@@ -52,6 +52,7 @@ def list_sessions() -> list[dict]:
     for m in db.all_missions():
         out.append({
             "tab_id": m.tab_id,
+            "mission_id": m.mission_id,
             "tab_short": (m.tab_id or "").split("-")[0],
             "goal": m.goal,
             "state": m.state,
@@ -77,9 +78,13 @@ def get_session(tab_prefix: str) -> dict:
     if match is None:
         return {"found": False, "error": f"no tab matching '{tab_prefix}'"}
     notes = db.notes_for_tab(match.tab_id, limit=10)
+    memory = db.get_memory(match.mission_id) if match.mission_id else None
+    events = db.recent_events(match.mission_id, limit=10) if match.mission_id else []
+    artifacts = db.artifacts_for_mission(match.mission_id, limit=10) if match.mission_id else []
     return {
         "found": True,
         "tab_id": match.tab_id,
+        "mission_id": match.mission_id,
         "goal": match.goal,
         "state": match.state,
         "last_event": match.last_event,
@@ -87,6 +92,35 @@ def get_session(tab_prefix: str) -> dict:
         "linked_pr": match.linked_pr,
         "linked_worktree": match.linked_worktree,
         "age_secs": max(0, time.time() - match.buffer_changed_at),
+        "memory": (
+            {
+                "title": memory.title,
+                "why": memory.why,
+                "done_definition": memory.done_definition,
+                "acceptance_criteria": memory.acceptance_criteria,
+                "phase": memory.phase,
+                "next_step": memory.next_step,
+                "blocked_on": memory.blocked_on,
+                "confidence": memory.confidence,
+                "source_kind": memory.source_kind,
+                "source_ref": memory.source_ref,
+            }
+            if memory else None
+        ),
+        "events": [
+            {
+                "id": e.id, "kind": e.kind, "actor": e.actor,
+                "summary": e.summary, "source_ref": e.source_ref, "ts": e.ts,
+            }
+            for e in events
+        ],
+        "artifacts": [
+            {
+                "id": a.id, "kind": a.kind, "path_or_url": a.path_or_url,
+                "status": a.status, "summary": a.summary, "ts": a.created_at,
+            }
+            for a in artifacts
+        ],
         "notes": [
             {"id": n.id, "text": n.text, "kind": n.kind, "ts": n.created_at}
             for n in notes
