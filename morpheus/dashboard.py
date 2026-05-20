@@ -64,6 +64,8 @@ RAIN_INTERVAL_SECONDS = 2.0
 RAIN_SLOW_FRAME_SECONDS = 0.14
 TABLE_REFRESH_SECONDS = 1.0
 TERMINAL_TAIL_SCAN_CHARS = 20_000
+COMPACT_LAYOUT_WIDTH = 120
+COMPACT_LAYOUT_HEIGHT = 32
 
 STATE_TEXT_STYLE = {
     "blocked":  "bold bright_red",
@@ -1999,6 +2001,7 @@ class MorpheusApp(App):
     }
     #rain-panel {
         width: 28%;
+        height: 100%;
         border: round green;
         background: black;
         color: green;
@@ -2006,11 +2009,13 @@ class MorpheusApp(App):
     }
     #missions-panel {
         width: 42%;
+        height: 100%;
         border: round green;
         background: black;
     }
     #mission-card-panel {
         width: 30%;
+        height: 100%;
         border: round green;
         background: black;
         color: white;
@@ -2040,6 +2045,22 @@ class MorpheusApp(App):
         background: black;
         color: ansi_bright_green;
     }
+    Screen.compact #header {
+        height: 3;
+    }
+    Screen.compact #alerts-panel {
+        height: 8;
+    }
+    Screen.compact #rain-panel {
+        width: 24%;
+    }
+    Screen.compact #missions-panel {
+        width: 46%;
+    }
+    Screen.compact #mission-card-panel {
+        width: 30%;
+        padding: 0 0;
+    }
     """
 
     def __init__(self):
@@ -2060,12 +2081,7 @@ class MorpheusApp(App):
     # ── compose ────────────────────────────────────────────────────────────
 
     def compose(self) -> ComposeResult:
-        banner = Text(BANNER, style="bold bright_green", justify="center")
-        sub = Text(
-            f"\nmission control v{__version__}  •  {RABBIT} follow the white rabbit",
-            style=COL_MUTED, justify="center",
-        )
-        yield Static(banner + sub, id="header")
+        yield Static(self._header_text(compact=False), id="header")
         with Horizontal(id="body"):
             yield RainWidget(id="rain-panel")
             yield MissionsTable(id="missions-panel")
@@ -2073,10 +2089,43 @@ class MorpheusApp(App):
         yield RichLog(id="alerts-panel", markup=False, wrap=False, highlight=False)
         yield Footer()
 
+    def _header_text(self, *, compact: bool) -> Text:
+        if compact:
+            title = Text("MORPHEUS", style="bold bright_green", justify="center")
+            sub = Text(
+                f"\nmission control v{__version__}  •  {RABBIT} follow the white rabbit",
+                style=COL_MUTED,
+                justify="center",
+            )
+            return title + sub
+        banner = Text(BANNER, style="bold bright_green", justify="center")
+        sub = Text(
+            f"\nmission control v{__version__}  •  {RABBIT} follow the white rabbit",
+            style=COL_MUTED,
+            justify="center",
+        )
+        return banner + sub
+
+    def on_resize(self, event) -> None:
+        self._apply_layout_mode()
+
+    def _apply_layout_mode(self) -> None:
+        compact = (
+            self.size.width < COMPACT_LAYOUT_WIDTH
+            or self.size.height < COMPACT_LAYOUT_HEIGHT
+        )
+        try:
+            self.screen.set_class(compact, "compact")
+            self.query_one("#header", Static).update(self._header_text(compact=compact))
+            self.screen.refresh(layout=True)
+        except Exception:
+            pass
+
     # ── mount + intervals ──────────────────────────────────────────────────
 
     async def on_mount(self) -> None:
         self.log_handle = core.setup_logging()
+        self._apply_layout_mode()
 
         # Watermarks so we don't replay existing notes/sessions as fresh alerts.
         try:
@@ -2820,7 +2869,13 @@ class MorpheusApp(App):
                 time.time(), "spawn",
                 f"PRD run [{run.title}] coordinator spawned {info.tab_id.split('-')[0]}",
             ))
-        # Alert will fire on next _scan_new_missions.
+        try:
+            missions = db.all_missions()
+            self.current_missions = missions
+            self._scan_new_missions(missions)
+            self._refresh_table()
+        except Exception:
+            pass
 
     def _selected_worktree_or_cwd(self) -> Path:
         try:
