@@ -101,6 +101,19 @@ TRAILING_DISCLAIMER_RE = re.compile(
     r"\s+(?:This is )?not (?:financial|legal|medical) advice\.?$",
     re.IGNORECASE,
 )
+PASSIVE_SPAWN_GOALS = {
+    "",
+    "python",
+    "python\"",
+    "python3",
+    "zsh",
+    "bash",
+    "sh",
+    "fish",
+    "login",
+    "terminal",
+    "iterm2",
+}
 
 # Stock-ticker row background colors (entire row paints this color for ~3s
 # after a state change, then settles back to default).
@@ -706,6 +719,13 @@ def _clean_terminal_line(value: str, strip: bool = True) -> str:
     cleaned = CONTROL_RE.sub("", cleaned)
     cleaned = cleaned.replace("\t", "    ")
     return cleaned.strip() if strip else cleaned
+
+
+def _is_passive_spawn_noise(mission: db.Mission) -> bool:
+    if mission.cmd:
+        return False
+    goal = _clean_terminal_line(mission.goal or "").strip().lower()
+    return goal in PASSIVE_SPAWN_GOALS
 
 
 def _session_headline(
@@ -3594,10 +3614,11 @@ class MorpheusApp(App):
             if m is None:
                 continue
             self.flashing[t] = (time.time() + FLASH_DURATION, m.state or "working")
-            self._push_alert(Alert(
-                time.time(), "spawn",
-                f"new session [{m.goal or '(untitled)'}] {t.split('-')[0]}",
-            ))
+            if not _is_passive_spawn_noise(m):
+                self._push_alert(Alert(
+                    time.time(), "spawn",
+                    f"new session [{m.goal or '(untitled)'}] {t.split('-')[0]}",
+                ))
         for t in closed_tabs:
             if self._is_self_tab_id(t):
                 self.live_buffers.pop(t, None)
@@ -3975,13 +3996,14 @@ class MorpheusApp(App):
         }
         self.last_seen_tabs = {mission.tab_id for mission in self._all_missions()}
         self._refresh_table()
-        self._push_alert(
-            Alert(
-                time.time(),
-                "close",
-                f"nuked project [{cleanup.name or cleanup.tenant_id}]: closed {closed} tabs, removed {cleanup.total_deleted} DB rows",
+        try:
+            self.notify(
+                f"nuked project [{cleanup.name or cleanup.tenant_id}]: "
+                f"closed {closed} tabs, removed {cleanup.total_deleted} DB rows",
+                title="Project cleanup",
             )
-        )
+        except Exception:
+            pass
 
     def _handle_project_cleanup_result(self, result: ProjectSwitchRequest) -> None:
         if result.show_all or not result.tenant_id:
@@ -4013,13 +4035,14 @@ class MorpheusApp(App):
             pass
         self._refresh_table()
         action = "pruned" if result.action == "prune" else "deleted"
-        self._push_alert(
-            Alert(
-                time.time(),
-                "summary",
-                f"{action} project [{cleanup.name or cleanup.tenant_id}] ({cleanup.total_deleted} DB rows)",
+        try:
+            self.notify(
+                f"{action} project [{cleanup.name or cleanup.tenant_id}] "
+                f"({cleanup.total_deleted} DB rows)",
+                title="Project cleanup",
             )
-        )
+        except Exception:
+            pass
 
     def action_toggle_card_details(self) -> None:
         try:

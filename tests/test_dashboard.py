@@ -272,6 +272,21 @@ class DashboardTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("older ready headline", rich_log.lines[1])
         self.assertGreaterEqual(rich_log.clear_count, 2)
 
+    def test_passively_observed_python_tab_does_not_pollute_ticker(self) -> None:
+        app = DashboardHarness()
+        mission = dashboard.db.Mission(
+            tab_id="tab-python-14",
+            goal='Python"',
+            state="working",
+            cmd="",
+        )
+
+        app._scan_new_missions([mission])
+
+        self.assertEqual(len(app.alerts), 0)
+        self.assertEqual(app.last_seen_tabs, {"tab-python-14"})
+        self.assertIn("tab-python-14", app.flashing)
+
     def test_edit_mission_screen_parses_claims_and_pr(self) -> None:
         memory = dashboard.db.MissionMemory(
             mission_id="m_20260520000102_abcd1234",
@@ -650,7 +665,7 @@ class DashboardTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(app.tenant_id, "")
         self.assertEqual(captured["ledger"][0], "project_delete")
         self.assertEqual(captured["ledger"][2]["deleted"], cleanup.deleted)
-        self.assertIn("deleted project", app.alerts[-1].text)
+        self.assertEqual(len(app.alerts), 0)
 
     async def test_project_switch_key_opens_switcher(self) -> None:
         project = dashboard.db.ProjectTenant(
@@ -758,7 +773,7 @@ class DashboardTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(app.show_all)
         self.assertEqual(app.tenant_id, "")
         self.assertEqual(app.live_buffers, {})
-        self.assertIn("nuked project", app.alerts[-1].text)
+        self.assertEqual(len(app.alerts), 0)
 
     async def test_finished_session_pushes_summary_ticker_and_event(self) -> None:
         app = DashboardHarness()

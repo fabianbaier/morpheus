@@ -306,6 +306,10 @@ Required live-stream behavior:
 - The ticker display order is newest-first. A new ready/completed/headline item
   should appear at the top of the rabbit strip so the freshest thing demanding
   attention is visible without scrolling.
+- Passive terminal discovery and successful project cleanup/admin bookkeeping
+  should not appear in the white-rabbit ticker. Generic shell/app tabs such as
+  `Python"`, `zsh`, or `Terminal` may still appear in the mission table when
+  observed, but the ticker should stay reserved for meaningful work signals.
 
 Acceptance test: start a Codex session that performs a web search, keep focus
 in Morpheus, and verify the cockpit shows the search/tool progress and latest
@@ -914,7 +918,7 @@ This table is the source of truth for where the product stands right now.
 | Robust self-tab exclusion | Implemented in v0.7.0a6 | Dashboard passes its own tab/session IDs into the watcher; core also recognizes the Morpheus screen by buffer if iTerm leaves the title as `Python"` |
 | Ready-response rabbit ticker | Implemented in v0.8.0a2 | `working → idle` now emits a `ready [...]` headline by extracting the latest assistant answer block, skipping Codex chrome/separators/source URLs, and compressing it to one sentence |
 | Idle ticker reconciliation | Implemented in v0.8.0a23 | The dashboard reconciles recently idle observed sessions into the white-rabbit ticker even if another watcher updated SQLite before the cockpit saw the state transition |
-| White-rabbit ticker noise reduction | Implemented in v0.8.0a24 | Successful focus actions and closed-row dismiss/prune bookkeeping stay silent so the ticker remains reserved for work signals, failures, collisions, spawns, loops, and ready/completed summaries |
+| White-rabbit ticker noise reduction | Implemented in v0.8.0a24, expanded in v0.8.0a34 | Successful focus actions, closed-row dismiss/prune bookkeeping, project cleanup confirmations, and passively observed generic shell tabs stay silent so the ticker remains reserved for work signals, failures, collisions, Morpheus-launched spawns, loops, and ready/completed summaries |
 | Cached activity snapshot | Implemented in v0.8.0a25 | The watch loop writes `~/.morpheus/activity.json` with per-session headline and tail lines so agents can answer what live sessions are doing from a cached file; `morpheus activity` reads that cache instantly and `--refresh` forces a live iTerm poll only when needed |
 | Newest-first rabbit ticker | Implemented in v0.8.0a3 | Bottom alert strip redraws from the newest-first alert deque so fresh session headlines stay at the top instead of appending chronologically |
 | Prompt loops foundation | Implemented in v0.8.0a4 | `l` creates recurring prompt loops; `morpheus loops run-due` runs due prompts, captures output, publishes ticker notes, and routes graph events/artifacts to target missions |

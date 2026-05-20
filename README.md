@@ -106,8 +106,10 @@ The cockpit has four main areas:
   underneath.
 - **Right: mission card** - The selected session's latest useful output first,
   then optional mission metadata, events, and artifacts.
-- **Bottom: ticker** - Newest-first headlines for spawns, blocked prompts,
-  collisions, notes, loop results, and ready/completed session summaries.
+- **Bottom: ticker** - Newest-first headlines for Morpheus-launched spawns,
+  blocked prompts, collisions, notes, loop results, and ready/completed session
+  summaries. Passive shell discovery and project cleanup bookkeeping stay out
+  of this feed.
 
 ### Normal Flow
 
@@ -407,11 +409,12 @@ MCP mission graph update tools, direct terminal broadcast, dense always-alive
 Matrix rain, live status rain pulses, a low-FPS rain render path, a zoom-safe
 compact cockpit layout, exact Codex closed-session provider resume, closed-row
 dismissal, idle ticker reconciliation, project-scoped loop rows, and a skippable
-Matrix Earth startup intro. Success-only focus and closed-row dismiss/prune
-actions stay out of the white-rabbit ticker, and `morpheus activity` exposes the
-cached live activity snapshot without reconnecting to iTerm. `morpheus graph
-recall-eval` scores stale mission recall readiness, and PRD parent rows remember
-collapsed tree state across dashboard restarts.
+Matrix Earth startup intro. Success-only focus, closed-row dismiss/prune,
+project cleanup, and passively imported generic shell tabs stay out of the
+white-rabbit ticker, and `morpheus activity` exposes the cached live activity
+snapshot without reconnecting to iTerm. `morpheus graph recall-eval` scores
+stale mission recall readiness, and PRD parent rows remember collapsed tree
+state across dashboard restarts.
 
 Next implementation phases:
 
