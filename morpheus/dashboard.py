@@ -241,6 +241,8 @@ class LiveStreamWidget(Static):
         self.buffers: dict[str, LiveBuffer] = {}
         self.selected_tab_id: Optional[str] = None
         self.shards: dict[str, StreamShard] = {}
+        self._has_active_rain = False
+        self._idle_placeholder_rendered = False
 
     def on_show(self) -> None:
         self._ensure_rain()
@@ -266,6 +268,7 @@ class LiveStreamWidget(Static):
     def update_buffers(self, buffers: dict[str, LiveBuffer], selected_tab_id: Optional[str]) -> None:
         self.buffers = buffers
         self.selected_tab_id = selected_tab_id
+        self._idle_placeholder_rendered = False
         self._sync_shards()
         self._render_live()
 
@@ -274,6 +277,13 @@ class LiveStreamWidget(Static):
             self._ensure_rain()
         if self.rain is None:
             return
+        self._has_active_rain = bool(missions)
+        if not missions and not self.buffers:
+            if not self._idle_placeholder_rendered:
+                self.update(Text("awaiting live streams", style=COL_DIMMER))
+                self._idle_placeholder_rendered = True
+            return
+        self._idle_placeholder_rendered = False
         self.rain.update_missions(missions)
         self.rain.tick()
         self._sync_shards()
@@ -281,11 +291,15 @@ class LiveStreamWidget(Static):
         self._render_live()
 
     def _render_live(self) -> None:
+        ordered = self._ordered_buffers()
+        if not ordered and not self._has_active_rain:
+            self.update(Text("awaiting live streams", style=COL_DIMMER))
+            return
+
         width = max(24, self.size.width - 4)
         height = max(6, self.size.height - 2)
         grid = self._rain_grid(width, height)
 
-        ordered = self._ordered_buffers()
         if not ordered:
             self._overlay_text(grid, 0, 0, "awaiting live streams", COL_DIMMER)
             self.update(self._grid_to_text(grid))
@@ -327,8 +341,18 @@ class LiveStreamWidget(Static):
     def _grid_to_text(self, grid: list[list[tuple[str, str]]]) -> Text:
         out = Text()
         for y, row in enumerate(grid):
+            run = ""
+            run_style = row[0][1] if row else ""
             for ch, style in row:
-                out.append(ch, style=style)
+                if style != run_style:
+                    if run:
+                        out.append(run, style=run_style)
+                    run = ch
+                    run_style = style
+                else:
+                    run += ch
+            if run:
+                out.append(run, style=run_style)
             if y < len(grid) - 1:
                 out.append("\n")
         return out
@@ -1926,6 +1950,7 @@ class MorpheusApp(App):
         width: 28%;
         border: round green;
         background: black;
+        color: green;
         padding: 0 0;
     }
     #missions-panel {

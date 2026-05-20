@@ -82,14 +82,15 @@ Run the cockpit:
 morpheus
 ```
 
-Inside the cockpit, the left panel is a Matrix rain field made from active
-sessions: recent terminal output appears as bright falling shards inside the
-rain, with selected and urgent sessions rendered more prominently. The mission
-table controls selection, and the right card prioritizes the selected mission's
-latest terminal output. Press `space` to expand or collapse the graph metadata,
-events, and artifacts underneath it. Use `j`/`k` or arrows to move, then press
-`b` for a cited graph/transcript brief, `e` to correct mission memory, or
-`r` to snapshot and resume the mission in a fresh tab. Press `Enter` to jump
+Inside the cockpit, the left panel is a dense Matrix rain field made from active
+sessions: recent terminal output appears as bright falling shards inside a
+constant dim glyph stream, with selected and urgent sessions rendered more
+prominently. The mission table controls selection, and the right card
+prioritizes the selected mission's latest terminal output. Press `space` to
+expand or collapse the graph metadata, events, and artifacts underneath it. Use
+`j`/`k` or arrows to move, then press `b` for a cited graph/transcript brief,
+`e` to correct mission memory, or `r` to snapshot and resume the mission in a
+fresh tab. Press `Enter` to jump
 into the real iTerm tab when you need to respond directly. Use `n` to spawn a
 new session without leaving Morpheus. The bottom white-rabbit
 strip acts like a ticker: blocked prompts, collisions, spawns, notes,
@@ -300,11 +301,12 @@ make daemon
 
 ## Roadmap
 
-Current status: v0.8.0a14 has PRD Runs foundation, PRD tree/manual workers,
+Current status: v0.8.0a15 has PRD Runs foundation, PRD tree/manual workers,
 newest-first ready tickers, prompt loops foundation, nonblocking/Markdown PRD
 picker, edit mission flow, selected mission briefs, PRD parent cleanup, and an
 output-first mission card, plus a user PATH install target, resume-fresh, and
-MCP mission graph update tools and direct terminal broadcast.
+MCP mission graph update tools, direct terminal broadcast, and dense
+always-alive Matrix rain.
 
 Next implementation phases:
 
@@ -331,6 +333,7 @@ Next implementation phases:
    session linked by a `spawned_from` edge. Done in `0.8.0a12`.
 21. MCP mission graph update tools. Done in `0.8.0a13`.
 22. Direct terminal broadcast via iTerm. Done in `0.8.0a14`.
-23. 48-hour recall eval.
+23. Dense Matrix rain baseline. Done in `0.8.0a15`.
+24. 48-hour recall eval.
 
 > "I can only show you the door. You're the one that has to walk through it."

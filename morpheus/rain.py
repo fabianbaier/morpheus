@@ -34,9 +34,13 @@ SPEED_FOR_STATE = {
     "unknown":  6,
 }
 
-# Empty/decoration columns drop very slowly.
-DECO_SPEED_MIN = 4
-DECO_SPEED_MAX = 10
+# Empty/decoration columns should still feel alive when session output is quiet.
+DECO_SPEED_MIN = 2
+DECO_SPEED_MAX = 5
+AMBIENT_DENSITY = 0.18
+ACTIVE_AMBIENT_DENSITY = 0.26
+AMBIENT_CHURN = 0.22
+AMBIENT_MOD = 100
 
 
 @dataclass
@@ -49,14 +53,41 @@ class _Column:
     length: int = 12
     speed_ticks: int = 6
     tick_counter: int = 0
-    chars: list[str] = None      # populated in __post_init__
+    chars: list[str] | None = None      # populated in __post_init__
+    ambient: list[str] | None = None
+    ambient_phase: int = 0
     decorative: bool = False     # not tied to a real mission
 
     def __post_init__(self):
         if self.chars is None:
-            self.chars = [random.choice(CHARS) for _ in range(max(self.height, 1))]
-        self.head_y = random.randint(-self.height, 0)
-        self.length = random.randint(8, max(10, self.height // 2 + 4))
+            self._reset_chars()
+        if self.ambient is None:
+            self._reset_ambient()
+        self.length = self._new_length()
+        self._reset_head(initial=True)
+
+    def _reset_chars(self) -> None:
+        self.chars = [random.choice(CHARS) for _ in range(max(self.height, 1))]
+
+    def _reset_ambient(self) -> None:
+        self.ambient = [random.choice(CHARS) for _ in range(max(self.height, 1))]
+        self.ambient_phase = random.randint(0, AMBIENT_MOD - 1)
+
+    def _new_length(self) -> int:
+        return random.randint(8, max(10, self.height // 2 + 4))
+
+    def _reset_head(self, *, initial: bool = False) -> None:
+        if self.decorative:
+            if initial:
+                self.head_y = random.randint(0, max(0, self.height - 1))
+                return
+            self.head_y = -random.randint(0, max(1, self.height // 5))
+            return
+        self.head_y = (
+            random.randint(-self.height, 0)
+            if initial
+            else -random.randint(0, max(1, self.height // 2))
+        )
 
     # ── state changes ──────────────────────────────────────────────────────
 
@@ -69,6 +100,11 @@ class _Column:
     # ── per-frame advance ──────────────────────────────────────────────────
 
     def tick(self) -> None:
+        self.ambient_phase = (self.ambient_phase + 1) % AMBIENT_MOD
+        if self.decorative and self.chars and self.ambient and random.random() < AMBIENT_CHURN:
+            pos = random.randrange(len(self.chars))
+            self.chars[pos] = random.choice(CHARS)
+            self.ambient[pos % len(self.ambient)] = random.choice(CHARS)
         self.tick_counter += 1
         if self.tick_counter < self.speed_ticks:
             return
@@ -79,18 +115,18 @@ class _Column:
             self.chars[self.head_y] = random.choice(CHARS)
         if self.head_y - self.length > self.height:
             # Restart with a random delay before the next drop.
-            self.head_y = -random.randint(0, max(1, self.height // 2))
-            self.length = random.randint(8, max(10, self.height // 2 + 4))
-            self.chars = [random.choice(CHARS) for _ in range(self.height)]
+            self._reset_head()
+            self.length = self._new_length()
+            self._reset_chars()
+            self._reset_ambient()
 
     # ── per-cell rendering ─────────────────────────────────────────────────
 
     def get_cell(self, y: int) -> tuple[str, str]:
-        # Outside the visible tail = blank.
         if y > self.head_y or y < self.head_y - self.length or y < 0 or y >= self.height:
-            return " ", ""
+            return self._ambient_cell(y)
         offset = self.head_y - y
-        ch = self.chars[y]
+        ch = self.chars[y] if self.chars else random.choice(CHARS)
 
         # Crashed: erratic red glitch.
         if self.state == "crashed":
@@ -107,6 +143,8 @@ class _Column:
             return ch, "yellow"
 
         # Green spectrum for working / idle / finished / unknown / decorative.
+        if self.decorative:
+            return ch, "bold bright_green" if offset == 0 else ""
         if offset == 0:
             # Bright white head for active, bright green head otherwise.
             return ch, "bold white" if self.state == "working" else "bold bright_green"
@@ -115,6 +153,27 @@ class _Column:
         if offset < 8:
             return ch, "green"
         return ch, "color(22)"  # dim dark green
+
+    def _ambient_cell(self, y: int) -> tuple[str, str]:
+        density = (
+            ACTIVE_AMBIENT_DENSITY
+            if self.state in {"working", "blocked", "crashed"}
+            else AMBIENT_DENSITY
+        )
+        if self.decorative:
+            density = AMBIENT_DENSITY
+        threshold = max(0, min(AMBIENT_MOD, int(density * AMBIENT_MOD)))
+        gate = (self.x * 37 + y * 17 + self.ambient_phase * 23) % AMBIENT_MOD
+        if gate >= threshold:
+            return " ", ""
+        ch = self.ambient[y % len(self.ambient)] if self.ambient else CHARS[(self.x + y) % len(CHARS)]
+        if self.state == "crashed":
+            return ch, "red"
+        if self.state == "blocked":
+            return ch, "yellow"
+        if self.state == "working":
+            return ch, "color(28)"
+        return ch, ""
 
 
 class Rain:
@@ -125,6 +184,7 @@ class Rain:
         self.rows = max(1, rows)
         self.columns: list[_Column] = []
         self._mission_xs: dict[str, int] = {}
+        self._fill_decorative_columns()
 
     # ── geometry ───────────────────────────────────────────────────────────
 
@@ -136,8 +196,26 @@ class Rain:
         # Reset columns to match new geometry.
         for col in self.columns:
             col.height = self.rows
-            col.chars = [random.choice(CHARS) for _ in range(self.rows)]
-            col.head_y = random.randint(-self.rows, 0)
+            col.length = col._new_length()
+            col._reset_chars()
+            col._reset_ambient()
+            col._reset_head(initial=True)
+        self.columns = [col for col in self.columns if 0 <= col.x < self.cols]
+        self._fill_decorative_columns()
+
+    def _new_decorative_column(self, x: int) -> _Column:
+        return _Column(
+            x=x, height=self.rows, state="unknown", goal="",
+            decorative=True,
+            speed_ticks=random.randint(DECO_SPEED_MIN, DECO_SPEED_MAX),
+        )
+
+    def _fill_decorative_columns(self) -> None:
+        used_xs = {col.x for col in self.columns if 0 <= col.x < self.cols}
+        for x in range(self.cols):
+            if x not in used_xs:
+                self.columns.append(self._new_decorative_column(x))
+        self.columns.sort(key=lambda c: c.x)
 
     # ── reconcile mission columns ──────────────────────────────────────────
 
@@ -154,8 +232,6 @@ class Rain:
         spacing = max(2, self.cols // max(1, len(sorted_m) or 1))
         spacing = min(spacing, 4)
 
-        existing_by_tab = {tab_id: col for tab_id, col in zip(self._mission_xs.keys(), self.columns)
-                           if tab_id in self._mission_xs}
         new_cols: list[_Column] = []
         used_xs: set[int] = set()
         new_mission_xs: dict[str, int] = {}
@@ -183,11 +259,7 @@ class Rain:
             # Reuse existing decorative col if at same x.
             deco = next((c for c in self.columns if c.decorative and c.x == x), None)
             if deco is None:
-                deco = _Column(
-                    x=x, height=self.rows, state="unknown", goal="",
-                    decorative=True,
-                    speed_ticks=random.randint(DECO_SPEED_MIN, DECO_SPEED_MAX),
-                )
+                deco = self._new_decorative_column(x)
             new_cols.append(deco)
 
         new_cols.sort(key=lambda c: c.x)
