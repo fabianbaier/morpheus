@@ -435,6 +435,67 @@ class DashboardTest(unittest.IsolatedAsyncioTestCase):
 
         sync_shards.assert_called_once()
 
+    def test_new_stream_update_replaces_top_line_and_drops_old_line(self) -> None:
+        stream = dashboard.LiveStreamWidget()
+        stream.buffers = {
+            "tab-123456": LiveBuffer(
+                tab_id="tab-123456",
+                goal="X",
+                state="working",
+                last_event="active output",
+                buffer="First useful status.",
+                observed_at=1,
+            )
+        }
+
+        with patch.object(dashboard.time, "monotonic", return_value=1.0):
+            stream._sync_shards()
+
+        stream.buffers["tab-123456"] = LiveBuffer(
+            tab_id="tab-123456",
+            goal="X",
+            state="working",
+            last_event="active output",
+            buffer="Second useful status.",
+            observed_at=2,
+        )
+        with patch.object(dashboard.time, "monotonic", return_value=2.0):
+            stream._sync_shards()
+
+        current = stream.shards["tab-123456"]
+        self.assertEqual(current.x, 0)
+        self.assertEqual(current.y, 0)
+        self.assertIn("Second usefu", current.text)
+        self.assertEqual(len(stream.falling_shards), 1)
+        self.assertEqual(stream.falling_shards[0].x, 0)
+        self.assertGreaterEqual(stream.falling_shards[0].y, 1)
+        self.assertIn("First useful", stream.falling_shards[0].text)
+
+    def test_idle_stream_adds_capped_matrix_pulses_without_replacing_status(self) -> None:
+        stream = dashboard.LiveStreamWidget()
+        stream.buffers = {
+            "tab-123456": LiveBuffer(
+                tab_id="tab-123456",
+                goal="current debate on X",
+                state="working",
+                last_event="active output",
+                buffer="Latest real status.",
+                observed_at=1,
+            )
+        }
+
+        with patch.object(dashboard.time, "monotonic", return_value=1.0):
+            stream._sync_shards_if_needed()
+        current_text = stream.shards["tab-123456"].text
+
+        for step in range(dashboard.MAX_FALLING_STREAM_SHARDS + 4):
+            with patch.object(dashboard.time, "monotonic", return_value=3.0 + step):
+                stream._sync_shards_if_needed()
+
+        self.assertEqual(stream.shards["tab-123456"].text, current_text)
+        self.assertEqual(len(stream.falling_shards), dashboard.MAX_FALLING_STREAM_SHARDS)
+        self.assertTrue(all(shard.ambient for shard in stream.falling_shards))
+
     def test_header_shows_project_root_and_hidden_count(self) -> None:
         project = dashboard.db.ProjectTenant(
             tenant_id="p_current",
