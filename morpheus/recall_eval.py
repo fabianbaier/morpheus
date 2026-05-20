@@ -29,10 +29,12 @@ FAIL_RE = re.compile(
     r"(?:pass(?:ed|ing)?|succeed(?:ed)?|success(?:ful)?|ok|verified)\b"
     r"|\bunverified\b"
 )
-NO_FAILURE_RE = re.compile(r"\b(?:0|zero|no)\s+(?:failures?|errors?)\b")
+NO_FAILURE_RE = re.compile(
+    r"\b(?:0|zero|no)\s+(?:failures?|errors?)(?:\s+(?:or|and)\s+(?:failures?|errors?))*\b"
+)
 POSITIVE_FAILURE_COUNT_RE = re.compile(r"\b(?:[1-9]\d*|some|multiple)\s+(?:failures?|errors?)\b")
 FAILURE_WORD_RE = re.compile(r"\bfailures?\b")
-ERROR_WORD_RE = re.compile(r"\berrors?\b(?!\s+handling\b)")
+ERROR_WORD_RE = re.compile(r"\berrors?\b(?![\s-]+handling\b)")
 
 
 @dataclass(frozen=True)

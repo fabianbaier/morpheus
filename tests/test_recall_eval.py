@@ -207,7 +207,9 @@ class RecallEvalLogicTest(unittest.TestCase):
             "build succeeded",
             "10 passed, 0 errors",
             "tests passed with no failures",
+            "tests passed with no failures or errors",
             "error handling tests passed",
+            "error-handling tests passed",
         ):
             with self.subTest(summary=summary):
                 event = db.MissionEvent(
