@@ -296,6 +296,14 @@ class DashboardTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(rendered, "The fix is to store run state in the mission graph.")
 
+    def test_session_headline_scans_recent_tail_of_large_buffers(self) -> None:
+        rendered = _session_headline(
+            ("old noise\n" * 5000) + "The recent answer is what matters here.",
+            fallback="idle",
+        )
+
+        self.assertEqual(rendered, "The recent answer is what matters here.")
+
     def test_stream_shard_text_embeds_live_output_in_mission_label(self) -> None:
         live = LiveBuffer(
             tab_id="tab-123456",
@@ -316,13 +324,44 @@ class DashboardTest(unittest.IsolatedAsyncioTestCase):
         stream = dashboard.LiveStreamWidget()
 
         with (
-            patch.object(stream, "_sync_shards") as sync_shards,
+            patch.object(stream, "_sync_shards_if_needed") as sync_shards,
             patch.object(stream, "_render_live") as render_live,
         ):
             stream.update_buffers({}, None, render=False)
 
         sync_shards.assert_called_once()
         render_live.assert_not_called()
+
+    def test_live_stream_update_buffers_can_skip_sync_and_render(self) -> None:
+        stream = dashboard.LiveStreamWidget()
+
+        with (
+            patch.object(stream, "_sync_shards_if_needed") as sync_shards,
+            patch.object(stream, "_render_live") as render_live,
+        ):
+            stream.update_buffers({}, None, render=False, sync=False)
+
+        sync_shards.assert_not_called()
+        render_live.assert_not_called()
+
+    def test_sync_shards_only_when_buffer_signature_changes(self) -> None:
+        stream = dashboard.LiveStreamWidget()
+        stream.buffers = {
+            "tab-123456": LiveBuffer(
+                tab_id="tab-123456",
+                goal="current debate on X",
+                state="working",
+                last_event="active output",
+                buffer="Searching the web\nTwo debate clusters are driving the timeline.",
+                observed_at=1,
+            )
+        }
+
+        with patch.object(stream, "_sync_shards") as sync_shards:
+            stream._sync_shards_if_needed()
+            stream._sync_shards_if_needed()
+
+        sync_shards.assert_called_once()
 
     async def test_finished_session_pushes_summary_ticker_and_event(self) -> None:
         app = DashboardHarness()

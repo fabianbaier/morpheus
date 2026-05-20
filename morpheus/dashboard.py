@@ -60,6 +60,9 @@ COL_MUTED   = "color(244)"
 COL_DIMMER  = "bright_black"
 COL_BODY    = "color(252)"
 COL_ACCENT  = "bright_cyan"
+RAIN_INTERVAL_SECONDS = 0.5
+RAIN_SLOW_FRAME_SECONDS = 0.14
+TERMINAL_TAIL_SCAN_CHARS = 20_000
 
 STATE_TEXT_STYLE = {
     "blocked":  "bold bright_red",
@@ -243,6 +246,7 @@ class LiveStreamWidget(Static):
         self.shards: dict[str, StreamShard] = {}
         self._has_active_rain = False
         self._idle_placeholder_rendered = False
+        self._shard_signature: tuple | None = None
 
     def on_show(self) -> None:
         self._ensure_rain()
@@ -253,6 +257,7 @@ class LiveStreamWidget(Static):
         else:
             cols, rows = self._inner_size()
             self.rain.resize(cols=cols, rows=rows)
+        self._shard_signature = None
 
     def _inner_size(self) -> tuple[int, int]:
         # Subtract a few for the panel border + padding.
@@ -271,11 +276,13 @@ class LiveStreamWidget(Static):
         selected_tab_id: Optional[str],
         *,
         render: bool = True,
+        sync: bool = True,
     ) -> None:
         self.buffers = buffers
         self.selected_tab_id = selected_tab_id
         self._idle_placeholder_rendered = False
-        self._sync_shards()
+        if sync:
+            self._sync_shards_if_needed()
         if render:
             self._render_live()
 
@@ -293,7 +300,7 @@ class LiveStreamWidget(Static):
         self._idle_placeholder_rendered = False
         self.rain.update_missions(missions)
         self.rain.tick()
-        self._sync_shards()
+        self._sync_shards_if_needed()
         self._tick_shards()
         self._render_live()
 
@@ -429,6 +436,34 @@ class LiveStreamWidget(Static):
                 speed_ticks=self._shard_speed(live),
             )
 
+    def _sync_shards_if_needed(self) -> None:
+        signature = self._current_shard_signature()
+        if signature == self._shard_signature:
+            return
+        self._shard_signature = signature
+        self._sync_shards()
+
+    def _current_shard_signature(self) -> tuple:
+        width = max(24, self.size.width - 4)
+        height = max(6, self.size.height - 2)
+        ordered = self._ordered_buffers()[:8]
+        return (
+            width,
+            height,
+            self.selected_tab_id,
+            tuple(
+                (
+                    live.tab_id,
+                    live.state,
+                    live.goal,
+                    live.last_event,
+                    live.observed_at,
+                    len(live.buffer),
+                )
+                for live in ordered
+            ),
+        )
+
     def _tick_shards(self) -> None:
         height = max(6, self.size.height - 2)
         for tab_id, shard in list(self.shards.items()):
@@ -476,6 +511,7 @@ RainWidget = LiveStreamWidget
 
 
 def _tail_lines(buffer: str, limit: int, width: int) -> list[str]:
+    buffer = _terminal_tail(buffer)
     lines = [_clean_terminal_line(line, strip=False).rstrip() for line in buffer.splitlines()]
     lines = [line for line in lines if line.strip()]
     if not lines:
@@ -510,6 +546,7 @@ def _session_headline(
 
 
 def _latest_response_lines(buffer: str) -> list[str]:
+    buffer = _terminal_tail(buffer)
     lines: list[str] = []
     for raw in reversed(buffer.splitlines()):
         line = _clean_terminal_line(raw)
@@ -523,6 +560,12 @@ def _latest_response_lines(buffer: str) -> list[str]:
             continue
         lines.append(line)
     return list(reversed(lines))
+
+
+def _terminal_tail(buffer: str, limit: int = TERMINAL_TAIL_SCAN_CHARS) -> str:
+    if len(buffer) <= limit:
+        return buffer
+    return buffer[-limit:]
 
 
 def _response_headline(lines: list[str]) -> str:
@@ -2010,6 +2053,7 @@ class MorpheusApp(App):
         self.self_tab_id: Optional[str] = None
         self.self_session_id: Optional[str] = None
         self.current_missions: list[db.Mission] = []
+        self._rain_backoff_until = 0.0
         self.log_handle = None
 
     # ── compose ────────────────────────────────────────────────────────────
@@ -2060,7 +2104,7 @@ class MorpheusApp(App):
         # Heavy tick: enumerate iTerm tabs, detect state, write DB + titles + context.
         self.set_interval(2.0, self._do_tick)
         # Light tick: animate rain.
-        self.set_interval(0.12, self._do_rain_animate)
+        self.set_interval(RAIN_INTERVAL_SECONDS, self._do_rain_animate)
         # Table re-render (catches flash-expiry without waiting for next heavy tick).
         self.set_interval(0.5, self._refresh_table)
 
@@ -2118,16 +2162,26 @@ class MorpheusApp(App):
         )
 
     def _do_rain_animate(self) -> None:
+        if not self.current_missions and not self.live_buffers:
+            return
+        now = time.time()
+        if now < self._rain_backoff_until:
+            return
+        started = time.perf_counter()
         try:
             rain_widget = self.query_one(RainWidget)
             rain_widget.update_buffers(
                 self.live_buffers,
                 self._selected_tab_id(),
                 render=False,
+                sync=False,
             )
             rain_widget.tick_rain(self.current_missions)
         except Exception:
             pass
+        elapsed = time.perf_counter() - started
+        if elapsed > RAIN_SLOW_FRAME_SECONDS:
+            self._rain_backoff_until = time.time() + min(1.0, elapsed * 2)
 
     def _refresh_table(self) -> None:
         try:
