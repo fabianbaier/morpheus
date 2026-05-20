@@ -1851,15 +1851,21 @@ class DashboardTest(unittest.IsolatedAsyncioTestCase):
         app.iterm_conn = object()
         done = asyncio.Event()
         captured = {}
+        app.project = dashboard.db.ProjectTenant(
+            tenant_id="p_parent",
+            name="bkeyID",
+            root_path="/tmp/bkeyID",
+        )
+        app.tenant_id = app.project.tenant_id
         project = dashboard.db.ProjectTenant(
-            tenant_id="p_prd",
-            name="prd",
-            root_path="/tmp",
+            tenant_id="p_nested",
+            name="bkey-devkit",
+            root_path="/tmp/bkeyID/bkey-devkit",
         )
         run = SimpleNamespace(
             parent_id="m_parent",
             title="PRD Runs",
-            prd_path=Path("/tmp/PRD.md"),
+            prd_path=Path("/tmp/bkeyID/bkey-devkit/PRD.md"),
             status_path="/tmp/status.md",
             prompt_path="/tmp/prompt.md",
         )
@@ -1876,8 +1882,12 @@ class DashboardTest(unittest.IsolatedAsyncioTestCase):
             captured["attach"] = (created_run, mission)
             done.set()
 
+        def fake_create_prd_run(path, title=None, *, project=None):
+            captured["prd_run"] = (path, title, project)
+            return run
+
         with patch.object(
-            dashboard.prd_runs, "create_prd_run", new=lambda path, title=None: run
+            dashboard.prd_runs, "create_prd_run", new=fake_create_prd_run
         ), patch.object(
             dashboard.prd_runs, "coordinator_command", new=lambda cmd, run: f"{cmd} --coordinator"
         ), patch.object(
@@ -1888,18 +1898,22 @@ class DashboardTest(unittest.IsolatedAsyncioTestCase):
             dashboard.tenant_mod, "ensure_project_tenant", new=lambda path=None: project
         ), patch.object(dashboard.db, "upsert", new=fake_upsert):
             await app._handle_new_session_result(
-                NewSessionRequest(goal="", command="codex", prd_path="/tmp/PRD.md")
+                NewSessionRequest(goal="", command="codex", prd_path="/tmp/bkeyID/bkey-devkit/PRD.md")
             )
             await asyncio.wait_for(done.wait(), timeout=1)
 
         connection, command, goal = captured["spawn"]
         self.assertIs(connection, app.iterm_conn)
-        self.assertEqual(command, "cd /tmp && codex --coordinator")
+        self.assertEqual(command, "cd /tmp/bkeyID && codex --coordinator")
         self.assertEqual(goal, "PRD Runs coordinator")
         self.assertEqual(captured["mission"].goal, "PRD Runs coordinator")
-        self.assertEqual(captured["mission"].cmd, "cd /tmp && codex --coordinator")
-        self.assertEqual(captured["mission"].tenant_id, "p_prd")
-        self.assertEqual(captured["mission"].project_root, "/tmp")
+        self.assertEqual(captured["mission"].cmd, "cd /tmp/bkeyID && codex --coordinator")
+        self.assertEqual(captured["mission"].tenant_id, "p_parent")
+        self.assertEqual(captured["mission"].project_root, "/tmp/bkeyID")
+        self.assertEqual(
+            captured["prd_run"],
+            ("/tmp/bkeyID/bkey-devkit/PRD.md", None, app.project),
+        )
         self.assertEqual(captured["attach"], (run, captured["mission"]))
 
     async def test_worker_result_spawns_child_under_prd_parent(self) -> None:
@@ -1907,16 +1921,18 @@ class DashboardTest(unittest.IsolatedAsyncioTestCase):
         app.iterm_conn = object()
         captured = {}
         project = dashboard.db.ProjectTenant(
-            tenant_id="p_worker",
-            name="worker",
-            root_path="/tmp",
+            tenant_id="p_parent",
+            name="bkeyID",
+            root_path="/tmp/bkeyID",
         )
         run = SimpleNamespace(
             parent_id="m_parent",
             title="PRD Runs",
-            prd_path=Path("/tmp/PRD.md"),
+            prd_path=Path("/tmp/bkeyID/bkey-devkit/PRD.md"),
             status_path="/tmp/status.md",
             prompt_path="/tmp/prompt.md",
+            tenant_id="p_parent",
+            project_root="/tmp/bkeyID",
         )
 
         async def fake_spawn_tab(connection, *, command, goal):
@@ -1939,7 +1955,11 @@ class DashboardTest(unittest.IsolatedAsyncioTestCase):
         ), patch.object(
             dashboard.iterm_client, "spawn_tab", new=fake_spawn_tab
         ), patch.object(
-            dashboard.tenant_mod, "ensure_project_tenant", new=lambda path=None: project
+            dashboard.db, "get_project_tenant", new=lambda tenant_id: project if tenant_id == "p_parent" else None
+        ), patch.object(
+            dashboard.tenant_mod,
+            "ensure_project_tenant",
+            side_effect=AssertionError("worker spawn should use the PRD run owner tenant"),
         ), patch.object(
             dashboard.db, "upsert", new=fake_upsert
         ), patch.object(
@@ -1959,11 +1979,11 @@ class DashboardTest(unittest.IsolatedAsyncioTestCase):
 
         connection, command, goal = captured["spawn"]
         self.assertIs(connection, app.iterm_conn)
-        self.assertEqual(command, "cd /tmp && codex --worker")
+        self.assertEqual(command, "cd /tmp/bkeyID && codex --worker")
         self.assertEqual(goal, "implement worker tree")
         self.assertEqual(captured["mission"].mission_id, "m_worker")
-        self.assertEqual(captured["mission"].tenant_id, "p_worker")
-        self.assertEqual(captured["mission"].project_root, "/tmp")
+        self.assertEqual(captured["mission"].tenant_id, "p_parent")
+        self.assertEqual(captured["mission"].project_root, "/tmp/bkeyID")
         self.assertEqual(captured["attach"][0], run)
         self.assertEqual(captured["attach"][2], "morpheus/dashboard.py")
         self.assertEqual(captured["attach"][3], "pytest tests/test_dashboard.py")
