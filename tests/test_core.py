@@ -118,6 +118,7 @@ class CoreTickTest(unittest.IsolatedAsyncioTestCase):
                 ),
                 patch.object(core.ctx_mod, "write_context_file", new=lambda: None),
                 patch.object(core.ctx_mod, "write_context_json", new=lambda: None),
+                patch.object(core.activity_mod, "write_snapshot", new=lambda observations: None),
                 patch.object(core.daemon_mod, "write_beacon", new=lambda: None),
             ):
                 mission = db.Mission(
@@ -136,6 +137,53 @@ class CoreTickTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(memory.resume_ref, resume_id)
         self.assertEqual(memory.resume_confidence, "exact")
         self.assertIn(f"cd /tmp/work && codex --yolo resume {resume_id}", memory.resume_command)
+
+    async def test_tick_writes_activity_snapshot_from_live_buffers(self) -> None:
+        tab = _tab(
+            tab_id="tab-live",
+            session_id="session-live",
+            current_name="codex",
+            cwd="/tmp/work",
+            buffer="Implemented activity snapshot.\nTests are next.",
+        )
+        captured = {}
+
+        async def fake_enumerate_tabs(connection):
+            return [tab]
+
+        async def fake_set_tab_name(connection, session_id, name):
+            return True
+
+        def fake_write_snapshot(observations):
+            captured["observations"] = list(observations)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with (
+                patch.object(db, "DB_DIR", root),
+                patch.object(db, "DB_PATH", root / "morpheus.db"),
+                patch.object(core.iterm_client, "enumerate_tabs", new=fake_enumerate_tabs),
+                patch.object(core.iterm_client, "set_tab_name", new=fake_set_tab_name),
+                patch.object(
+                    core.cfg_mod,
+                    "load",
+                    new=lambda: {
+                        "token_guard": {"enabled": False},
+                        "worktree": {"warn_on_collision": False},
+                    },
+                ),
+                patch.object(core.ctx_mod, "write_context_file", new=lambda: None),
+                patch.object(core.ctx_mod, "write_context_json", new=lambda: None),
+                patch.object(core.activity_mod, "write_snapshot", new=fake_write_snapshot),
+                patch.object(core.daemon_mod, "write_beacon", new=lambda: None),
+            ):
+                count = await core._tick(object(), FakeLogger())
+
+        self.assertEqual(count, 1)
+        self.assertEqual(len(captured["observations"]), 1)
+        observation = captured["observations"][0]
+        self.assertEqual(observation.tab_id, "tab-live")
+        self.assertIn("Tests are next", observation.buffer)
 
 
 if __name__ == "__main__":

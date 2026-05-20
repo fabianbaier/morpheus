@@ -7,6 +7,7 @@ import logging
 import time
 from pathlib import Path
 
+from morpheus import activity as activity_mod
 from morpheus import config as cfg_mod
 from morpheus import context as ctx_mod
 from morpheus import daemon as daemon_mod
@@ -54,6 +55,7 @@ async def _tick(connection, log: logging.Logger,
 
     # tab_id -> cwd  for worktree-collision detection at end of tick.
     cwd_by_tab: dict[str, str] = {}
+    activity_observations: list[activity_mod.ActivityObservation] = []
 
     for tab in tabs:
         # Skip Morpheus cockpit tabs before adding them to seen_ids, so any
@@ -105,6 +107,7 @@ async def _tick(connection, log: logging.Logger,
 
         if on_tab_observed is not None:
             await on_tab_observed(tab, prev, d)
+        activity_observations.append(activity_mod.ActivityObservation.from_tab(tab, prev))
 
         age = naming.now_minus(prev.buffer_changed_at)
         new_title = naming.build_tab_title(prev.goal, new_state, d.last_event, age)
@@ -138,6 +141,7 @@ async def _tick(connection, log: logging.Logger,
 
     # Refresh shared context snapshot so agents in other tabs can read it.
     try:
+        activity_mod.write_snapshot(activity_observations)
         ctx_mod.write_context_file()
         ctx_mod.write_context_json()
     except Exception as e:

@@ -158,6 +158,7 @@ morpheus snapshot <tab-prefix>
 morpheus prune
 morpheus brief
 morpheus ask "what needs my attention?"
+morpheus activity --all
 morpheus graph status
 morpheus graph show <mission-or-tab-prefix>
 morpheus run find-prds .
@@ -171,6 +172,7 @@ Cross-session notes:
 
 ```bash
 morpheus context -f short
+morpheus activity -f short
 morpheus note "touching src/auth/*, hold off"
 morpheus note --kind claim "claiming PR #224 worktree"
 morpheus note --kind broadcast "please verify remote commits before finishing"
@@ -344,7 +346,7 @@ make daemon
 
 ## Roadmap
 
-Current status: v0.8.0a24 has PRD Runs foundation, PRD tree/manual workers,
+Current status: v0.8.0a25 has PRD Runs foundation, PRD tree/manual workers,
 newest-first ready tickers, prompt loops foundation, nonblocking/Markdown PRD
 picker, edit mission flow, selected mission briefs, PRD parent cleanup, and an
 output-first mission card, plus a user PATH install target, resume-fresh, and
@@ -352,7 +354,8 @@ MCP mission graph update tools, direct terminal broadcast, dense always-alive
 Matrix rain, a low-FPS rain render path, a zoom-safe compact cockpit layout,
 exact Codex closed-session provider resume, closed-row dismissal, and idle
 ticker reconciliation. Success-only focus and closed-row dismiss/prune actions
-stay out of the white-rabbit ticker.
+stay out of the white-rabbit ticker, and `morpheus activity` exposes the cached
+live activity snapshot without reconnecting to iTerm.
 
 Next implementation phases:
 
@@ -389,6 +392,7 @@ Next implementation phases:
 30. Closed-row dismiss/prune actions. Done in `0.8.0a22`.
 31. Idle ticker reconciliation when another watcher observes the transition first. Done in `0.8.0a23`.
 32. White-rabbit ticker noise reduction for focus/dismiss bookkeeping. Done in `0.8.0a24`.
-33. 48-hour recall eval.
+33. Cached activity snapshot and `morpheus activity`. Done in `0.8.0a25`.
+34. 48-hour recall eval.
 
 > "I can only show you the door. You're the one that has to walk through it."
