@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| **Status** | v0.8.0a12 implemented (resume fresh); next: MCP mission tools |
+| **Status** | v0.8.0a13 implemented (MCP mission tools); next: 48-hour recall eval |
 | **Author** | Fabian Baier |
 | **Last updated** | 2026-05-20 |
 | **Target platform** | macOS + iTerm2 |
@@ -562,7 +562,7 @@ mission graph memory, provenance, loop phase, and proof tracking.
 | `morpheus/trigger.py` | GitHub PR polling and draft session spawn |
 | `morpheus/ledger.py` | Cost and action ledger tables |
 | `morpheus/config.py` | `~/.morpheus/config.toml` defaults and loader |
-| `morpheus/mcp_server.py` | MCP tools exposing read-only state + notes/claims |
+| `morpheus/mcp_server.py` | MCP tools exposing sessions, mission graph read/update, notes/claims, spend/actions |
 | `morpheus/mission_graph.py` | v0.7 graph helpers: provenance, edges, stale/lint checks |
 | `morpheus/prd_runs.py` | v0.8 PRD run helpers: PRD discovery, parent mission creation, coordinator prompt/status files |
 | `morpheus/proof.py` | v0.7 proof artifact capture and last-check summaries |
@@ -782,7 +782,7 @@ This table is the source of truth for where the product stands right now.
 | Output-first mission card | Implemented in v0.8.0a10 | The selected card shows much more latest terminal output by default and moves mission/graph metadata behind the `Space` details toggle |
 | User PATH CLI install | Implemented in v0.8.0a11 | `make install-cli` installs a safe user shim and prints a PATH hint when `~/.local/bin` is not visible to the shell |
 | Resume fresh | Implemented in v0.8.0a12 | `r` snapshots the selected live tab, spawns a seeded replacement, links new -> old with `spawned_from`, and closes/archives the old tab after spawn |
-| MCP mission tools | Partially shipped | Read-only session tools exist; graph read/update tools remain v0.7 |
+| MCP mission tools | Implemented in v0.8.0a13 | MCP exposes durable graph list/show/update, event/artifact, and mission-link tools; spawn/kill remain outside MCP |
 | 48-hour recall eval | Not implemented | Add fixture or dogfood checklist: stale mission → press `b` → know next action in <10s |
 
 ---
@@ -1044,11 +1044,13 @@ For Claude Code / Codex specifically, this can be encoded in a project
 ### 10.4 MCP integration
 
 The Morpheus MCP server exposes `list_sessions()`, `get_session(id)`,
-`get_context()`, `get_context_short()`, `post_note(text)`, `claim_path(path)`,
-`daily_spend()`, and `recent_actions()` as first-class tools. Claude Code and
-Codex can see cross-session state without shelling out. v0.7 should extend MCP
-with mission-graph read/update tools while keeping spawn/kill behind ask-first
-authorization.
+`list_missions()`, `get_mission(ref)`, `update_mission(ref, ...)`,
+`add_mission_event(ref, ...)`, `add_mission_artifact(ref, ...)`,
+`link_missions(from_ref, to_ref, ...)`, `get_context()`,
+`get_context_short()`, `post_note(text)`, `claim_path(path)`, `daily_spend()`,
+and `recent_actions()` as first-class tools. Claude Code and Codex can see and
+update cross-session mission graph state without shelling out. Spawn/kill stay
+out of MCP and remain ask-first actions.
 
 ---
 

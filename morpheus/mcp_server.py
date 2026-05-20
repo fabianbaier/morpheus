@@ -17,6 +17,12 @@ Tools exposed (all read-only OR explicitly state-mutating notes — no
 iTerm spawn/kill from MCP yet; that lives behind the CLI for v0.6):
   - list_sessions()
   - get_session(tab_prefix)
+  - list_missions(include_archived)
+  - get_mission(ref)
+  - update_mission(ref, ...)
+  - add_mission_event(ref, ...)
+  - add_mission_artifact(ref, ...)
+  - link_missions(from_ref, to_ref, ...)
   - get_context()
   - get_context_short()
   - post_note(text, tab_id, kind)
@@ -27,13 +33,14 @@ iTerm spawn/kill from MCP yet; that lives behind the CLI for v0.6):
 
 from __future__ import annotations
 
+import json
 import time
-from typing import Optional
+from typing import Any, Optional
 
 from mcp.server.fastmcp import FastMCP
 
 from morpheus import context as ctx_mod
-from morpheus import db, ledger
+from morpheus import db, ledger, mission_graph as graph_mod, prd_runs
 
 mcp = FastMCP("morpheus")
 
@@ -129,6 +136,250 @@ def get_session(tab_prefix: str) -> dict:
 
 
 @mcp.tool()
+def list_missions(include_archived: bool = False) -> list[dict]:
+    """List durable mission graph nodes.
+
+    This includes archived mission memory when requested. Use this when a live
+    tab may have disappeared but the durable mission still matters.
+    """
+    live_by_mission: dict[str, list[db.Mission]] = {}
+    for mission in db.all_missions():
+        live_by_mission.setdefault(mission.mission_id, []).append(mission)
+    return [
+        {
+            **_memory_dict(memory),
+            "short_id": graph_mod.short_id(memory.mission_id),
+            "live": [_live_dict(m) for m in live_by_mission.get(memory.mission_id, [])],
+        }
+        for memory in db.all_memory(include_archived=include_archived)
+    ]
+
+
+@mcp.tool()
+def get_mission(
+    ref: str,
+    event_limit: int = 10,
+    artifact_limit: int = 10,
+    edge_limit: int = 10,
+) -> dict:
+    """Get a durable mission graph card by mission id/prefix or tab id/prefix."""
+    resolved = graph_mod.resolve(ref)
+    if resolved is None:
+        return {"found": False, "error": f"no mission matching '{ref}'"}
+
+    return {
+        "found": True,
+        "mission_id": resolved.mission_id,
+        "short_id": graph_mod.short_id(resolved.mission_id),
+        "memory": _memory_dict(resolved.memory),
+        "live": [_live_dict(m) for m in resolved.live],
+        "events": [
+            _event_dict(event)
+            for event in db.recent_events(resolved.mission_id, limit=max(0, event_limit))
+        ],
+        "artifacts": [
+            _artifact_dict(artifact)
+            for artifact in db.artifacts_for_mission(resolved.mission_id, limit=max(0, artifact_limit))
+        ],
+        "edges": [
+            _edge_dict(edge)
+            for edge in db.edges_for_id(resolved.mission_id, limit=max(0, edge_limit))
+        ],
+    }
+
+
+@mcp.tool()
+def update_mission(
+    ref: str,
+    title: Optional[str] = None,
+    why: Optional[str] = None,
+    done_definition: Optional[str] = None,
+    acceptance_criteria: Optional[str] = None,
+    current_plan: Optional[str] = None,
+    next_step: Optional[str] = None,
+    last_decision: Optional[str] = None,
+    last_summary: Optional[str] = None,
+    blocked_on: Optional[str] = None,
+    phase: Optional[str] = None,
+    confidence: Optional[float] = None,
+    source_kind: Optional[str] = None,
+    source_ref: Optional[str] = None,
+    epic_ref: Optional[str] = None,
+    issue_ref: Optional[str] = None,
+    claimed_paths_json: Optional[str] = None,
+    topic: Optional[str] = None,
+) -> dict:
+    """Update safe mission-memory fields.
+
+    `claimed_paths_json` may be a JSON list of path strings. Spawn, kill, close,
+    push, merge, and external-message actions are intentionally not exposed.
+    """
+    resolved = graph_mod.resolve(ref)
+    if resolved is None:
+        return {"ok": False, "found": False, "error": f"no mission matching '{ref}'"}
+
+    memory = resolved.memory
+    updates: dict[str, Any] = {}
+    for field, value in {
+        "title": title,
+        "why": why,
+        "done_definition": done_definition,
+        "acceptance_criteria": acceptance_criteria,
+        "current_plan": current_plan,
+        "next_step": next_step,
+        "last_decision": last_decision,
+        "last_summary": last_summary,
+        "blocked_on": blocked_on,
+        "phase": phase,
+        "confidence": confidence,
+        "source_kind": source_kind,
+        "source_ref": source_ref,
+        "epic_ref": epic_ref,
+        "issue_ref": issue_ref,
+        "topic": topic,
+    }.items():
+        if value is not None:
+            setattr(memory, field, value)
+            updates[field] = value
+
+    if claimed_paths_json is not None:
+        try:
+            paths = json.loads(claimed_paths_json)
+        except json.JSONDecodeError as e:
+            return {"ok": False, "found": True, "error": f"claimed_paths_json is not JSON: {e}"}
+        if not isinstance(paths, list) or not all(isinstance(path, str) for path in paths):
+            return {"ok": False, "found": True, "error": "claimed_paths_json must be a JSON list of strings"}
+        memory.claimed_paths = json.dumps(paths)
+        updates["claimed_paths"] = paths
+
+    if not updates:
+        return {"ok": True, "found": True, "mission_id": resolved.mission_id, "updated": []}
+
+    db.upsert_memory(memory)
+    event_id = db.add_event(
+        resolved.mission_id,
+        kind="mission_update",
+        actor="mcp",
+        summary=f"MCP updated mission fields: {', '.join(sorted(updates))}",
+        source_ref="mcp:update_mission",
+        metadata={"fields": sorted(updates)},
+    )
+    _log_action("mcp_update_mission", resolved, {"fields": sorted(updates)})
+    _refresh_after_graph_write(resolved.mission_id)
+    refreshed = graph_mod.resolve(resolved.mission_id)
+    return {
+        "ok": True,
+        "found": True,
+        "mission_id": resolved.mission_id,
+        "event_id": event_id,
+        "updated": sorted(updates),
+        "memory": _memory_dict(refreshed.memory if refreshed else memory),
+    }
+
+
+@mcp.tool()
+def add_mission_event(
+    ref: str,
+    summary: str,
+    kind: str = "decision",
+    actor: str = "mcp",
+    source_ref: str = "mcp:add_mission_event",
+    metadata_json: str = "",
+) -> dict:
+    """Append a mission graph event."""
+    resolved = graph_mod.resolve(ref)
+    if resolved is None:
+        return {"ok": False, "found": False, "error": f"no mission matching '{ref}'"}
+    try:
+        metadata = json.loads(metadata_json) if metadata_json else {}
+    except json.JSONDecodeError as e:
+        return {"ok": False, "found": True, "error": f"metadata_json is not JSON: {e}"}
+    if not isinstance(metadata, dict):
+        return {"ok": False, "found": True, "error": "metadata_json must decode to an object"}
+
+    event_id = db.add_event(
+        resolved.mission_id,
+        kind=kind,
+        actor=actor,
+        summary=summary,
+        source_ref=source_ref,
+        metadata=metadata,
+    )
+    _log_action("mcp_add_mission_event", resolved, {"kind": kind, "event_id": event_id})
+    _refresh_after_graph_write(resolved.mission_id)
+    return {"ok": True, "found": True, "mission_id": resolved.mission_id, "event_id": event_id}
+
+
+@mcp.tool()
+def add_mission_artifact(
+    ref: str,
+    path_or_url: str,
+    kind: str = "proof",
+    status: str = "unknown",
+    summary: str = "",
+) -> dict:
+    """Attach a proof/output artifact to a mission."""
+    resolved = graph_mod.resolve(ref)
+    if resolved is None:
+        return {"ok": False, "found": False, "error": f"no mission matching '{ref}'"}
+    artifact_id = db.add_artifact(
+        resolved.mission_id,
+        kind=kind,
+        path_or_url=path_or_url,
+        status=status,
+        summary=summary,
+    )
+    _log_action(
+        "mcp_add_mission_artifact",
+        resolved,
+        {"kind": kind, "status": status, "artifact_id": artifact_id},
+    )
+    _refresh_after_graph_write(resolved.mission_id)
+    return {"ok": True, "found": True, "mission_id": resolved.mission_id, "artifact_id": artifact_id}
+
+
+@mcp.tool()
+def link_missions(
+    from_ref: str,
+    to_ref: str,
+    relation: str = "relates_to",
+    reason: str = "",
+) -> dict:
+    """Create a mission graph edge between two existing missions."""
+    from_resolved = graph_mod.resolve(from_ref)
+    if from_resolved is None:
+        return {"ok": False, "error": f"no mission matching '{from_ref}'"}
+    to_resolved = graph_mod.resolve(to_ref)
+    if to_resolved is None:
+        return {"ok": False, "error": f"no mission matching '{to_ref}'"}
+
+    edge_id = db.add_edge(
+        from_resolved.mission_id,
+        to_resolved.mission_id,
+        relation=relation,
+        reason=reason,
+    )
+    _log_action(
+        "mcp_link_missions",
+        from_resolved,
+        {
+            "edge_id": edge_id,
+            "to_mission_id": to_resolved.mission_id,
+            "relation": relation,
+        },
+    )
+    _refresh_after_graph_write(from_resolved.mission_id)
+    _refresh_after_graph_write(to_resolved.mission_id)
+    return {
+        "ok": True,
+        "edge_id": edge_id,
+        "from_id": from_resolved.mission_id,
+        "to_id": to_resolved.mission_id,
+        "relation": relation,
+    }
+
+
+@mcp.tool()
 def get_context() -> str:
     """Return the full human-readable markdown context snapshot of every
     morpheus session. This is what ~/.morpheus/context.md contains."""
@@ -194,6 +445,114 @@ def recent_actions(limit: int = 20) -> list[dict]:
         }
         for e in entries
     ]
+
+
+def _memory_dict(memory: db.MissionMemory) -> dict:
+    return {
+        "mission_id": memory.mission_id,
+        "title": memory.title,
+        "why": memory.why,
+        "done_definition": memory.done_definition,
+        "acceptance_criteria": memory.acceptance_criteria,
+        "current_plan": memory.current_plan,
+        "next_step": memory.next_step,
+        "last_decision": memory.last_decision,
+        "last_summary": memory.last_summary,
+        "blocked_on": memory.blocked_on,
+        "phase": memory.phase,
+        "confidence": memory.confidence,
+        "source_kind": memory.source_kind,
+        "source_ref": memory.source_ref,
+        "epic_ref": memory.epic_ref,
+        "issue_ref": memory.issue_ref,
+        "last_verified_at": memory.last_verified_at,
+        "claimed_paths": _decode_claimed_paths(memory.claimed_paths),
+        "topic": memory.topic,
+        "created_at": memory.created_at,
+        "updated_at": memory.updated_at,
+        "archived_at": memory.archived_at,
+    }
+
+
+def _live_dict(mission: db.Mission) -> dict:
+    return {
+        "tab_id": mission.tab_id,
+        "session_id": mission.session_id,
+        "goal": mission.goal,
+        "state": mission.state,
+        "last_event": mission.last_event,
+        "age_secs": max(0, time.time() - mission.buffer_changed_at),
+        "cmd": mission.cmd,
+        "linked_pr": mission.linked_pr,
+        "linked_worktree": mission.linked_worktree,
+    }
+
+
+def _event_dict(event: db.MissionEvent) -> dict:
+    return {
+        "id": event.id,
+        "mission_id": event.mission_id,
+        "kind": event.kind,
+        "actor": event.actor,
+        "summary": event.summary,
+        "source_ref": event.source_ref,
+        "metadata": event.metadata,
+        "ts": event.ts,
+    }
+
+
+def _artifact_dict(artifact: db.MissionArtifact) -> dict:
+    return {
+        "id": artifact.id,
+        "mission_id": artifact.mission_id,
+        "kind": artifact.kind,
+        "path_or_url": artifact.path_or_url,
+        "status": artifact.status,
+        "summary": artifact.summary,
+        "created_at": artifact.created_at,
+    }
+
+
+def _edge_dict(edge: db.MissionEdge) -> dict:
+    return {
+        "id": edge.id,
+        "from_id": edge.from_id,
+        "to_id": edge.to_id,
+        "relation": edge.relation,
+        "reason": edge.reason,
+        "created_at": edge.created_at,
+    }
+
+
+def _decode_claimed_paths(raw: str) -> list[str]:
+    try:
+        decoded = json.loads(raw or "[]")
+    except json.JSONDecodeError:
+        return []
+    if isinstance(decoded, list):
+        return [str(item) for item in decoded]
+    return []
+
+
+def _log_action(action: str, resolved: graph_mod.ResolvedMission, details: dict) -> None:
+    tab_id = resolved.live[0].tab_id if resolved.live else None
+    ledger.log_action(
+        action,
+        tab_id=tab_id,
+        details={"mission_id": resolved.mission_id, **details},
+    )
+
+
+def _refresh_after_graph_write(mission_id: str) -> None:
+    try:
+        ctx_mod.write_context_file()
+        ctx_mod.write_context_json()
+    except Exception:
+        pass
+    try:
+        prd_runs.update_status_for_mission(mission_id)
+    except Exception:
+        pass
 
 
 def serve() -> None:

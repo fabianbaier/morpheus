@@ -120,6 +120,7 @@ morpheus run find-prds .
 morpheus run start ./PRD.md --cmd "codex"
 morpheus loops add "market scan" "summarize tomorrow's market catalysts" --every 30m
 morpheus loops run-due
+morpheus mcp serve
 ```
 
 Cross-session notes:
@@ -172,7 +173,8 @@ Runtime pieces:
   `~/.morpheus/loops/`, and publishes ticker notes plus graph artifacts.
 - `morpheus/context.py` writes `~/.morpheus/context.md` and `.json` so agents can
   see sibling sessions.
-- `morpheus/mcp_server.py` exposes Morpheus state to Claude Code / Codex via MCP.
+- `morpheus/mcp_server.py` exposes sessions, mission graph read/update tools,
+  notes/claims, spend, and action history to Claude Code / Codex via MCP.
 
 ## Mission Graph
 
@@ -198,6 +200,12 @@ morpheus graph show <tab-prefix-or-mission-id>
 morpheus graph event <ref> "decided to split auth tests" --kind decision
 morpheus graph artifact <ref> ./pytest.log --kind test --status pass
 ```
+
+The MCP server exposes the same graph layer to agents through
+`list_missions`, `get_mission`, `update_mission`, `add_mission_event`,
+`add_mission_artifact`, and `link_missions`. These tools can update mission
+memory and proof, but they do not spawn, kill, push, merge, or send external
+messages.
 
 Snapshots automatically attach a `snapshot` artifact to the selected mission.
 When a tab is closed or disappears, the live attachment is removed but the
@@ -286,10 +294,11 @@ make daemon
 
 ## Roadmap
 
-Current status: v0.8.0a12 has PRD Runs foundation, PRD tree/manual workers,
+Current status: v0.8.0a13 has PRD Runs foundation, PRD tree/manual workers,
 newest-first ready tickers, prompt loops foundation, nonblocking/Markdown PRD
 picker, edit mission flow, selected mission briefs, PRD parent cleanup, and an
-output-first mission card, plus a user PATH install target and resume-fresh.
+output-first mission card, plus a user PATH install target, resume-fresh, and
+MCP mission graph update tools.
 
 Next implementation phases:
 
@@ -314,6 +323,7 @@ Next implementation phases:
 19. User PATH CLI install target. Done in `0.8.0a11`.
 20. Resume-fresh flow that snapshots, archives old attachment, and spawns a new
    session linked by a `spawned_from` edge. Done in `0.8.0a12`.
-21. MCP mission graph update tools.
+21. MCP mission graph update tools. Done in `0.8.0a13`.
+22. 48-hour recall eval.
 
 > "I can only show you the door. You're the one that has to walk through it."
