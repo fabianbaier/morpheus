@@ -368,16 +368,26 @@ def notes(
 # ───────── doctor ─────────
 
 def _iterm2_running() -> bool:
-    """Best-effort check whether the iTerm2 app is running on this machine."""
+    """Best-effort check whether the iTerm2 app is running on this machine.
+
+    Tries several patterns because the process name varies across macOS
+    versions and how the app was launched.
+    """
     import subprocess
-    try:
-        out = subprocess.run(
-            ["pgrep", "-x", "iTerm2"],
-            capture_output=True, text=True, timeout=2,
-        )
-        return out.returncode == 0
-    except Exception:
-        return False
+    patterns = [
+        ["pgrep", "-x", "iTerm2"],
+        ["pgrep", "-x", "iTerm"],
+        ["pgrep", "-if", "iTerm2"],
+        ["pgrep", "-if", "Contents/MacOS/iTerm"],
+    ]
+    for cmd in patterns:
+        try:
+            out = subprocess.run(cmd, capture_output=True, text=True, timeout=2)
+            if out.returncode == 0 and out.stdout.strip():
+                return True
+        except Exception:
+            continue
+    return False
 
 
 def _running_in_iterm() -> bool:
@@ -397,7 +407,7 @@ def doctor():
         console.print(f"  ✗ iterm2 import failed: {e}")
         raise typer.Exit(1)
 
-    # Up-front context: where is the user running this, and is iTerm2 alive?
+    # Where is the user running this?
     if _running_in_iterm():
         console.print("  ✓ running inside an iTerm2 session")
     else:
@@ -407,13 +417,10 @@ def doctor():
             f"morpheus can still connect to iTerm2 if it's running, but the dashboard "
             f"will render in this terminal, not in an iTerm tab.[/yellow]"
         )
-    if _iterm2_running():
-        console.print("  ✓ iTerm2 app appears to be running")
-    else:
-        console.print(
-            "  [red]✗ iTerm2 app is NOT running — launch iTerm2 first "
-            "(CMD+SPACE → 'iTerm' → enter, or open from /Applications/iTerm.app)[/red]"
-        )
+    # NB: deliberately do NOT print an "iTerm2 not running" warning here —
+    # the connection attempt below is the only reliable signal. pgrep checks
+    # were producing false negatives that confused users (the connection
+    # would succeed but the pre-check would say "not running").
 
     # iterm2's run_until_complete prints its own help on connection failure and
     # may sys.exit rather than raise — so we use a success flag and catch
@@ -444,6 +451,14 @@ def doctor():
         console.print(f"  ✓ connected — windows={success['windows']}  tabs={success['tabs']}")
         console.print("\n[green bold]✓ all checks passed.[/green bold] Run [bold]morpheus[/bold] to launch the dashboard.")
         return
+
+    # Now that we know the connection actually failed, give the diagnostic
+    # for "is iTerm2 even running?" — this is the right time to surface it.
+    if not _iterm2_running():
+        console.print(
+            "  [red]✗ iTerm2 app does not appear to be running — launch it first "
+            "(CMD+SPACE → 'iTerm' → enter, or `open -a iTerm`).[/red]"
+        )
 
     console.print("\n[yellow bold]→ iTerm2 Python API setup needed (this lives INSIDE iTerm2, not in Terminal.app):[/yellow bold]")
     console.print("  1. [bold]Switch to iTerm2[/bold] (CMD+TAB to it, or launch from /Applications/iTerm.app)")
