@@ -11,9 +11,10 @@ import json
 import secrets
 import sqlite3
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable, Optional
+from typing import Any, Iterable, Iterator, Optional
 
 DB_DIR = Path.home() / ".morpheus"
 DB_PATH = DB_DIR / "morpheus.db"
@@ -267,12 +268,21 @@ CREATE INDEX IF NOT EXISTS prompt_loop_runs_loop_idx ON prompt_loop_runs(loop_id
 """
 
 
-def _connect() -> sqlite3.Connection:
+@contextmanager
+def _connect() -> Iterator[sqlite3.Connection]:
     DB_DIR.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     _ensure_schema(conn)
-    return conn
+    try:
+        yield conn
+    except Exception:
+        conn.rollback()
+        raise
+    else:
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def _ensure_schema(conn: sqlite3.Connection) -> None:
@@ -405,6 +415,30 @@ def get(tab_id: str) -> Optional[Mission]:
     with _connect() as conn:
         row = conn.execute("SELECT * FROM missions WHERE tab_id = ?", (tab_id,)).fetchone()
     return _row_to_mission(row) if row else None
+
+
+def update_mission_details(
+    tab_id: str,
+    *,
+    goal: str,
+    linked_pr: Optional[int],
+    linked_worktree: str,
+) -> bool:
+    """Update user-editable live attachment fields exactly as supplied."""
+    now = time.time()
+    with _connect() as conn:
+        cur = conn.execute(
+            """
+            UPDATE missions
+               SET goal = ?,
+                   linked_pr = ?,
+                   linked_worktree = ?,
+                   updated_at = ?
+             WHERE tab_id = ?
+            """,
+            (goal, linked_pr, linked_worktree, now, tab_id),
+        )
+    return cur.rowcount > 0
 
 
 def all_missions() -> list[Mission]:

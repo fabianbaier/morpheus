@@ -18,6 +18,7 @@ The morpheus tab is your command center; the iTerm tabs are your workers.
 from __future__ import annotations
 
 import asyncio
+import json
 import random
 import re
 import time
@@ -150,6 +151,28 @@ class LoopRequest:
     command: str
     target_mission_id: str = ""
     target_tab_id: Optional[str] = None
+
+
+@dataclass
+class EditMissionRequest:
+    tab_id: str
+    mission_id: str
+    goal: str
+    title: str
+    why: str
+    done_definition: str
+    acceptance_criteria: str
+    current_plan: str
+    next_step: str
+    phase: str
+    blocked_on: str
+    source_kind: str
+    source_ref: str
+    issue_ref: str
+    linked_pr: Optional[int]
+    linked_worktree: str
+    claimed_paths: str
+    topic: str
 
 
 @dataclass
@@ -844,6 +867,228 @@ class NewSessionScreen(ModalScreen[Optional[NewSessionRequest]]):
             self.action_cancel()
 
 
+# ── modal: edit selected mission ───────────────────────────────────────────
+
+PHASE_OPTIONS = (
+    "planning",
+    "editing",
+    "testing",
+    "reviewing",
+    "blocked",
+    "done_needs_human",
+    "archived",
+)
+
+SOURCE_KIND_OPTIONS = (
+    "user",
+    "transcript",
+    "inferred",
+    "imported",
+    "prd",
+    "issue",
+)
+
+EDIT_INPUT_ORDER = (
+    "goal_input",
+    "title_input",
+    "why_input",
+    "done_input",
+    "criteria_input",
+    "plan_input",
+    "next_input",
+    "blocked_input",
+    "source_ref_input",
+    "issue_ref_input",
+    "linked_pr_input",
+    "worktree_input",
+    "claimed_paths_input",
+    "topic_input",
+)
+
+
+class EditMissionScreen(ModalScreen[Optional[EditMissionRequest]]):
+    """Edit the durable mission card fields for the selected session."""
+
+    CSS = """
+    EditMissionScreen { align: center middle; }
+    #dialog {
+        width: 92;
+        height: 28;
+        border: round ansi_bright_green;
+        background: black;
+        padding: 1 2;
+    }
+    #dialog Label.title {
+        color: ansi_bright_green;
+        text-style: bold;
+        margin-bottom: 1;
+    }
+    #dialog Label.hint {
+        color: $text-muted;
+    }
+    EditMissionScreen Input {
+        background: black;
+        color: ansi_bright_green;
+        border: round green;
+        margin: 0 0 1 0;
+    }
+    EditMissionScreen Select {
+        background: black;
+        color: ansi_bright_green;
+        border: round green;
+        margin: 0 0 1 0;
+    }
+    #buttons {
+        height: 3;
+        align: center middle;
+    }
+    Button {
+        margin: 0 1;
+    }
+    """
+
+    BINDINGS = [
+        Binding("escape", "cancel", "cancel"),
+        Binding("ctrl+enter", "submit", "save"),
+    ]
+
+    def __init__(self, mission: db.Mission, memory: db.MissionMemory):
+        super().__init__()
+        self.mission = mission
+        self.memory = memory
+
+    def compose(self) -> ComposeResult:
+        phase_options = _select_options(PHASE_OPTIONS, self.memory.phase)
+        source_options = _select_options(SOURCE_KIND_OPTIONS, self.memory.source_kind)
+        with Container(id="dialog"):
+            yield Label(
+                f"{RABBIT}  EDIT MISSION  {self.mission.tab_id.split('-')[0]}",
+                classes="title",
+            )
+            yield Input(value=self.mission.goal, placeholder="goal", id="goal_input")
+            yield Input(value=self.memory.title, placeholder="card title", id="title_input")
+            yield Input(value=self.memory.why, placeholder="why this exists", id="why_input")
+            yield Input(value=self.memory.done_definition, placeholder="done definition", id="done_input")
+            yield Input(value=self.memory.acceptance_criteria, placeholder="acceptance criteria", id="criteria_input")
+            yield Input(value=self.memory.current_plan, placeholder="current plan", id="plan_input")
+            yield Input(value=self.memory.next_step, placeholder="next step", id="next_input")
+            with Horizontal():
+                yield Select(phase_options, value=self.memory.phase or "planning", id="phase_select")
+                yield Select(source_options, value=self.memory.source_kind or "user", id="source_kind_select")
+            yield Input(value=self.memory.blocked_on, placeholder="blocked on", id="blocked_input")
+            yield Input(value=self.memory.source_ref, placeholder="source ref", id="source_ref_input")
+            yield Input(value=self.memory.issue_ref, placeholder="issue / PR / task ref", id="issue_ref_input")
+            yield Input(value=_format_optional_pr(self.mission.linked_pr), placeholder="linked PR number", id="linked_pr_input")
+            yield Input(value=self.mission.linked_worktree, placeholder="linked worktree", id="worktree_input")
+            yield Input(value=_display_claimed_paths(self.memory.claimed_paths), placeholder="claimed paths, comma-separated", id="claimed_paths_input")
+            yield Input(value=self.memory.topic, placeholder="topic", id="topic_input")
+            yield Label("ctrl+enter to save · esc to cancel", classes="hint", id="hint_label")
+            with Horizontal(id="buttons"):
+                yield Button("save", id="save_btn", variant="success")
+                yield Button("cancel", id="cancel_btn", variant="default")
+
+    def on_mount(self) -> None:
+        self.query_one("#goal_input", Input).focus()
+
+    def action_submit(self) -> None:
+        try:
+            linked_pr = _parse_optional_pr(self.query_one("#linked_pr_input", Input).value)
+            claimed_paths = _normalize_claimed_paths(self.query_one("#claimed_paths_input", Input).value)
+        except ValueError as e:
+            self.query_one("#hint_label", Label).update(str(e))
+            return
+
+        phase_value = self.query_one("#phase_select", Select).value
+        source_kind_value = self.query_one("#source_kind_select", Select).value
+        self.dismiss(
+            EditMissionRequest(
+                tab_id=self.mission.tab_id,
+                mission_id=self.memory.mission_id,
+                goal=self.query_one("#goal_input", Input).value.strip(),
+                title=self.query_one("#title_input", Input).value.strip(),
+                why=self.query_one("#why_input", Input).value.strip(),
+                done_definition=self.query_one("#done_input", Input).value.strip(),
+                acceptance_criteria=self.query_one("#criteria_input", Input).value.strip(),
+                current_plan=self.query_one("#plan_input", Input).value.strip(),
+                next_step=self.query_one("#next_input", Input).value.strip(),
+                phase=str(phase_value or "planning"),
+                blocked_on=self.query_one("#blocked_input", Input).value.strip(),
+                source_kind=str(source_kind_value or "user"),
+                source_ref=self.query_one("#source_ref_input", Input).value.strip(),
+                issue_ref=self.query_one("#issue_ref_input", Input).value.strip(),
+                linked_pr=linked_pr,
+                linked_worktree=self.query_one("#worktree_input", Input).value.strip(),
+                claimed_paths=claimed_paths,
+                topic=self.query_one("#topic_input", Input).value.strip(),
+            )
+        )
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        current_id = event.input.id
+        if current_id not in EDIT_INPUT_ORDER:
+            return
+        current_index = EDIT_INPUT_ORDER.index(current_id)
+        if current_index == len(EDIT_INPUT_ORDER) - 1:
+            self.action_submit()
+            return
+        self.query_one(f"#{EDIT_INPUT_ORDER[current_index + 1]}", Input).focus()
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "save_btn":
+            self.action_submit()
+        else:
+            self.action_cancel()
+
+
+def _select_options(values: tuple[str, ...], current: str) -> list[tuple[str, str]]:
+    options = [(value.replace("_", " "), value) for value in values]
+    if current and current not in values:
+        options.append((current.replace("_", " "), current))
+    return options
+
+
+def _format_optional_pr(value: Optional[int]) -> str:
+    return "" if value is None else str(value)
+
+
+def _parse_optional_pr(value: str) -> Optional[int]:
+    cleaned = value.strip().lstrip("#")
+    if not cleaned:
+        return None
+    if not cleaned.isdigit():
+        raise ValueError("linked PR must be a number or blank")
+    return int(cleaned)
+
+
+def _display_claimed_paths(value: str) -> str:
+    try:
+        loaded = json.loads(value or "[]")
+    except json.JSONDecodeError:
+        return value
+    if isinstance(loaded, list):
+        return ", ".join(str(item) for item in loaded)
+    return value
+
+
+def _normalize_claimed_paths(value: str) -> str:
+    cleaned = value.strip()
+    if not cleaned:
+        return "[]"
+    if cleaned.startswith("["):
+        try:
+            loaded = json.loads(cleaned)
+        except json.JSONDecodeError as e:
+            raise ValueError(f"claimed paths JSON is invalid: {e.msg}") from e
+        if not isinstance(loaded, list) or not all(isinstance(item, str) for item in loaded):
+            raise ValueError("claimed paths JSON must be a list of strings")
+        return json.dumps([item.strip() for item in loaded if item.strip()])
+    paths = [part.strip() for part in cleaned.split(",") if part.strip()]
+    return json.dumps(paths)
+
+
 # ── modal: post note ──────────────────────────────────────────────────────
 
 class NoteScreen(ModalScreen[Optional[tuple[str, str, Optional[str]]]]):
@@ -1010,6 +1255,7 @@ FOOTER_BINDINGS = [
     Binding("up", "cursor_up", "prev", show=False),
     Binding("enter", "focus_session", "focus tab"),
     Binding("n", "new_session", "new"),
+    Binding("e", "edit_mission", "edit"),
     Binding("d", "kill_session", "kill"),
     Binding("p", "prune_stale", "prune"),
     Binding("s", "snapshot_session", "snapshot"),
@@ -1566,6 +1812,76 @@ class MorpheusApp(App):
         except Exception:
             pass
         return Path.cwd()
+
+    def action_edit_mission(self) -> None:
+        table = self.query_one(MissionsTable)
+        tab_id = table.selected_tab_id()
+        if not tab_id:
+            self._push_alert(Alert(time.time(), "error", "no mission selected to edit"))
+            return
+        mission = db.get(tab_id)
+        if mission is None:
+            self._push_alert(Alert(time.time(), "error", f"mission [{tab_id.split('-')[0]}] not found"))
+            return
+        if not mission.mission_id:
+            db.upsert(mission)
+            mission = db.get(tab_id) or mission
+        memory = db.get_memory(mission.mission_id) if mission.mission_id else None
+        if memory is None:
+            memory = db.MissionMemory(
+                mission_id=mission.mission_id,
+                title=mission.goal or mission.cmd or tab_id.split("-")[0],
+                source_kind="user",
+                source_ref=f"tab:{tab_id}",
+            )
+        self.push_screen(EditMissionScreen(mission, memory), self._handle_edit_mission_result)
+
+    async def _handle_edit_mission_result(self, result: Optional[EditMissionRequest]) -> None:
+        if result is None:
+            return
+
+        existing = db.get_memory(result.mission_id)
+        memory = existing or db.MissionMemory(mission_id=result.mission_id)
+        memory.title = result.title
+        memory.why = result.why
+        memory.done_definition = result.done_definition
+        memory.acceptance_criteria = result.acceptance_criteria
+        memory.current_plan = result.current_plan
+        memory.next_step = result.next_step
+        memory.blocked_on = result.blocked_on
+        memory.phase = result.phase
+        memory.confidence = 1.0
+        memory.source_kind = result.source_kind
+        memory.source_ref = result.source_ref
+        memory.issue_ref = result.issue_ref
+        memory.claimed_paths = result.claimed_paths
+        memory.topic = result.topic
+        db.upsert_memory(memory)
+        db.update_mission_details(
+            result.tab_id,
+            goal=result.goal,
+            linked_pr=result.linked_pr,
+            linked_worktree=result.linked_worktree,
+        )
+        db.add_event(
+            result.mission_id,
+            kind="mission_edit",
+            actor="user",
+            summary="Mission card edited",
+            source_ref=f"tab:{result.tab_id}",
+            metadata={
+                "tab_id": result.tab_id,
+                "phase": result.phase,
+                "linked_pr": result.linked_pr,
+                "linked_worktree": result.linked_worktree,
+            },
+        )
+        self._push_alert(Alert(
+            time.time(),
+            "summary",
+            f"edited [{result.title or result.goal or result.tab_id.split('-')[0]}]",
+        ))
+        self._refresh_table()
 
     async def action_kill_session(self) -> None:
         if self.iterm_conn is None:

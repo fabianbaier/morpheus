@@ -8,6 +8,7 @@ from textual.widgets import Input
 
 from morpheus import dashboard
 from morpheus.dashboard import (
+    EditMissionScreen,
     LiveBuffer,
     LoopRequest,
     LoopScreen,
@@ -49,15 +50,17 @@ class FakeRichLog:
 
 
 @contextmanager
-def isolated_dashboard_runtime():
+def isolated_dashboard_runtime(missions=None):
     async def fake_async_create():
         return object()
+
+    mission_rows = list(missions or [])
 
     with (
         patch.object(dashboard.iterm2.Connection, "async_create", new=fake_async_create),
         patch.object(dashboard.core, "setup_logging", new=lambda: FakeLogger()),
         patch.object(dashboard.db, "recent_notes", new=lambda limit=1: []),
-        patch.object(dashboard.db, "all_missions", new=lambda: []),
+        patch.object(dashboard.db, "all_missions", new=lambda: list(mission_rows)),
     ):
         yield
 
@@ -141,6 +144,29 @@ class DashboardTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("newer ready headline", rich_log.lines[0])
         self.assertIn("older ready headline", rich_log.lines[1])
         self.assertGreaterEqual(rich_log.clear_count, 2)
+
+    def test_edit_mission_screen_parses_claims_and_pr(self) -> None:
+        mission = dashboard.db.Mission(
+            tab_id="tab-123456",
+            mission_id="m_20260520000102_abcd1234",
+            goal="old goal",
+            linked_pr=224,
+            linked_worktree="/tmp/work",
+        )
+        memory = dashboard.db.MissionMemory(
+            mission_id=mission.mission_id,
+            title="Old title",
+            why="old why",
+            phase="planning",
+            source_kind="user",
+            claimed_paths='["src/old.py"]',
+        )
+        self.assertEqual(dashboard._parse_optional_pr("#225"), 225)
+        self.assertEqual(
+            dashboard._normalize_claimed_paths("src/a.py, tests/test_a.py"),
+            '["src/a.py", "tests/test_a.py"]',
+        )
+        self.assertEqual(dashboard._display_claimed_paths(memory.claimed_paths), "src/old.py")
 
     def test_session_headline_prefers_final_substantive_line(self) -> None:
         rendered = _session_headline(
@@ -340,6 +366,22 @@ class DashboardTest(unittest.IsolatedAsyncioTestCase):
                 await pilot.pause()
                 self.assertIsInstance(app.screen, LoopScreen)
 
+                await app.pop_screen()
+                await pilot.pause()
+
+                mission = dashboard.db.Mission(
+                    tab_id="tab-123456",
+                    mission_id="m_20260520000102_abcd1234",
+                    goal="edit mission",
+                )
+                memory = dashboard.db.MissionMemory(
+                    mission_id=mission.mission_id,
+                    title="Edit mission",
+                )
+                await app.push_screen(EditMissionScreen(mission, memory))
+                await pilot.pause()
+                self.assertIsInstance(app.screen, EditMissionScreen)
+
     async def test_new_session_key_opens_modal_without_worker_crash(self) -> None:
         app = DashboardHarness()
 
@@ -349,6 +391,148 @@ class DashboardTest(unittest.IsolatedAsyncioTestCase):
                 await pilot.pause()
 
                 self.assertIsInstance(app.screen, NewSessionScreen)
+
+    async def test_edit_mission_key_opens_modal_for_selected_mission(self) -> None:
+        app = DashboardHarness()
+        mission = dashboard.db.Mission(
+            tab_id="tab-123456",
+            mission_id="m_20260520000102_abcd1234",
+            goal="edit this mission",
+            state="working",
+            buffer_changed_at=1,
+        )
+        memory = dashboard.db.MissionMemory(
+            mission_id=mission.mission_id,
+            title="Edit this mission",
+            why="make stale intent recoverable",
+        )
+
+        with isolated_dashboard_runtime([mission]), patch.object(
+            dashboard.db, "get", new=lambda tab_id: mission if tab_id == mission.tab_id else None
+        ), patch.object(
+            dashboard.db, "get_memory", new=lambda mission_id: memory if mission_id == memory.mission_id else None
+        ):
+            async with app.run_test(size=(120, 40)) as pilot:
+                app._refresh_table()
+                await pilot.pause()
+                await pilot.press("e")
+                await pilot.pause()
+
+                self.assertIsInstance(app.screen, EditMissionScreen)
+                self.assertEqual(app.screen.query_one("#goal_input", Input).value, "edit this mission")
+                self.assertEqual(app.screen.query_one("#why_input", Input).value, "make stale intent recoverable")
+
+    async def test_edit_mission_submit_updates_memory_live_fields_and_event(self) -> None:
+        app = DashboardHarness()
+        done = asyncio.Event()
+        captured = {}
+        mission = dashboard.db.Mission(
+            tab_id="tab-123456",
+            mission_id="m_20260520000102_abcd1234",
+            goal="old goal",
+            state="working",
+            linked_pr=224,
+            linked_worktree="/tmp/old",
+            buffer_changed_at=1,
+        )
+        memory = dashboard.db.MissionMemory(
+            mission_id=mission.mission_id,
+            title="Old title",
+            why="old why",
+            phase="planning",
+            source_kind="imported",
+            source_ref="tab:old",
+        )
+
+        def fake_upsert_memory(updated):
+            captured["memory"] = updated
+
+        def fake_update_mission_details(tab_id, *, goal, linked_pr, linked_worktree):
+            captured["live"] = {
+                "tab_id": tab_id,
+                "goal": goal,
+                "linked_pr": linked_pr,
+                "linked_worktree": linked_worktree,
+            }
+            return True
+
+        def fake_add_event(mission_id, kind, summary, actor="user", source_ref="", metadata=None):
+            captured["event"] = {
+                "mission_id": mission_id,
+                "kind": kind,
+                "summary": summary,
+                "actor": actor,
+                "source_ref": source_ref,
+                "metadata": metadata,
+            }
+            done.set()
+            return 1
+
+        with isolated_dashboard_runtime([mission]), patch.object(
+            dashboard.db, "get", new=lambda tab_id: mission if tab_id == mission.tab_id else None
+        ), patch.object(
+            dashboard.db, "get_memory", new=lambda mission_id: memory if mission_id == memory.mission_id else None
+        ), patch.object(
+            dashboard.db, "upsert_memory", new=fake_upsert_memory
+        ), patch.object(
+            dashboard.db, "update_mission_details", new=fake_update_mission_details
+        ), patch.object(
+            dashboard.db, "add_event", new=fake_add_event
+        ):
+            async with app.run_test(size=(120, 40)) as pilot:
+                app._refresh_table()
+                await pilot.pause()
+                await pilot.press("e")
+                await pilot.pause()
+
+                screen = app.screen
+                self.assertIsInstance(screen, EditMissionScreen)
+                screen.query_one("#goal_input", Input).value = "new goal"
+                screen.query_one("#title_input", Input).value = "New title"
+                screen.query_one("#why_input", Input).value = "new why"
+                screen.query_one("#done_input", Input).value = "done means verified"
+                screen.query_one("#criteria_input", Input).value = "criterion one"
+                screen.query_one("#plan_input", Input).value = "plan next"
+                screen.query_one("#next_input", Input).value = "write tests"
+                screen.query_one("#linked_pr_input", Input).value = "#225"
+                screen.query_one("#worktree_input", Input).value = "/tmp/new"
+                screen.query_one("#claimed_paths_input", Input).value = "src/a.py, tests/test_a.py"
+                screen.query_one("#topic_input", Input).value = "mission-edit"
+                screen.action_submit()
+
+                await asyncio.wait_for(done.wait(), timeout=1)
+
+        self.assertEqual(captured["memory"].title, "New title")
+        self.assertEqual(captured["memory"].why, "new why")
+        self.assertEqual(captured["memory"].done_definition, "done means verified")
+        self.assertEqual(captured["memory"].acceptance_criteria, "criterion one")
+        self.assertEqual(captured["memory"].current_plan, "plan next")
+        self.assertEqual(captured["memory"].next_step, "write tests")
+        self.assertEqual(captured["memory"].claimed_paths, '["src/a.py", "tests/test_a.py"]')
+        self.assertEqual(captured["memory"].topic, "mission-edit")
+        self.assertEqual(
+            captured["live"],
+            {
+                "tab_id": mission.tab_id,
+                "goal": "new goal",
+                "linked_pr": 225,
+                "linked_worktree": "/tmp/new",
+            },
+        )
+        self.assertEqual(captured["event"]["kind"], "mission_edit")
+        self.assertEqual(captured["event"]["actor"], "user")
+        self.assertEqual(captured["event"]["metadata"]["phase"], "planning")
+
+    async def test_edit_mission_without_selection_pushes_alert(self) -> None:
+        app = DashboardHarness()
+
+        with isolated_dashboard_runtime():
+            async with app.run_test(size=(120, 40)) as pilot:
+                await pilot.press("e")
+                await pilot.pause()
+
+        self.assertEqual(app.alerts[0].kind, "error")
+        self.assertIn("no mission selected", app.alerts[0].text)
 
     async def test_new_session_submit_spawns_tab_and_records_mission(self) -> None:
         app = DashboardHarness()

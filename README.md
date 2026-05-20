@@ -256,8 +256,8 @@ make daemon
 
 ## Roadmap
 
-Current status: v0.8.0a4 has PRD Runs foundation, newest-first ready tickers,
-and prompt loops foundation.
+Current status: v0.8.0a5 has PRD Runs foundation, newest-first ready tickers,
+prompt loops foundation, and edit mission flow.
 
 Next implementation phases:
 
@@ -273,7 +273,7 @@ Next implementation phases:
 10. PRD Runs foundation. Done in `0.8.0a1`.
 11. Collapsible PRD run tree in the cockpit.
 12. Manual child-worker spawn under a PRD run.
-13. Edit mission flow for why/plan/next/provenance/proof fields.
+13. Edit mission flow for why/plan/next/provenance/proof fields. Done in `0.8.0a5`.
 14. `b` brief-selected using mission graph plus transcript tail.
 15. Resume-fresh flow that snapshots, archives old attachment, and spawns a new
    session linked by a `spawned_from` edge.
