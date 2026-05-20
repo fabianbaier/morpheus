@@ -8,6 +8,7 @@ import time
 from pathlib import Path
 
 from morpheus import context as ctx_mod
+from morpheus import daemon as daemon_mod
 from morpheus import db, detect, iterm_client, naming
 
 LOG_DIR = Path.home() / ".morpheus"
@@ -94,18 +95,79 @@ async def _tick(connection, log: logging.Logger, on_state_change=None) -> int:
     except Exception as e:
         log.exception("context write failed: %s", e)
 
+    # Heartbeat so `morpheus daemon-status` can tell we're alive.
+    daemon_mod.write_beacon()
+
     return len(tabs)
 
 
-async def watch_loop(poll_interval: float = 5.0, on_state_change=None) -> None:
+def watch_loop(
+    poll_interval: float = 5.0,
+    on_state_change=None,
+    on_new_mission=None,
+    on_closed_mission=None,
+    on_new_note=None,
+) -> None:
+    """Headless watch loop. Synchronous wrapper around an asyncio event loop.
+
+    All callbacks are async. `on_state_change(mission, old, new)` fires when a
+    mission's classified state changes between ticks. `on_new_mission(mission)`
+    fires when a tab that wasn't in the DB before appears. `on_closed_mission(
+    tab_id)` fires for tabs we lose. `on_new_note(note)` fires for any note
+    rows that weren't present at startup or last tick.
+    """
     log = setup_logging()
     log.info("morpheus watch started (poll=%.1fs)", poll_interval)
 
+    try:
+        last_seen_tabs = {m.tab_id for m in db.all_missions()}
+    except Exception:
+        last_seen_tabs = set()
+    try:
+        recent = db.recent_notes(limit=1)
+        last_note_id = recent[0].id if recent else 0
+    except Exception:
+        last_note_id = 0
+
     async def body(connection):
+        nonlocal last_seen_tabs, last_note_id
         while True:
             try:
                 n = await _tick(connection, log, on_state_change=on_state_change)
                 log.debug("tick: %d tabs", n)
+
+                # Detect new + closed missions for notification hooks.
+                if on_new_mission or on_closed_mission:
+                    try:
+                        missions = db.all_missions()
+                        current = {m.tab_id for m in missions}
+                        new_tabs = current - last_seen_tabs
+                        closed_tabs = last_seen_tabs - current
+                        by_id = {m.tab_id: m for m in missions}
+                        if on_new_mission:
+                            for t in new_tabs:
+                                m = by_id.get(t)
+                                if m:
+                                    await on_new_mission(m)
+                        if on_closed_mission:
+                            for t in closed_tabs:
+                                await on_closed_mission(t)
+                        last_seen_tabs = current
+                    except Exception as e:
+                        log.exception("new/closed-mission hook failed: %s", e)
+
+                # Detect new notes.
+                if on_new_note:
+                    try:
+                        recent_notes = db.recent_notes(limit=12)
+                        fresh = [nn for nn in recent_notes if nn.id > last_note_id]
+                        for nn in sorted(fresh, key=lambda x: x.created_at):
+                            await on_new_note(nn)
+                        if fresh:
+                            last_note_id = max(nn.id for nn in fresh)
+                    except Exception as e:
+                        log.exception("new-note hook failed: %s", e)
+
             except asyncio.CancelledError:
                 raise
             except Exception as e:

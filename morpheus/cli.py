@@ -14,8 +14,9 @@ from rich.console import Console
 from rich.markdown import Markdown
 from rich.table import Table
 
+from morpheus import brief as brief_mod
 from morpheus import context as ctx_mod
-from morpheus import core, db, iterm_client, naming, __version__
+from morpheus import core, daemon as daemon_mod, db, iterm_client, naming, notifier as notifier_mod, __version__
 
 app = typer.Typer(
     name="morpheus",
@@ -55,16 +56,42 @@ def version():
 @app.command()
 def watch(
     poll: float = typer.Option(5.0, "--poll", "-p", help="Seconds between polls."),
+    no_notify: bool = typer.Option(False, "--no-notify",
+                                    help="Disable macOS notifications."),
 ):
-    """Run the watch loop in the foreground. Updates tab titles every --poll seconds."""
+    """Headless watch loop. Updates tab titles + context.md every --poll seconds.
+
+    When run from a real terminal (interactive), Ctrl-C stops it. When run by
+    launchd, this is the long-lived background process.
+    """
     console.print(f"[bold green]▶ MORPHEUS watching[/bold green] (poll={poll:.1f}s) — Ctrl-C to stop.")
-    console.print(f"  log: {core.LOG_PATH}")
-    console.print(f"  db:  {db.DB_PATH}")
+    console.print(f"  log:    {core.LOG_PATH}")
+    console.print(f"  db:     {db.DB_PATH}")
+    console.print(f"  beacon: {daemon_mod.BEACON_PATH}")
+
+    if no_notify:
+        on_state = on_spawn = on_note = None
+    else:
+        async def on_state(m: db.Mission, old: str, new: str):
+            notifier_mod.notify_state(m.goal or "(untitled)", new, m.last_event)
+
+        async def on_spawn(m: db.Mission):
+            notifier_mod.notify_spawn(m.goal or "(untitled)", m.tab_id)
+
+        async def on_note(n: db.Note):
+            owner = db.get(n.tab_id) if n.tab_id else None
+            goal = owner.goal if owner else "?"
+            notifier_mod.notify_note(goal, n.text)
+
     try:
-        import asyncio
-        asyncio.run(core.watch_loop(poll_interval=poll))
+        core.watch_loop(
+            poll_interval=poll,
+            on_state_change=on_state,
+            on_new_mission=on_spawn,
+            on_new_note=on_note,
+        )
     except KeyboardInterrupt:
-        console.print("\n[dim]stopped.[/dim]")
+        console.print("\n[bright_black]stopped.[/bright_black]")
 
 
 # ───────── spawn ─────────
@@ -363,6 +390,91 @@ def notes(
         goal = by_tab.get(n.tab_id, db.Mission(tab_id="")).goal or "(unknown)"
         marker = {"note": "•", "claim": "⚑", "broadcast": "📡"}.get(n.kind, "•")
         console.print(f"[dim]{ts}[/dim]  {marker}  [green]{tab_short}[/green]  [bold]{goal}[/bold]  {n.text}")
+
+
+# ───────── brief ─────────
+
+@app.command()
+def brief(
+    out: Optional[Path] = typer.Option(None, "--out", "-o",
+                                        help="Write the brief to this file (also prints)."),
+    notify: bool = typer.Option(False, "--notify", "-n",
+                                 help="Push a macOS notification with the brief summary."),
+    no_llm: bool = typer.Option(False, "--no-llm",
+                                 help="Skip the claude-p call; print the template-only brief."),
+    no_gh: bool = typer.Option(False, "--no-gh",
+                                help="Skip the GH review-queue lookup."),
+):
+    """Generate a brief digest of current state (sessions + GH queue + notes)."""
+    body = brief_mod.generate(use_llm=not no_llm, include_gh=not no_gh)
+    # Render as markdown to the terminal.
+    console.print(Markdown(body))
+    if out:
+        out.write_text(body)
+        console.print(f"\n[green]wrote {len(body):d} bytes →[/green] {out}")
+    if notify:
+        # Just send the first non-empty line of the brief as the notification body.
+        summary = next((ln for ln in body.splitlines() if ln.strip() and not ln.startswith("#")),
+                       "morpheus brief ready — see your terminal.")
+        ok = notifier_mod.notify_brief(summary)
+        if not ok:
+            console.print("[yellow]notification not delivered (terminal-notifier missing?)[/yellow]")
+
+
+# ───────── daemon (launchd) ─────────
+
+@app.command("install-daemon")
+def install_daemon(
+    poll: float = typer.Option(5.0, "--poll", "-p",
+                                help="Seconds between polls."),
+):
+    """Install the launchd LaunchAgent so morpheus runs always (RunAtLoad, KeepAlive)."""
+    ok, msg = daemon_mod.install(poll=poll)
+    if ok:
+        console.print(f"[green]✓ {msg}[/green]")
+    else:
+        console.print(f"[red]✗ {msg}[/red]")
+        raise typer.Exit(1)
+
+
+@app.command("uninstall-daemon")
+def uninstall_daemon():
+    """Stop and remove the launchd LaunchAgent."""
+    ok, msg = daemon_mod.uninstall()
+    if ok:
+        console.print(f"[green]✓ {msg}[/green]")
+    else:
+        console.print(f"[red]✗ {msg}[/red]")
+        raise typer.Exit(1)
+
+
+@app.command("daemon-status")
+def daemon_status():
+    """Show launchd daemon status (loaded? PID? beacon age? log size?)."""
+    s = daemon_mod.status()
+
+    def yes(b: bool) -> str:
+        return "[green]✓[/green]" if b else "[red]✗[/red]"
+
+    console.print(f"[bold]morpheus daemon[/bold]")
+    console.print(f"  plist installed:   {yes(s.plist_installed)}  {daemon_mod.LAUNCH_AGENT_PATH}")
+    console.print(f"  launchctl loaded:  {yes(s.launchctl_loaded)}")
+    console.print(f"  PID:               {s.pid if s.pid else '[dim]—[/dim]'}")
+    if s.program_path:
+        console.print(f"  program:           {s.program_path}")
+    if s.beacon_exists:
+        age = s.beacon_age_secs or 0.0
+        color = "green" if age < 30 else ("yellow" if age < 120 else "red")
+        console.print(f"  last beacon:       [{color}]{naming.format_age(age)} ago[/{color}]  "
+                       f"({daemon_mod.BEACON_PATH})")
+    else:
+        console.print(f"  last beacon:       [yellow]never (daemon may have just started or be hung)[/yellow]")
+    console.print(f"  log size:          {s.log_size_bytes:,} bytes  ({daemon_mod.DAEMON_LOG})")
+    if not s.launchctl_loaded:
+        console.print("\n  [yellow]Install:[/yellow] morpheus install-daemon")
+    elif s.beacon_age_secs is None or s.beacon_age_secs > 120:
+        console.print("\n  [yellow]Daemon looks unhealthy — check the log:[/yellow]")
+        console.print(f"    tail -f {daemon_mod.DAEMON_LOG}")
 
 
 # ───────── doctor ─────────
