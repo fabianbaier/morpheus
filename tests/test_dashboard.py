@@ -435,6 +435,84 @@ class DashboardTest(unittest.IsolatedAsyncioTestCase):
 
         sync_shards.assert_called_once()
 
+    def test_header_shows_project_root_and_hidden_count(self) -> None:
+        project = dashboard.db.ProjectTenant(
+            tenant_id="p_current",
+            name="current",
+            root_path="/Users/fabianbaier/current",
+        )
+        app = DashboardHarness(project=project)
+        current = dashboard.db.Mission(tab_id="tab-current", tenant_id="p_current")
+        hidden = dashboard.db.Mission(tab_id="tab-hidden", tenant_id="p_hidden")
+
+        def fake_all_missions(tenant_id=None):
+            if tenant_id == "p_current":
+                return [current]
+            return [current, hidden]
+
+        with patch.object(dashboard.db, "all_missions", new=fake_all_missions):
+            rendered = app._header_text(compact=True).plain
+
+        self.assertIn("project: current", rendered)
+        self.assertIn("~/current", rendered)
+        self.assertIn("1 hidden elsewhere", rendered)
+        self.assertIn("press t to switch", rendered)
+
+    def test_project_switch_result_updates_scope(self) -> None:
+        project_a = dashboard.db.ProjectTenant(
+            tenant_id="p_a",
+            name="a",
+            root_path="/tmp/a",
+        )
+        project_b = dashboard.db.ProjectTenant(
+            tenant_id="p_b",
+            name="b",
+            root_path="/tmp/b",
+        )
+        mission_b = dashboard.db.Mission(tab_id="tab-b", tenant_id="p_b")
+        app = DashboardHarness(project=project_a)
+        app.live_buffers = {
+            "tab-a": dashboard.LiveBuffer("tab-a", "a", "working", "", "", 0),
+            "tab-b": dashboard.LiveBuffer("tab-b", "b", "working", "", "", 0),
+        }
+
+        def fake_all_missions(tenant_id=None):
+            if tenant_id == "p_b":
+                return [mission_b]
+            return []
+
+        with (
+            patch.object(dashboard.db, "get_project_tenant", new=lambda tenant_id: project_b),
+            patch.object(dashboard.db, "all_missions", new=fake_all_missions),
+            patch.object(app, "_refresh_table", new=lambda: None),
+        ):
+            app._handle_project_switch_result(dashboard.ProjectSwitchRequest("p_b"))
+
+        self.assertEqual(app.project, project_b)
+        self.assertFalse(app.show_all)
+        self.assertEqual(app.tenant_id, "p_b")
+        self.assertEqual(set(app.live_buffers), {"tab-b"})
+
+    async def test_project_switch_key_opens_switcher(self) -> None:
+        project = dashboard.db.ProjectTenant(
+            tenant_id="p_current",
+            name="current",
+            root_path="/tmp/current",
+        )
+        app = DashboardHarness(project=project)
+
+        with (
+            isolated_dashboard_runtime(),
+            patch.object(dashboard.tenant_mod, "backfill_known_tenants", new=lambda: 0),
+            patch.object(dashboard.db, "all_project_tenants", new=lambda include_archived=False: [project]),
+            patch.object(dashboard.db, "all_missions", new=lambda tenant_id=None: []),
+        ):
+            async with app.run_test(size=(120, 40)) as pilot:
+                await pilot.press("t")
+                await pilot.pause()
+
+                self.assertIsInstance(app.screen, dashboard.ProjectSwitchScreen)
+
     async def test_finished_session_pushes_summary_ticker_and_event(self) -> None:
         app = DashboardHarness()
         captured = {}
