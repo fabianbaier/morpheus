@@ -1415,6 +1415,7 @@ def graph_recall_eval(
         None,
         help="Mission ids/prefixes or tab ids/prefixes. Default: all stale active missions.",
     ),
+    all_projects: bool = typer.Option(False, "--all", help="Evaluate every project instead of the cwd project."),
     stale_hours: float = typer.Option(
         48.0,
         "--stale-hours",
@@ -1450,6 +1451,9 @@ def graph_recall_eval(
         console.print("[red]--target-seconds must be positive[/red]")
         raise typer.Exit(1)
 
+    tenant_mod.backfill_known_tenants()
+    project = None if refs or all_projects else tenant_mod.ensure_project_tenant(Path.cwd())
+
     try:
         results = _recall_eval_results(
             refs or [],
@@ -1457,6 +1461,7 @@ def graph_recall_eval(
             target_seconds=target_seconds,
             include_archived=include_archived,
             include_fresh=include_fresh,
+            tenant_id=project.tenant_id if project else None,
         )
     except ValueError as e:
         console.print(f"[red]{e}[/red]")
@@ -1488,9 +1493,10 @@ def _recall_eval_results(
     target_seconds: float,
     include_archived: bool,
     include_fresh: bool,
+    tenant_id: Optional[str] = None,
 ) -> list[recall_eval.RecallEvaluation]:
     live_by_mission: dict[str, list[db.Mission]] = {}
-    for mission in db.all_missions():
+    for mission in db.all_missions(tenant_id=tenant_id):
         if mission.mission_id:
             live_by_mission.setdefault(mission.mission_id, []).append(mission)
 
@@ -1504,7 +1510,7 @@ def _recall_eval_results(
             if resolved.live:
                 live_by_mission[resolved.mission_id] = resolved.live
     else:
-        memories = db.all_memory(include_archived=include_archived)
+        memories = db.all_memory(include_archived=include_archived, tenant_id=tenant_id)
 
     results: list[recall_eval.RecallEvaluation] = []
     seen: set[str] = set()

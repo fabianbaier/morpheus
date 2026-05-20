@@ -144,6 +144,8 @@ events/artifacts to the selected mission.
 | `b` | Brief the selected mission from graph + transcript |
 | `e` | Edit mission memory |
 | `space` | Expand/collapse mission card details |
+| `t` | Switch project scope |
+| `o` | Toggle PRD tree open/closed |
 | `r` | Snapshot and resume in a fresh tab |
 | `/` | Add a note |
 | `d` | Kill/archive selected session or PRD run |

@@ -264,6 +264,12 @@ class LoopActionRequest:
 
 
 @dataclass
+class ProjectSwitchRequest:
+    tenant_id: str
+    show_all: bool = False
+
+
+@dataclass
 class EditMissionRequest:
     tab_id: str
     mission_id: str
@@ -1127,6 +1133,20 @@ def _join_nonempty(*parts: str) -> str:
     return " ".join(part for part in parts if part).strip() or "unset"
 
 
+def _display_path(path: str, limit: int = 72) -> str:
+    if not path:
+        return "unknown"
+    home = str(Path.home())
+    shown = path
+    if shown == home:
+        shown = "~"
+    elif shown.startswith(home + "/"):
+        shown = "~" + shown[len(home):]
+    if len(shown) <= limit:
+        return shown
+    return "…" + shown[-(limit - 1):]
+
+
 def _loop_target_label(loop: db.PromptLoop) -> str:
     if not loop.target_mission_id:
         return "ticker"
@@ -1788,6 +1808,153 @@ class LoopScreen(ModalScreen[Optional[LoopRequest]]):
         self.dismiss(None)
 
 
+class ProjectSwitchScreen(ModalScreen[Optional[ProjectSwitchRequest]]):
+    """Switch the visible cockpit scope between project tenants."""
+
+    CSS = """
+    ProjectSwitchScreen { align: center middle; }
+    #project-dialog {
+        width: 106;
+        height: 25;
+        border: round ansi_bright_green;
+        background: black;
+        padding: 1 2;
+    }
+    #project-dialog Label.title {
+        color: ansi_bright_green;
+        text-style: bold;
+        margin-bottom: 1;
+    }
+    #project-dialog Label.hint {
+        color: grey;
+        margin-bottom: 1;
+    }
+    #project_table {
+        height: 13;
+        margin-bottom: 1;
+    }
+    #project_detail {
+        height: 4;
+        border: round green;
+        padding: 0 1;
+        color: ansi_bright_green;
+        margin-bottom: 1;
+    }
+    Button { margin-right: 2; }
+    """
+
+    BINDINGS = [
+        Binding("escape", "close", "close"),
+        Binding("q", "close", "close"),
+        Binding("enter", "select_project", "select"),
+        Binding("j", "cursor_down", "next"),
+        Binding("k", "cursor_up", "prev"),
+        Binding("down", "cursor_down", "next", show=False),
+        Binding("up", "cursor_up", "prev", show=False),
+    ]
+
+    def __init__(
+        self,
+        *,
+        tenants: list[db.ProjectTenant],
+        current_tenant_id: str = "",
+        show_all: bool = False,
+    ):
+        super().__init__()
+        self.tenants = tenants
+        self.current_tenant_id = current_tenant_id
+        self.show_all = show_all
+        self.rows: list[ProjectSwitchRequest] = [
+            ProjectSwitchRequest(tenant_id="", show_all=True),
+            *[
+                ProjectSwitchRequest(tenant_id=tenant.tenant_id, show_all=False)
+                for tenant in tenants
+            ],
+        ]
+
+    def compose(self) -> ComposeResult:
+        with Container(id="project-dialog"):
+            yield Label(f"{RABBIT}  PROJECTS", classes="title")
+            yield Label("Enter selects a cockpit scope. Global shows every project.", classes="hint")
+            yield DataTable(id="project_table")
+            yield Static("", id="project_detail")
+            with Horizontal():
+                yield Button("select", variant="primary", id="project_select")
+                yield Button("close", id="project_close")
+
+    def on_mount(self) -> None:
+        table = self.query_one("#project_table", DataTable)
+        table.cursor_type = "row"
+        table.add_columns("SCOPE", "LIVE", "ROOT")
+        table.add_row(
+            "global fleet" + (" *" if self.show_all else ""),
+            str(len(db.all_missions())),
+            "all project tenants",
+        )
+        selected_row = 0 if self.show_all else 0
+        for idx, tenant in enumerate(self.tenants, start=1):
+            live_count = len(db.all_missions(tenant_id=tenant.tenant_id))
+            selected = " *" if tenant.tenant_id == self.current_tenant_id and not self.show_all else ""
+            if selected:
+                selected_row = idx
+            table.add_row(
+                f"{tenant.name or tenant.tenant_id}{selected}",
+                str(live_count),
+                _display_path(tenant.root_path),
+            )
+        table.cursor_coordinate = (selected_row, 0)
+        table.focus()
+        self._refresh_detail()
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "project_select":
+            self.action_select_project()
+        else:
+            self.action_close()
+
+    def on_data_table_row_highlighted(self, event) -> None:
+        self._refresh_detail()
+
+    def action_cursor_down(self) -> None:
+        table = self.query_one("#project_table", DataTable)
+        table.action_cursor_down()
+        self._refresh_detail()
+
+    def action_cursor_up(self) -> None:
+        table = self.query_one("#project_table", DataTable)
+        table.action_cursor_up()
+        self._refresh_detail()
+
+    def action_select_project(self) -> None:
+        request = self._selected_request()
+        if request is not None:
+            self.dismiss(request)
+
+    def action_close(self) -> None:
+        self.dismiss(None)
+
+    def _selected_request(self) -> Optional[ProjectSwitchRequest]:
+        table = self.query_one("#project_table", DataTable)
+        row = table.cursor_row or 0
+        if row < 0 or row >= len(self.rows):
+            return None
+        return self.rows[row]
+
+    def _refresh_detail(self) -> None:
+        request = self._selected_request()
+        if request is None:
+            detail = "No project selected."
+        elif request.show_all:
+            detail = "Global fleet: every live Morpheus session across all project roots."
+        else:
+            tenant = next((item for item in self.tenants if item.tenant_id == request.tenant_id), None)
+            if tenant is None:
+                detail = "Project no longer exists."
+            else:
+                detail = f"{tenant.name} ({tenant.root_kind})\n{tenant.root_path}"
+        self.query_one("#project_detail", Static).update(detail)
+
+
 class LoopManagerScreen(ModalScreen[Optional[LoopActionRequest]]):
     """Manage configured prompt loops without running long commands in the TUI."""
 
@@ -2144,7 +2311,8 @@ FOOTER_BINDINGS = [
     Binding("slash", "post_note", "note"),
     Binding("l", "new_loop", "loop"),
     Binding("shift+l", "manage_loops", "loops"),
-    Binding("t", "toggle_prd_tree", "tree"),
+    Binding("t", "switch_project", "project"),
+    Binding("o", "toggle_prd_tree", "tree"),
     Binding("w", "new_worker", "worker"),
     Binding("r", "resume_fresh", "resume"),
     Binding("ctrl+r", "refresh_now", "refresh", show=False),
@@ -2295,7 +2463,7 @@ class MorpheusApp(App):
         yield Footer()
 
     def _header_text(self, *, compact: bool) -> Text:
-        scope = "global" if self.show_all or self.project is None else self.project.name
+        scope = self._scope_text()
         if compact:
             title = Text("MORPHEUS", style="bold bright_green", justify="center")
             sub = Text(
@@ -2311,6 +2479,25 @@ class MorpheusApp(App):
             justify="center",
         )
         return banner + sub
+
+    def _scope_text(self) -> str:
+        if self.show_all or self.project is None:
+            return "global fleet - all projects"
+        hidden = self._hidden_mission_count()
+        hidden_text = f" - {hidden} hidden elsewhere" if hidden else ""
+        return (
+            f"project: {self.project.name} ({_display_path(self.project.root_path)})"
+            f"{hidden_text} - press t to switch"
+        )
+
+    def _hidden_mission_count(self) -> int:
+        tenant_id = self._tenant_filter()
+        if not tenant_id:
+            return 0
+        try:
+            return max(0, len(db.all_missions()) - len(db.all_missions(tenant_id=tenant_id)))
+        except Exception:
+            return 0
 
     def on_resize(self, event) -> None:
         self._apply_layout_mode()
@@ -2886,6 +3073,51 @@ class MorpheusApp(App):
             ),
             self._handle_loop_action_result,
         )
+
+    def action_switch_project(self) -> None:
+        try:
+            tenant_mod.backfill_known_tenants()
+            tenants = db.all_project_tenants(include_archived=False)
+        except Exception as e:
+            self._push_alert(Alert(time.time(), "error", f"project switch failed: {e}"))
+            return
+        self.push_screen(
+            ProjectSwitchScreen(
+                tenants=tenants,
+                current_tenant_id=self.tenant_id,
+                show_all=self.show_all,
+            ),
+            self._handle_project_switch_result,
+        )
+
+    def _handle_project_switch_result(self, result: Optional[ProjectSwitchRequest]) -> None:
+        if result is None:
+            return
+        if result.show_all:
+            self.project = None
+            self.show_all = True
+            self.tenant_id = ""
+        else:
+            project = db.get_project_tenant(result.tenant_id)
+            if project is None:
+                self._push_alert(Alert(time.time(), "error", "project no longer exists"))
+                return
+            self.project = project
+            self.show_all = False
+            self.tenant_id = project.tenant_id
+
+        in_scope = {mission.tab_id for mission in self._all_missions()}
+        self.live_buffers = {
+            tab_id: live for tab_id, live in self.live_buffers.items()
+            if not self.tenant_id or tab_id in in_scope
+        }
+        self.last_seen_tabs = in_scope
+        try:
+            self.query_one("#header", Static).update(self._header_text(compact="compact" in self.screen.classes))
+        except Exception:
+            pass
+        self._refresh_table()
+        self._push_alert(Alert(time.time(), "summary", f"project scope: {self._scope_text()}"))
 
     def action_toggle_card_details(self) -> None:
         try:

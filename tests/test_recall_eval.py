@@ -186,6 +186,8 @@ class RecallEvalLogicTest(unittest.TestCase):
             "did not succeed",
             "not successful",
             "unverified",
+            "10 passed, 2 errors",
+            "tests passed with 2 failures",
         ):
             with self.subTest(summary=summary):
                 event = db.MissionEvent(
@@ -396,6 +398,70 @@ class RecallEvalCliTest(unittest.TestCase):
         payload = json.loads(result.output)
         self.assertEqual(payload[0]["status"], "FAIL")
         self.assertIn("why", payload[0]["missing"])
+
+    def test_graph_recall_eval_defaults_to_cwd_project_scope(self) -> None:
+        runner = CliRunner()
+        now = time.time()
+        current_project = db.ProjectTenant(
+            tenant_id="p_current",
+            name="current",
+            root_path="/tmp/current",
+        )
+
+        def add_ready_mission(mission_id: str, tab_id: str, tenant_id: str) -> None:
+            db.upsert(
+                db.Mission(
+                    tab_id=tab_id,
+                    mission_id=mission_id,
+                    tenant_id=tenant_id,
+                    goal=mission_id,
+                    state="idle",
+                    buffer_changed_at=now - recall_eval.DEFAULT_STALE_SECONDS - 60,
+                )
+            )
+            db.upsert_memory(
+                db.MissionMemory(
+                    mission_id=mission_id,
+                    tenant_id=tenant_id,
+                    title=mission_id,
+                    why="prove project scoped recall eval",
+                    done_definition="only current project is evaluated by default",
+                    acceptance_criteria="--all includes every project",
+                    next_step="keep project boundaries intact",
+                    last_decision="default no-ref recall eval to cwd project",
+                    updated_at=now - recall_eval.DEFAULT_STALE_SECONDS - 60,
+                )
+            )
+            db.add_event(mission_id, kind="check", actor="codex", summary="tests passed")
+            db.add_artifact(
+                mission_id,
+                kind="test",
+                path_or_url=f"{mission_id}.log",
+                status="pass",
+                summary="passing project-scoped proof",
+            )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with (
+                patch.object(db, "DB_DIR", root),
+                patch.object(db, "DB_PATH", root / "morpheus.db"),
+                patch.object(cli.tenant_mod, "backfill_known_tenants", new=lambda: 0),
+                patch.object(cli.tenant_mod, "ensure_project_tenant", new=lambda path=None: current_project),
+            ):
+                add_ready_mission("m_current", "tab-current", "p_current")
+                add_ready_mission("m_other", "tab-other", "p_other")
+
+                scoped = runner.invoke(cli.app, ["graph", "recall-eval", "--json"])
+                global_result = runner.invoke(cli.app, ["graph", "recall-eval", "--all", "--json"])
+
+        self.assertEqual(scoped.exit_code, 0, scoped.output)
+        scoped_payload = json.loads(scoped.output)
+        self.assertEqual([item["mission_id"] for item in scoped_payload], ["m_current"])
+
+        self.assertEqual(global_result.exit_code, 0, global_result.output)
+        global_ids = {item["mission_id"] for item in json.loads(global_result.output)}
+        self.assertEqual(global_ids, {"m_current", "m_other"})
 
     def test_graph_recall_eval_rejects_ambiguous_prefix(self) -> None:
         runner = CliRunner()
