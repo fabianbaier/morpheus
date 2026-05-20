@@ -7,7 +7,14 @@ from unittest.mock import patch
 from textual.widgets import Input
 
 from morpheus import dashboard
-from morpheus.dashboard import MissionCardWidget, MorpheusApp, NewSessionScreen, NoteScreen
+from morpheus.dashboard import (
+    LiveBuffer,
+    MissionCardWidget,
+    MorpheusApp,
+    NewSessionScreen,
+    NoteScreen,
+    _tail_lines,
+)
 
 
 class DashboardHarness(MorpheusApp):
@@ -78,15 +85,31 @@ class DashboardTest(unittest.IsolatedAsyncioTestCase):
             summary="dashboard test",
             created_at=0,
         )
+        live = LiveBuffer(
+            tab_id=mission.tab_id,
+            goal=mission.goal,
+            state=mission.state,
+            last_event="active output",
+            buffer="alpha\nSearching the web\nfinal response line",
+            observed_at=0,
+        )
 
-        rendered = card._render_card(mission, memory, [event], [artifact]).plain
+        rendered = card._render_card(mission, memory, [event], [artifact], live).plain
 
         self.assertIn("Graph card", rendered)
         self.assertIn("phase: planning", rendered)
         self.assertIn("why: recover stale agent intent", rendered)
         self.assertIn("next: wire edit flow", rendered)
+        self.assertIn("LATEST OUTPUT", rendered)
+        self.assertIn("Searching the web", rendered)
+        self.assertIn("final response line", rendered)
         self.assertIn("decision build card before edit flow", rendered)
         self.assertIn("pass test tests/test_dashboard.py", rendered)
+
+    def test_tail_lines_prefers_recent_non_empty_output(self) -> None:
+        rendered = _tail_lines("old\n\nmiddle\nlatest and very long", limit=2, width=12)
+
+        self.assertEqual(rendered, ["middle", "latest and …"])
 
     async def test_dashboard_and_modal_css_mounts(self) -> None:
         app = DashboardHarness()

@@ -5,9 +5,9 @@ The morpheus tab is your command center; the iTerm tabs are your workers.
 
   ┌─ MORPHEUS banner ─────────────────────────────────────────────────────┐
   │                                                                       │
-  │  ┌── rain ────────────┐  ┌── missions (sorted newest-active first) ┐  │
-  │  │  vertical katakana │  │  cursor-navigable, ticker-flash on      │  │
-  │  │  per session       │  │  state change (green/yellow/red row)    │  │
+  │  ┌── live streams ────┐  ┌── missions (sorted newest-active first) ┐  │
+  │  │  terminal tails +  │  │  cursor-navigable, ticker-flash on      │  │
+  │  │  Matrix separators │  │  state change (green/yellow/red row)    │  │
   │  └────────────────────┘  └────────────────────────────────────────┘   │
   │  ┌── 🐇 alerts ──────────────────────────────────────────────────┐    │
   │  └────────────────────────────────────────────────────────────────┘   │
@@ -18,6 +18,7 @@ The morpheus tab is your command center; the iTerm tabs are your workers.
 from __future__ import annotations
 
 import asyncio
+import random
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -100,14 +101,26 @@ class Alert:
         return t
 
 
+@dataclass
+class LiveBuffer:
+    tab_id: str
+    goal: str
+    state: str
+    last_event: str
+    buffer: str
+    observed_at: float
+
+
 # ── rain widget ───────────────────────────────────────────────────────────
 
-class RainWidget(Static):
-    """Static widget that owns a rain.Rain and renders it every tick."""
+class LiveStreamWidget(Static):
+    """Live terminal tails with Matrix texture between session streams."""
 
     def __init__(self, **kw):
         super().__init__("", **kw)
         self.rain: Optional[rain_mod.Rain] = None
+        self.buffers: dict[str, LiveBuffer] = {}
+        self.selected_tab_id: Optional[str] = None
 
     def on_show(self) -> None:
         self._ensure_rain()
@@ -130,6 +143,11 @@ class RainWidget(Static):
             cols, rows = self._inner_size()
             self.rain = rain_mod.Rain(cols=cols, rows=rows)
 
+    def update_buffers(self, buffers: dict[str, LiveBuffer], selected_tab_id: Optional[str]) -> None:
+        self.buffers = buffers
+        self.selected_tab_id = selected_tab_id
+        self._render_live()
+
     def tick_rain(self, missions: list[db.Mission]) -> None:
         if self.rain is None:
             self._ensure_rain()
@@ -137,7 +155,95 @@ class RainWidget(Static):
             return
         self.rain.update_missions(missions)
         self.rain.tick()
-        self.update(self.rain.render())
+        self._render_live()
+
+    def _render_live(self) -> None:
+        width = max(24, self.size.width - 4)
+        height = max(6, self.size.height - 2)
+        text = Text()
+        text.append("LIVE STREAMS\n", style="bold bright_green")
+
+        ordered = self._ordered_buffers()
+        if not ordered:
+            text.append("waiting for observed terminal output\n", style=COL_DIMMER)
+            text.append(self._matrix_line(width), style="color(22)")
+            self.update(text)
+            return
+
+        used_lines = 1
+        for i, live in enumerate(ordered[:4]):
+            if used_lines >= height - 2:
+                break
+            if i > 0:
+                text.append(self._matrix_line(width), style="color(22)")
+                text.append("\n")
+                used_lines += 1
+
+            header = self._stream_header(live, width)
+            text.append(header)
+            text.append("\n")
+            used_lines += 1
+
+            remaining = max(1, height - used_lines - 1)
+            line_budget = min(5 if live.tab_id == self.selected_tab_id else 3, remaining)
+            for line in _tail_lines(live.buffer, limit=line_budget, width=width):
+                style = "bright_white" if live.tab_id == self.selected_tab_id else COL_BODY
+                text.append(line, style=style)
+                text.append("\n")
+                used_lines += 1
+                if used_lines >= height - 1:
+                    break
+
+        if used_lines < height - 1:
+            text.append(self._matrix_line(width), style="color(22)")
+        self.update(text)
+
+    def _ordered_buffers(self) -> list[LiveBuffer]:
+        items = list(self.buffers.values())
+        if not items:
+            return []
+        state_order = {"blocked": 0, "crashed": 1, "working": 2, "idle": 3, "finished": 4, "unknown": 5}
+        return sorted(
+            items,
+            key=lambda item: (
+                0 if item.tab_id == self.selected_tab_id else 1,
+                state_order.get(item.state, 9),
+                -item.observed_at,
+            ),
+        )
+
+    def _stream_header(self, live: LiveBuffer, width: int) -> Text:
+        tab_short = (live.tab_id or "?").split("-")[0]
+        emoji = naming.STATE_EMOJI.get(live.state, "⚪")
+        label = f"{emoji} {tab_short} {live.goal or '(untitled)'}"
+        age = naming.format_age(max(0.0, time.time() - live.observed_at))
+        suffix = f" {live.state} · {age} ago"
+        raw = _truncate(f"{label} {suffix}", width)
+        style = "bold bright_green" if live.tab_id == self.selected_tab_id else STATE_TEXT_STYLE.get(live.state, COL_BODY)
+        return Text(raw, style=style)
+
+    def _matrix_line(self, width: int) -> str:
+        if width <= 0:
+            return ""
+        return "".join(random.choice(rain_mod.CHARS) for _ in range(width))
+
+
+RainWidget = LiveStreamWidget
+
+
+def _tail_lines(buffer: str, limit: int, width: int) -> list[str]:
+    lines = [line.rstrip() for line in buffer.splitlines()]
+    lines = [line for line in lines if line.strip()]
+    if not lines:
+        return ["(no visible output yet)"]
+    return [_truncate(line, width) for line in lines[-limit:]]
+
+
+def _truncate(value: str, width: int) -> str:
+    cleaned = value.replace("\t", "    ")
+    if len(cleaned) <= width:
+        return cleaned
+    return cleaned[: max(0, width - 1)] + "…"
 
 
 # ── missions table ────────────────────────────────────────────────────────
@@ -215,7 +321,7 @@ class MissionCardWidget(Static):
     def on_mount(self) -> None:
         self.update(self._empty())
 
-    def update_card(self, mission: Optional[db.Mission]) -> None:
+    def update_card(self, mission: Optional[db.Mission], live: Optional[LiveBuffer] = None) -> None:
         if mission is None:
             self.update(self._empty())
             return
@@ -223,7 +329,7 @@ class MissionCardWidget(Static):
         memory = db.get_memory(mission.mission_id) if mission.mission_id else None
         events = db.recent_events(mission.mission_id, limit=5) if mission.mission_id else []
         artifacts = db.artifacts_for_mission(mission.mission_id, limit=5) if mission.mission_id else []
-        self.update(self._render_card(mission, memory, events, artifacts))
+        self.update(self._render_card(mission, memory, events, artifacts, live))
 
     def _empty(self) -> Text:
         text = Text()
@@ -237,6 +343,7 @@ class MissionCardWidget(Static):
         memory: Optional[db.MissionMemory],
         events: list[db.MissionEvent],
         artifacts: list[db.MissionArtifact],
+        live: Optional[LiveBuffer] = None,
     ) -> Text:
         text = Text()
         title = (memory.title if memory else "") or mission.goal or "(untitled)"
@@ -272,6 +379,14 @@ class MissionCardWidget(Static):
         self._field(text, "confidence", f"{memory.confidence:.2f}")
         if memory.topic:
             self._field(text, "topic", memory.topic)
+
+        text.append("\nLATEST OUTPUT\n", style="bold bright_green")
+        if live and live.buffer:
+            for line in _tail_lines(live.buffer, limit=6, width=90):
+                text.append(line, style=COL_BODY)
+                text.append("\n")
+        else:
+            text.append("unset\n", style=COL_DIMMER)
 
         text.append("\nEVENTS\n", style="bold bright_green")
         if events:
@@ -562,6 +677,7 @@ class MorpheusApp(App):
         self.flashing: dict[str, tuple[float, str]] = {}
         self.last_seen_tabs: set[str] = set()
         self.last_seen_note_id: int = 0
+        self.live_buffers: dict[str, LiveBuffer] = {}
         self.log_handle = None
 
     # ── compose ────────────────────────────────────────────────────────────
@@ -641,6 +757,7 @@ class MorpheusApp(App):
                 self.iterm_conn, self.log_handle,
                 on_state_change=self._on_state_change,
                 on_alert=self._on_alert,
+                on_tab_observed=self._on_tab_observed,
             )
             missions = db.all_missions()
             self._scan_new_missions(missions)
@@ -653,6 +770,16 @@ class MorpheusApp(App):
         alert_kind = "state" if kind.startswith("token") else "error"
         self._push_alert(Alert(time.time(), alert_kind, text))
 
+    async def _on_tab_observed(self, tab: iterm_client.TabInfo, mission: db.Mission, detection) -> None:
+        self.live_buffers[tab.tab_id] = LiveBuffer(
+            tab_id=tab.tab_id,
+            goal=mission.goal,
+            state=mission.state,
+            last_event=detection.last_event,
+            buffer=tab.buffer,
+            observed_at=time.time(),
+        )
+
     def _do_rain_animate(self) -> None:
         try:
             missions = db.all_missions()
@@ -661,6 +788,7 @@ class MorpheusApp(App):
         try:
             rain_widget = self.query_one(RainWidget)
             rain_widget.tick_rain(missions)
+            self._refresh_live_stream()
         except Exception:
             pass
 
@@ -676,8 +804,22 @@ class MorpheusApp(App):
             table = self.query_one(MissionsTable)
             table.refresh_rows(missions, self.flashing)
             self._refresh_mission_card(missions)
+            self._refresh_live_stream()
         except Exception:
             pass
+
+    def _selected_tab_id(self) -> Optional[str]:
+        try:
+            return self.query_one(MissionsTable).selected_tab_id()
+        except Exception:
+            return None
+
+    def _refresh_live_stream(self) -> None:
+        try:
+            stream = self.query_one(RainWidget)
+        except Exception:
+            return
+        stream.update_buffers(self.live_buffers, self._selected_tab_id())
 
     def _refresh_mission_card(self, missions: Optional[list[db.Mission]] = None) -> None:
         try:
@@ -696,7 +838,7 @@ class MorpheusApp(App):
             mission = next((m for m in missions if m.tab_id == tab_id), None)
         if mission is None:
             mission = db.get(tab_id)
-        card.update_card(mission)
+        card.update_card(mission, self.live_buffers.get(tab_id))
 
     # ── change detection / alerts ──────────────────────────────────────────
 
@@ -728,6 +870,7 @@ class MorpheusApp(App):
                 f"new session [{m.goal or '(untitled)'}] {t.split('-')[0]}",
             ))
         for t in closed_tabs:
+            self.live_buffers.pop(t, None)
             self._push_alert(Alert(
                 time.time(), "close",
                 f"session [{t.split('-')[0]}] closed",

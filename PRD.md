@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| **Status** | v0.7.0a2 in progress (Mission Graph storage + selected dashboard card implemented) |
+| **Status** | v0.7.0a3 implemented (live session streams + selected dashboard card); next: edit mission flow |
 | **Author** | Fabian Baier |
 | **Last updated** | 2026-05-20 |
 | **Target platform** | macOS + iTerm2 |
@@ -421,7 +421,7 @@ mission graph memory, provenance, loop phase, and proof tracking.
 |---|---|
 | `morpheus/cli.py` | Typer entry points |
 | `morpheus/core.py` | The tick loop and `_tick()` |
-| `morpheus/dashboard.py` | Textual cockpit with Matrix rain, mission table, alerts, keybindings |
+| `morpheus/dashboard.py` | Textual cockpit with live session streams, Matrix texture, mission table, mission card, alerts, keybindings |
 | `morpheus/db.py` | SQLite schema, `Mission`, `MissionMemory`, `MissionEvent`, `MissionArtifact`, `MissionEdge`, `Note`, CRUD |
 | `morpheus/detect.py` | State classifier from pane buffer |
 | `morpheus/iterm_client.py` | Thin async wrapper over iterm2 Python API |
@@ -604,6 +604,7 @@ This table is the source of truth for where the product stands right now.
 | Provenance model | Foundation implemented | Graph fields store source kind/ref and confidence; UI trust treatment still pending |
 | Loop phase / proof tracking | Foundation implemented | `phase`, `last_verified_at`, events, artifacts exist; selected cockpit card now displays phase/events/artifacts |
 | Mission card panel | Implemented in v0.7.0a2 | Right-side Textual card shows selected mission graph fields, events, artifacts, unset memory gaps |
+| Live session streams | Implemented in v0.7.0a3 | Left panel now renders real terminal tails from selected/recent sessions with Matrix separators |
 | Edit mission flow | Not implemented | `e` opens goal/why/plan/next/criteria/source/proof editor |
 | Brief selected | Not implemented | `b` renders a cited why/status/next card from graph + transcript tail |
 | Resume fresh | Not implemented | `r` snapshots, archives old attachment, spawns replacement with mission context |

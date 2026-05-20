@@ -37,7 +37,7 @@ def setup_logging(verbose: bool = False) -> logging.Logger:
 
 
 async def _tick(connection, log: logging.Logger,
-                on_state_change=None, on_alert=None) -> int:
+                on_state_change=None, on_alert=None, on_tab_observed=None) -> int:
     """One observation cycle. Returns count of tabs processed.
 
     `on_alert(kind, mission, text)` fires for v0.4 derived alerts (token guard,
@@ -93,6 +93,9 @@ async def _tick(connection, log: logging.Logger,
 
         prev.state = new_state
         db.upsert(prev)
+
+        if on_tab_observed is not None:
+            await on_tab_observed(tab, prev, d)
 
         age = naming.now_minus(prev.buffer_changed_at)
         new_title = naming.build_tab_title(prev.goal, new_state, d.last_event, age)

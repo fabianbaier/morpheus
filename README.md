@@ -52,7 +52,7 @@ make watch          # foreground watcher instead of launchd
 make graph-status   # mission graph table counts and health checks
 make doctor         # iTerm2 Python API diagnostic
 make logs           # tail ~/.morpheus/daemon.log
-make test           # compileall + git diff whitespace check
+make test           # install editable, compileall, unit tests, whitespace check
 ```
 
 Override the daemon poll interval when testing:
@@ -68,6 +68,13 @@ Run the cockpit:
 ```bash
 morpheus
 ```
+
+Inside the cockpit, the left panel shows recent terminal output from the
+selected and most relevant sessions with Matrix separators between streams. The
+mission table controls selection, and the right card shows the selected mission's
+graph memory plus the latest terminal tail. Use `j`/`k` or arrows to move, then
+press `Enter` to jump into the real iTerm tab when you need to respond directly.
+Use `n` to spawn a new session without leaving Morpheus.
 
 Core commands:
 
@@ -117,8 +124,9 @@ Runtime pieces:
 
 - `morpheus/core.py` polls iTerm every few seconds, detects state, updates tab
   titles, writes context files, and records live sessions.
-- `morpheus/dashboard.py` renders the Textual cockpit with Matrix rain, mission
-  table, alerts, and keyboard actions.
+- `morpheus/dashboard.py` renders the Textual cockpit with live session streams,
+  Matrix texture, mission table, selected mission card, alerts, and keyboard
+  actions.
 - `morpheus/daemon.py` installs a launchd watcher so tab titles and context stay
   fresh even when the cockpit is closed.
 - `morpheus/db.py` owns SQLite storage for live session attachments, notes,
@@ -199,9 +207,10 @@ Next implementation phases:
 
 1. Stable mission IDs and graph storage. Done in `0.7.0a1`.
 2. Mission card panel in the cockpit. Done in `0.7.0a2`.
-3. Edit mission flow for why/plan/next/provenance/proof fields.
-4. `b` brief-selected using mission graph plus transcript tail.
-5. Resume-fresh flow that snapshots, archives old attachment, and spawns a new
+3. Live terminal streams in the cockpit. Done in `0.7.0a3`.
+4. Edit mission flow for why/plan/next/provenance/proof fields.
+5. `b` brief-selected using mission graph plus transcript tail.
+6. Resume-fresh flow that snapshots, archives old attachment, and spawns a new
    session linked by a `spawned_from` edge.
 
 > "I can only show you the door. You're the one that has to walk through it."
