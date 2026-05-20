@@ -19,6 +19,14 @@ except ImportError as e:  # pragma: no cover
     ) from e
 
 
+ENTER = "\r"
+
+
+def text_with_enter(text: str) -> str:
+    """Append the key sequence terminal TUIs treat as Enter."""
+    return text.rstrip("\r\n") + ENTER
+
+
 @dataclass
 class TabInfo:
     tab_id: str
@@ -133,7 +141,7 @@ async def spawn_tab(
             pass
 
     if command:
-        await session.async_send_text(command.rstrip("\n") + "\n")
+        await session.async_send_text(text_with_enter(command))
 
     return TabInfo(
         tab_id=new_tab.tab_id,

@@ -879,7 +879,8 @@ def _tab_id_for_session(session_id: str) -> Optional[str]:
 
 
 def _broadcast_payload(text: str, *, submit: bool) -> str:
-    return f"[morpheus broadcast] {text}" + ("\n" if submit else "")
+    payload = f"[morpheus broadcast] {text}"
+    return iterm_client.text_with_enter(payload) if submit else payload
 
 
 def _resolve_broadcast_targets(
