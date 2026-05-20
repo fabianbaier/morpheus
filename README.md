@@ -90,6 +90,8 @@ morpheus brief
 morpheus ask "what needs my attention?"
 morpheus graph status
 morpheus graph show <mission-or-tab-prefix>
+morpheus run find-prds .
+morpheus run start ./PRD.md --cmd "codex"
 ```
 
 Cross-session notes:
@@ -135,6 +137,8 @@ Runtime pieces:
   ledgers, and the v0.7 mission graph tables.
 - `morpheus/mission_graph.py` resolves mission IDs/tab IDs and provides graph
   health helpers.
+- `morpheus/prd_runs.py` finds PRDs/specs and creates coordinator-led parent
+  missions for v0.8 PRD Runs.
 - `morpheus/context.py` writes `~/.morpheus/context.md` and `.json` so agents can
   see sibling sessions.
 - `morpheus/mcp_server.py` exposes Morpheus state to Claude Code / Codex via MCP.
@@ -165,6 +169,24 @@ morpheus graph artifact <ref> ./pytest.log --kind test --status pass
 Snapshots automatically attach a `snapshot` artifact to the selected mission.
 When a tab is closed or disappears, the live attachment is removed but the
 mission memory is archived instead of forgotten.
+
+## PRD Runs
+
+v0.8 starts a conservative PRD Run workflow. From the cockpit, `n` shows PRD/spec
+candidates from the selected worktree; picking one creates a parent mission from
+the PRD, writes a status file under `~/.morpheus/runs/<mission>/`, and spawns one
+coordinator tab linked by a graph edge.
+
+From the CLI:
+
+```bash
+morpheus run find-prds .
+morpheus run start ./PRD.md --cmd "codex"
+```
+
+The coordinator is responsible for reading the PRD, proposing safe child-worker
+slices, and recording status in Morpheus events/artifacts. Automatic fan-out is
+intentionally not enabled yet.
 
 ## State Files
 
@@ -203,7 +225,7 @@ make daemon
 
 ## Roadmap
 
-Current status: v0.6 runtime is shipped. v0.7 is the Mission Graph Cockpit.
+Current status: v0.8 PRD Runs foundation is underway.
 
 Next implementation phases:
 
@@ -214,9 +236,12 @@ Next implementation phases:
 5. Matrix rain output shards. Done in `0.7.0a5`.
 6. Robust self-tab exclusion. Done in `0.7.0a6`.
 7. Ready-response rabbit ticker headlines. Done in `0.7.0a7`.
-8. Edit mission flow for why/plan/next/provenance/proof fields.
-9. `b` brief-selected using mission graph plus transcript tail.
-10. Resume-fresh flow that snapshots, archives old attachment, and spawns a new
+8. PRD Runs foundation. Done in `0.8.0a1`.
+9. Collapsible PRD run tree in the cockpit.
+10. Manual child-worker spawn under a PRD run.
+11. Edit mission flow for why/plan/next/provenance/proof fields.
+12. `b` brief-selected using mission graph plus transcript tail.
+13. Resume-fresh flow that snapshots, archives old attachment, and spawns a new
    session linked by a `spawned_from` edge.
 
 > "I can only show you the door. You're the one that has to walk through it."

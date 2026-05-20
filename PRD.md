@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| **Status** | v0.7.0a7 implemented (ready-response rabbit ticker); next: edit mission flow |
+| **Status** | v0.8.0a1 implemented (PRD Runs foundation); next: child-worker tree UI |
 | **Author** | Fabian Baier |
 | **Last updated** | 2026-05-20 |
 | **Target platform** | macOS + iTerm2 |
@@ -359,10 +359,38 @@ The CLI remains the scriptable surface for the same mission model:
 | `morpheus ask "<query>"` | Ask questions over current Morpheus state |
 | `morpheus poll-prs` | One-shot PR review queue poll and optional draft spawn |
 | `morpheus ledger costs/actions` | Inspect cost and action ledgers |
+| `morpheus run find-prds [root]` | List PRD/spec candidates in a worktree |
+| `morpheus run start <prd> [--cmd codex]` | Create a PRD parent mission, spawn one coordinator tab, and link it |
 | `morpheus mcp serve` | Expose Morpheus state to agent tools |
 | `morpheus doctor` | Diagnose iTerm2 + Python API connectivity |
 
-### 6.5 Cross-session context
+### 6.5 PRD Runs
+
+PRD Runs are the v0.8 product wedge: a durable parent mission created from a PRD
+or spec file, with coordinator and worker sessions linked underneath it.
+
+Conservative v1 behavior:
+
+- The new-session flow shows PRD/spec candidates from the selected worktree or
+  current working directory.
+- Choosing a PRD creates a parent `mission_memory` row with `source_kind=prd`,
+  a source artifact, and a run status file under `~/.morpheus/runs/<mission>/`.
+- Morpheus spawns exactly one coordinator tab and links it to the parent mission
+  with a `coordinator` edge.
+- The coordinator prompt tells the agent to read the PRD, propose worker slices,
+  write status to Morpheus events/artifacts, and avoid automatic fan-out.
+- Child workers are manual in v0.8. Automatic decomposition belongs in v0.9
+  after the tree model and ownership boundaries feel correct.
+
+Future v0.8 work:
+
+- Show parent/child PRD runs as collapsible trees in the mission table.
+- Add explicit `spawn child worker` under selected PRD run.
+- Record per-child ownership, file paths, proof requirements, and blockers.
+- Add a run status updater that writes mission events and keeps the status file
+  aligned with the graph.
+
+### 6.6 Cross-session context
 
 Two files maintained by the tick loop:
 
@@ -479,6 +507,7 @@ mission graph memory, provenance, loop phase, and proof tracking.
 | `morpheus/config.py` | `~/.morpheus/config.toml` defaults and loader |
 | `morpheus/mcp_server.py` | MCP tools exposing read-only state + notes/claims |
 | `morpheus/mission_graph.py` | v0.7 graph helpers: provenance, edges, stale/lint checks |
+| `morpheus/prd_runs.py` | v0.8 PRD run helpers: PRD discovery, parent mission creation, coordinator prompt/status files |
 | `morpheus/proof.py` | v0.7 proof artifact capture and last-check summaries |
 
 ### 7.3 State schema
@@ -653,6 +682,9 @@ This table is the source of truth for where the product stands right now.
 | Matrix rain output shards | Implemented in v0.7.0a5 | Left panel is rain-first again: real terminal output is embedded as falling bright shards inside the Matrix rain instead of rendered as a static terminal tail |
 | Robust self-tab exclusion | Implemented in v0.7.0a6 | Dashboard passes its own tab/session IDs into the watcher; core also recognizes the Morpheus screen by buffer if iTerm leaves the title as `Python"` |
 | Ready-response rabbit ticker | Implemented in v0.7.0a7 | `working → idle` now emits a `ready [...]` headline from the latest substantive terminal output, so Codex answers that return to the prompt show in the bottom ticker |
+| PRD Runs foundation | Implemented in v0.8.0a1 | PRD finder, new-session PRD selector, parent mission creation, coordinator prompt/status files, `morpheus run start`, and coordinator graph edge shipped |
+| PRD run tree UI | Not implemented | Show parent PRD rows with collapsible coordinator/worker children in the mission table |
+| PRD child worker spawn | Not implemented | Manual worker spawn under selected parent with file/path ownership and proof requirements |
 | Edit mission flow | Not implemented | `e` opens goal/why/plan/next/criteria/source/proof editor |
 | Brief selected | Not implemented | `b` renders a cited why/status/next card from graph + transcript tail |
 | Resume fresh | Not implemented | `r` snapshots, archives old attachment, spawns replacement with mission context |

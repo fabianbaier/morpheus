@@ -11,6 +11,7 @@ from morpheus.dashboard import (
     LiveBuffer,
     MissionCardWidget,
     MorpheusApp,
+    NewSessionRequest,
     NewSessionScreen,
     NoteScreen,
     _session_headline,
@@ -301,6 +302,53 @@ class DashboardTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(captured["mission"].session_id, "session-123456")
         self.assertEqual(captured["mission"].goal, "review a PR")
         self.assertEqual(captured["mission"].cmd, "codex")
+
+    async def test_new_session_with_prd_creates_run_and_coordinator(self) -> None:
+        app = DashboardHarness()
+        app.iterm_conn = object()
+        done = asyncio.Event()
+        captured = {}
+        run = SimpleNamespace(
+            parent_id="m_parent",
+            title="PRD Runs",
+            prd_path="/tmp/PRD.md",
+            status_path="/tmp/status.md",
+            prompt_path="/tmp/prompt.md",
+        )
+
+        async def fake_spawn_tab(connection, *, command, goal):
+            captured["spawn"] = (connection, command, goal)
+            return SimpleNamespace(tab_id="tab-123456", session_id="session-123456")
+
+        def fake_upsert(mission):
+            mission.mission_id = "m_child"
+            captured["mission"] = mission
+
+        def fake_attach(created_run, mission):
+            captured["attach"] = (created_run, mission)
+            done.set()
+
+        with patch.object(
+            dashboard.prd_runs, "create_prd_run", new=lambda path, title=None: run
+        ), patch.object(
+            dashboard.prd_runs, "coordinator_command", new=lambda cmd, run: f"{cmd} --coordinator"
+        ), patch.object(
+            dashboard.prd_runs, "attach_coordinator", new=fake_attach
+        ), patch.object(
+            dashboard.iterm_client, "spawn_tab", new=fake_spawn_tab
+        ), patch.object(dashboard.db, "upsert", new=fake_upsert):
+            await app._handle_new_session_result(
+                NewSessionRequest(goal="", command="codex", prd_path="/tmp/PRD.md")
+            )
+            await asyncio.wait_for(done.wait(), timeout=1)
+
+        connection, command, goal = captured["spawn"]
+        self.assertIs(connection, app.iterm_conn)
+        self.assertEqual(command, "codex --coordinator")
+        self.assertEqual(goal, "PRD Runs coordinator")
+        self.assertEqual(captured["mission"].goal, "PRD Runs coordinator")
+        self.assertEqual(captured["mission"].cmd, "codex --coordinator")
+        self.assertEqual(captured["attach"], (run, captured["mission"]))
 
     async def test_post_note_key_opens_modal_and_records_note(self) -> None:
         app = DashboardHarness()

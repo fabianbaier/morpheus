@@ -23,6 +23,7 @@ import re
 import time
 from collections import deque
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional
 
 import iterm2
@@ -31,10 +32,11 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Container, Horizontal, Vertical
 from textual.screen import ModalScreen
-from textual.widgets import Button, DataTable, Footer, Input, Label, RichLog, Static
+from textual.widgets import Button, DataTable, Footer, Input, Label, RichLog, Select, Static
 
 from morpheus import context as ctx_mod
 from morpheus import core, db, iterm_client, naming, rain as rain_mod
+from morpheus import prd_runs
 from morpheus import __version__
 
 # ── content / palette ─────────────────────────────────────────────────────
@@ -114,6 +116,13 @@ class LiveBuffer:
     last_event: str
     buffer: str
     observed_at: float
+
+
+@dataclass
+class NewSessionRequest:
+    goal: str
+    command: str
+    prd_path: str = ""
 
 
 @dataclass
@@ -618,7 +627,7 @@ def _join_nonempty(*parts: str) -> str:
 
 # ── modal: spawn new session ──────────────────────────────────────────────
 
-class NewSessionScreen(ModalScreen[Optional[tuple[str, str]]]):
+class NewSessionScreen(ModalScreen[Optional[NewSessionRequest]]):
     """Modal form to spawn a new iTerm tab + register a mission card."""
 
     CSS = """
@@ -627,7 +636,7 @@ class NewSessionScreen(ModalScreen[Optional[tuple[str, str]]]):
     }
     #dialog {
         width: 70;
-        height: 16;
+        height: 20;
         border: round ansi_bright_green;
         background: black;
         padding: 1 2;
@@ -649,6 +658,12 @@ class NewSessionScreen(ModalScreen[Optional[tuple[str, str]]]):
     Input:focus {
         border: round ansi_bright_green;
     }
+    Select {
+        background: black;
+        color: ansi_bright_green;
+        border: round green;
+        margin: 0 0 1 0;
+    }
     #buttons {
         height: 3;
         align: center middle;
@@ -663,11 +678,23 @@ class NewSessionScreen(ModalScreen[Optional[tuple[str, str]]]):
         Binding("ctrl+enter", "submit", "spawn"),
     ]
 
+    def __init__(
+        self,
+        prd_candidates: Optional[list[prd_runs.PRDCandidate]] = None,
+        root: Optional[Path] = None,
+    ):
+        super().__init__()
+        self.prd_candidates = prd_candidates or []
+        self.root = root or Path.cwd()
+
     def compose(self) -> ComposeResult:
         with Container(id="dialog"):
             yield Label(f"{RABBIT}  SPAWN NEW SESSION", classes="title")
             yield Input(placeholder="goal — one line, e.g. 'PR #224 review'", id="goal_input")
             yield Input(placeholder="command — e.g. 'codex' or 'claude'", id="cmd_input")
+            options = [("no PRD run", "")]
+            options.extend((candidate.label, str(candidate.path)) for candidate in self.prd_candidates)
+            yield Select(options, prompt="PRD run (optional)", allow_blank=False, value="", id="prd_select")
             yield Label("enter to spawn · esc to cancel", classes="hint")
             with Horizontal(id="buttons"):
                 yield Button("spawn", id="spawn_btn", variant="success")
@@ -679,8 +706,10 @@ class NewSessionScreen(ModalScreen[Optional[tuple[str, str]]]):
     def action_submit(self) -> None:
         goal = self.query_one("#goal_input", Input).value
         cmd = self.query_one("#cmd_input", Input).value
+        prd_value = self.query_one("#prd_select", Select).value
+        prd_path = prd_value if isinstance(prd_value, str) else ""
         if cmd:
-            self.dismiss((goal, cmd))
+            self.dismiss(NewSessionRequest(goal=goal.strip(), command=cmd.strip(), prd_path=prd_path))
 
     def action_cancel(self) -> None:
         self.dismiss(None)
@@ -1194,16 +1223,28 @@ class MorpheusApp(App):
     def action_new_session(self) -> None:
         if self.iterm_conn is None:
             return
-        self.push_screen(NewSessionScreen(), self._handle_new_session_result)
+        root = self._selected_worktree_or_cwd()
+        candidates = prd_runs.find_prds(root)
+        self.push_screen(NewSessionScreen(prd_candidates=candidates, root=root), self._handle_new_session_result)
 
-    async def _handle_new_session_result(self, result: Optional[tuple[str, str]]) -> None:
+    async def _handle_new_session_result(self, result: Optional[NewSessionRequest]) -> None:
         if not result:
             return
-        goal, cmd = result
+        goal = result.goal
+        cmd = result.command
         if not cmd:
             return
         if self.iterm_conn is None:
             return
+        run = None
+        if result.prd_path:
+            try:
+                run = prd_runs.create_prd_run(result.prd_path, title=goal or None)
+                goal = f"{run.title} coordinator"
+                cmd = prd_runs.coordinator_command(cmd, run)
+            except Exception as e:
+                self._push_alert(Alert(time.time(), "error", f"PRD run failed: {e}"))
+                return
         try:
             info = await iterm_client.spawn_tab(self.iterm_conn, command=cmd, goal=goal)
         except Exception as e:
@@ -1220,7 +1261,25 @@ class MorpheusApp(App):
             buffer_changed_at=now, last_event_at=now, created_at=now,
         )
         db.upsert(m)
+        if run is not None:
+            prd_runs.attach_coordinator(run, m)
+            self._push_alert(Alert(
+                time.time(), "spawn",
+                f"PRD run [{run.title}] coordinator spawned {info.tab_id.split('-')[0]}",
+            ))
         # Alert will fire on next _scan_new_missions.
+
+    def _selected_worktree_or_cwd(self) -> Path:
+        try:
+            table = self.query_one(MissionsTable)
+            tab_id = table.selected_tab_id()
+            if tab_id:
+                mission = db.get(tab_id)
+                if mission and mission.linked_worktree:
+                    return Path(mission.linked_worktree)
+        except Exception:
+            pass
+        return Path.cwd()
 
     async def action_kill_session(self) -> None:
         if self.iterm_conn is None:

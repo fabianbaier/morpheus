@@ -225,6 +225,10 @@ def _new_mission_id(now: Optional[float] = None) -> str:
     return f"m_{ts}_{secrets.token_hex(4)}"
 
 
+def new_mission_id(now: Optional[float] = None) -> str:
+    return _new_mission_id(now)
+
+
 def _ensure_mission_identity(conn: sqlite3.Connection, mission: Mission) -> None:
     if mission.mission_id:
         return

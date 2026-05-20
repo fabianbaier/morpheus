@@ -18,7 +18,7 @@ from morpheus import ask as ask_mod
 from morpheus import brief as brief_mod
 from morpheus import config as cfg_mod
 from morpheus import context as ctx_mod
-from morpheus import core, daemon as daemon_mod, db, iterm_client, ledger as ledger_mod, mission_graph as graph_mod, naming, notifier as notifier_mod, trigger as trigger_mod, __version__
+from morpheus import core, daemon as daemon_mod, db, iterm_client, ledger as ledger_mod, mission_graph as graph_mod, naming, notifier as notifier_mod, prd_runs, trigger as trigger_mod, __version__
 
 app = typer.Typer(
     name="morpheus",
@@ -143,6 +143,73 @@ def spawn(
         console.print(f"  cmd: [dim]{command}[/dim]")
 
     iterm_client.run(_do)
+
+
+# ───────── PRD runs (v0.8 foundation) ─────────
+
+run_app = typer.Typer(help="Start and inspect PRD-backed coordinator runs.")
+app.add_typer(run_app, name="run")
+
+
+@run_app.command("start")
+def run_start(
+    prd: Path = typer.Argument(..., help="PRD/spec file to use as the parent mission."),
+    command: str = typer.Option("codex", "--cmd", "-c", help="Coordinator command, e.g. 'codex' or 'claude'."),
+    title: Optional[str] = typer.Option(None, "--title", "-t", help="Override the PRD title."),
+):
+    """Create a PRD parent mission, spawn one coordinator tab, and link it."""
+    run = prd_runs.create_prd_run(prd, title=title)
+    coordinator_goal = f"{run.title} coordinator"
+    coordinator_cmd = prd_runs.coordinator_command(command, run)
+
+    async def _do(connection):
+        info = await iterm_client.spawn_tab(
+            connection,
+            command=coordinator_cmd,
+            goal=coordinator_goal,
+        )
+        if info is None:
+            console.print("[red]failed to spawn coordinator tab — is iTerm focused?[/red]")
+            raise typer.Exit(1)
+
+        now = time.time()
+        mission = db.Mission(
+            tab_id=info.tab_id,
+            session_id=info.session_id,
+            goal=coordinator_goal,
+            state="working",
+            cmd=coordinator_cmd,
+            buffer_changed_at=now,
+            last_event_at=now,
+            created_at=now,
+        )
+        db.upsert(mission)
+        prd_runs.attach_coordinator(run, mission)
+        console.print(f"[green]PRD run created[/green] [bold]{run.title}[/bold]")
+        console.print(f"  parent:      [cyan]{run.parent_id}[/cyan]")
+        console.print(f"  coordinator: [cyan]{mission.mission_id}[/cyan] tab {info.tab_id}")
+        console.print(f"  PRD:         {run.prd_path}")
+        console.print(f"  status:      {run.status_path}")
+        console.print(f"  prompt:      {run.prompt_path}")
+
+    iterm_client.run(_do)
+
+
+@run_app.command("find-prds")
+def run_find_prds(
+    root: Path = typer.Argument(Path.cwd(), help="Worktree/root directory to scan."),
+):
+    """List PRD/spec-like files Morpheus can use for PRD runs."""
+    candidates = prd_runs.find_prds(root)
+    if not candidates:
+        console.print("[yellow]no PRD-like files found[/yellow]")
+        return
+    table = Table(title=f"PRDs in {Path(root).resolve()}", header_style="bold green")
+    table.add_column("#", style="cyan")
+    table.add_column("path")
+    for i, candidate in enumerate(candidates, start=1):
+        table.add_row(str(i), candidate.label)
+    console.print(table)
 
 
 # ───────── list ─────────
