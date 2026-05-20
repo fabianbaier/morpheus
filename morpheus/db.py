@@ -433,12 +433,96 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
     conn.execute("CREATE INDEX IF NOT EXISTS mission_memory_tenant_idx ON mission_memory(tenant_id, updated_at DESC)")
     conn.execute("CREATE INDEX IF NOT EXISTS mission_memory_project_root_idx ON mission_memory(project_root)")
     conn.execute("CREATE INDEX IF NOT EXISTS prompt_loops_tenant_idx ON prompt_loops(tenant_id, next_run_at)")
+    _backfill_loop_project_columns(conn)
 
 
 def _ensure_column(conn: sqlite3.Connection, table: str, column: str, ddl: str) -> None:
     cols = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
     if column not in cols:
         conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
+
+
+def _backfill_loop_project_columns(conn: sqlite3.Connection) -> None:
+    rows = conn.execute(
+        """
+        SELECT id, target_mission_id, target_tab_id
+          FROM prompt_loops
+         WHERE tenant_id = ''
+           AND (target_mission_id != '' OR target_tab_id IS NOT NULL)
+        """
+    ).fetchall()
+    if not rows:
+        return
+    now = time.time()
+    for row in rows:
+        tenant_id, project_root = _loop_project_from_target(
+            conn,
+            row["target_mission_id"] or "",
+            row["target_tab_id"],
+        )
+        if tenant_id or project_root:
+            conn.execute(
+                """
+                UPDATE prompt_loops
+                   SET tenant_id = ?,
+                       project_root = ?,
+                       updated_at = ?
+                 WHERE id = ? AND tenant_id = ''
+                """,
+                (tenant_id, project_root, now, row["id"]),
+            )
+
+
+def _loop_project_from_target(
+    conn: sqlite3.Connection,
+    target_mission_id: str = "",
+    target_tab_id: Optional[str] = None,
+) -> tuple[str, str]:
+    tenant_id = ""
+    project_root = ""
+    source = None
+    if target_mission_id:
+        source = conn.execute(
+            """
+            SELECT tenant_id, project_root
+              FROM mission_memory
+             WHERE mission_id = ?
+               AND (tenant_id != '' OR project_root != '')
+            """,
+            (target_mission_id,),
+        ).fetchone()
+    if source is None and target_mission_id:
+        source = conn.execute(
+            """
+            SELECT tenant_id, project_root
+              FROM missions
+             WHERE mission_id = ?
+               AND (tenant_id != '' OR project_root != '')
+             LIMIT 1
+            """,
+            (target_mission_id,),
+        ).fetchone()
+    if source is None and target_tab_id:
+        source = conn.execute(
+            """
+            SELECT tenant_id, project_root
+              FROM missions
+             WHERE tab_id = ?
+               AND (tenant_id != '' OR project_root != '')
+            """,
+            (target_tab_id,),
+        ).fetchone()
+    if source is not None:
+        tenant_id = source["tenant_id"] or ""
+        project_root = source["project_root"] or ""
+    if not tenant_id and project_root:
+        project = conn.execute(
+            "SELECT tenant_id FROM project_tenants WHERE root_path = ?",
+            (project_root,),
+        ).fetchone()
+        if project is not None:
+            tenant_id = project["tenant_id"] or ""
+    return tenant_id, project_root
 
 
 def _new_mission_id(now: Optional[float] = None) -> str:
@@ -1937,6 +2021,15 @@ def loop_runs(loop_id: int, limit: int = 20) -> list[PromptLoopRun]:
     return [_row_to_prompt_loop_run(row) for row in rows]
 
 
+def loop_run_count(loop_id: int) -> int:
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) AS n FROM prompt_loop_runs WHERE loop_id = ?",
+            (loop_id,),
+        ).fetchone()
+    return int(row["n"]) if row else 0
+
+
 def update_loop_details(
     loop_id: int,
     *,
@@ -1984,15 +2077,31 @@ def set_loop_target(
 ) -> Optional[PromptLoop]:
     now = time.time()
     with _connect() as conn:
+        tenant_id, project_root = _loop_project_from_target(
+            conn,
+            target_mission_id,
+            target_tab_id,
+        )
         conn.execute(
             """
             UPDATE prompt_loops
                SET target_mission_id = ?,
                    target_tab_id = ?,
+                   tenant_id = CASE WHEN ? != '' THEN ? ELSE tenant_id END,
+                   project_root = CASE WHEN ? != '' THEN ? ELSE project_root END,
                    updated_at = ?
              WHERE id = ?
             """,
-            (target_mission_id, target_tab_id, now, loop_id),
+            (
+                target_mission_id,
+                target_tab_id,
+                tenant_id,
+                tenant_id,
+                project_root,
+                project_root,
+                now,
+                loop_id,
+            ),
         )
         row = conn.execute("SELECT * FROM prompt_loops WHERE id = ?", (loop_id,)).fetchone()
     return _row_to_prompt_loop(row) if row else None

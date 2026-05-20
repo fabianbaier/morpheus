@@ -15,6 +15,7 @@ from morpheus.dashboard import (
     EditMissionScreen,
     LiveBuffer,
     LoopActionRequest,
+    LoopEditScreen,
     LoopManagerScreen,
     LoopRequest,
     LoopScreen,
@@ -78,6 +79,7 @@ def isolated_dashboard_runtime(missions=None, memories=None, edges=None):
             new=lambda include_archived=False, tenant_id=None: list(memory_rows),
         ),
         patch.object(dashboard.db, "all_loops", new=lambda include_paused=True, tenant_id="": []),
+        patch.object(dashboard.db, "loop_run_count", new=lambda loop_id: 0),
         patch.object(
             dashboard.db,
             "edges_from_id",
@@ -2179,6 +2181,8 @@ class DashboardTest(unittest.IsolatedAsyncioTestCase):
             dashboard.db, "all_loops", new=lambda include_paused=True, tenant_id="": [loop]
         ), patch.object(
             dashboard.db, "loop_runs", new=lambda loop_id, limit=5: [run]
+        ), patch.object(
+            dashboard.db, "loop_run_count", new=lambda loop_id: 1
         ):
             async with app.run_test(size=(120, 40)) as pilot:
                 app.action_manage_loops()
@@ -2187,6 +2191,7 @@ class DashboardTest(unittest.IsolatedAsyncioTestCase):
                 self.assertIsInstance(app.screen, LoopManagerScreen)
                 detail = app.screen._detail(loop)
                 self.assertIn("market scan", str(detail))
+                self.assertIn("recent runs (1 total", str(detail))
                 self.assertIn("WMT disciplined zone", str(detail))
 
     async def test_uppercase_loop_key_opens_manager(self) -> None:
@@ -2210,6 +2215,72 @@ class DashboardTest(unittest.IsolatedAsyncioTestCase):
                 await pilot.pause()
 
                 self.assertIsInstance(app.screen, LoopManagerScreen)
+
+    async def test_loop_manager_edit_action_updates_loop(self) -> None:
+        app = DashboardHarness()
+        done = asyncio.Event()
+        captured = {}
+        loop = dashboard.db.PromptLoop(
+            id=7,
+            name="market scan",
+            prompt="summarize catalysts",
+            interval_seconds=900,
+            command="codex exec",
+            target_mission_id="m_target",
+            target_tab_id="tab-target",
+        )
+        updated = dashboard.db.PromptLoop(
+            id=7,
+            name="market pulse",
+            prompt="new prompt",
+            interval_seconds=1200,
+            command="codex exec --search",
+            target_mission_id="m_target",
+            target_tab_id="tab-target",
+        )
+
+        def fake_update_loop_details(loop_id, **kwargs):
+            captured["update"] = (loop_id, kwargs)
+            done.set()
+            return updated
+
+        with isolated_dashboard_runtime(), patch.object(
+            dashboard.db, "get_loop", new=lambda loop_id: loop if loop_id == loop.id else None
+        ), patch.object(
+            dashboard.db, "update_loop_details", new=fake_update_loop_details
+        ), patch.object(
+            dashboard.db, "add_event", new=lambda *args, **kwargs: captured.setdefault("event", (args, kwargs)) or 1
+        ), patch.object(
+            dashboard.ledger_mod, "log_action", new=lambda *args, **kwargs: captured.setdefault("ledger", (args, kwargs))
+        ), patch.object(
+            dashboard.ctx_mod, "write_context_file", new=lambda: None
+        ), patch.object(
+            dashboard.ctx_mod, "write_context_json", new=lambda: None
+        ):
+            async with app.run_test(size=(120, 40)) as pilot:
+                app._handle_loop_action_result(LoopActionRequest(action="edit", loop_id=loop.id))
+                await pilot.pause()
+
+                self.assertIsInstance(app.screen, LoopEditScreen)
+                self.assertEqual(app.screen.query_one("#loop_name", Input).value, "market scan")
+                app.screen.dismiss(LoopActionRequest(
+                    action="edit",
+                    loop_id=loop.id,
+                    name="market pulse",
+                    prompt="new prompt",
+                    interval="20m",
+                    command="codex exec --search",
+                ))
+
+                await asyncio.wait_for(done.wait(), timeout=1)
+
+        self.assertEqual(captured["update"][0], 7)
+        self.assertEqual(captured["update"][1]["name"], "market pulse")
+        self.assertEqual(captured["update"][1]["prompt"], "new prompt")
+        self.assertEqual(captured["update"][1]["interval_seconds"], 20 * 60)
+        self.assertEqual(captured["update"][1]["command"], "codex exec --search")
+        self.assertEqual(captured["ledger"][0][0], "loop_edit")
+        self.assertIn("updated loop", app.alerts[0].text)
 
     async def test_refresh_table_renders_project_loop_rows(self) -> None:
         app = DashboardHarness()

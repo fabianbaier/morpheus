@@ -134,7 +134,8 @@ Press `l` to create a recurring prompt loop. Loops are useful for repeated
 checks such as "scan for new blockers every 30 minutes" or "summarize market
 catalysts." Loop results show up in the ticker, and targeted loops also attach
 events/artifacts to the selected mission. Project loops appear as `LOOP` rows
-in the cockpit; use `Shift+L` or `L` to manage them.
+in the cockpit; use `Shift+L` or `L` to inspect recent runs and edit/manage
+them.
 
 ### Key Shortcuts
 
@@ -145,7 +146,7 @@ in the cockpit; use `Shift+L` or `L` to manage them.
 | `n` | New session |
 | `w` | New worker under a PRD run |
 | `l` | New recurring prompt loop |
-| `Shift+L` / `L` | Manage loops |
+| `Shift+L` / `L` | Inspect, edit, and manage loops |
 | `b` | Brief the selected mission from graph + transcript |
 | `e` | Edit mission memory |
 | `space` | Expand/collapse mission card details |
@@ -335,8 +336,9 @@ From the cockpit, press `l` to create a loop. If a mission is selected, loop
 results route back to that mission as `loop_output` events and `loop-output`
 artifacts; otherwise they report to the ticker/context only. Loops are visible
 as project-scoped `LOOP` rows, and `Shift+L` / `L` opens the loop manager for
-pause/resume/delete/join controls. The dashboard does not run long loop commands
-inline; use launchd/cron or `morpheus loops run-due`.
+edit/pause/resume/delete/join controls plus recent run history. The dashboard
+does not run long loop commands inline; use launchd/cron or
+`morpheus loops run-due`.
 
 ## State Files
 

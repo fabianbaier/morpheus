@@ -102,6 +102,41 @@ class TenantTest(unittest.TestCase):
 
         self.assertEqual([loop.name for loop in loops_a], ["project a loop"])
 
+    def test_db_backfills_legacy_loop_project_from_target_memory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            db_dir = root / "db"
+            project = db.ProjectTenant(
+                tenant_id=tenant.tenant_id_for_root(root / "a"),
+                name="a",
+                root_path=str(root / "a"),
+                root_kind="cwd",
+            )
+
+            with patch.object(db, "DB_DIR", db_dir), patch.object(db, "DB_PATH", db_dir / "morpheus.db"):
+                project = db.upsert_project_tenant(project)
+                db.upsert_memory(db.MissionMemory(
+                    mission_id="m_target",
+                    tenant_id=project.tenant_id,
+                    project_root=project.root_path,
+                    title="target mission",
+                ))
+                legacy = db.create_loop(
+                    "legacy loop",
+                    "prompt",
+                    60,
+                    "codex exec",
+                    target_mission_id="m_target",
+                )
+
+                loops = db.all_loops(tenant_id=project.tenant_id)
+                refreshed = db.get_loop(legacy.id)
+
+        self.assertEqual([loop.id for loop in loops], [legacy.id])
+        self.assertIsNotNone(refreshed)
+        self.assertEqual(refreshed.tenant_id, project.tenant_id)
+        self.assertEqual(refreshed.project_root, project.root_path)
+
     def test_context_can_be_tenant_scoped(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

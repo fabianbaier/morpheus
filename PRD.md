@@ -327,7 +327,7 @@ attach.
 | `r` | Resume fresh | Spawns a new session seeded with the snapshot + mission card |
 | `/` | Note / claim | Posts a note or path/worktree claim |
 | `l` | Loop control | Creates a recurring prompt loop routed to ticker/context or the selected mission |
-| `Shift+L` / `L` | Manage loops | Opens the current project's loop manager |
+| `Shift+L` / `L` | Manage loops | Opens the current project's loop manager with edit and run-history controls |
 | `w` | Worker | Spawns a manual child worker under the selected PRD run/coordinator/worker |
 | `p` | Prune | Archives stale/finished sessions after confirmation |
 | `d` | Dismiss / close | Closes selected live tab or archives an already-dead mission |
@@ -535,11 +535,11 @@ Required behavior:
 Implemented cockpit controls:
 
 - `Shift+L` / `L` opens the loop manager for the current project, with recent
-  run history plus pause/resume/delete/join controls.
+  run history plus edit/pause/resume/delete/join controls. Editing can change
+  name, prompt, interval, and command without leaving the cockpit.
 
 Future work:
 
-- Loop edit controls in the cockpit manager.
 - Optional fan-out where a loop result can draft an instruction for a target
   session, with user approval before sending text.
 - Background LLM summarization for long loop outputs, recorded with provenance
@@ -883,6 +883,7 @@ This table is the source of truth for where the product stands right now.
 | Newest-first rabbit ticker | Implemented in v0.8.0a3 | Bottom alert strip redraws from the newest-first alert deque so fresh session headlines stay at the top instead of appending chronologically |
 | Prompt loops foundation | Implemented in v0.8.0a4 | `l` creates recurring prompt loops; `morpheus loops run-due` runs due prompts, captures output, publishes ticker notes, and routes graph events/artifacts to target missions |
 | Prompt loop cockpit visibility | Implemented in v0.8.0a27 | Loops now store owning project tenant/root, render as `LOOP` rows in the mission table, and `Shift+L`/`L` opens the current project's loop manager so active/due/last-run state is visible without running loop commands inside the dashboard |
+| Prompt loop cockpit editing/history | Implemented in v0.8.0a28 | The loop manager shows run counts and recent run history, explains when no runner has executed yet, edits name/prompt/interval/command in-cockpit, and backfills legacy targeted loops into their project tenant |
 | PRD Runs foundation | Implemented in v0.8.0a1 | PRD finder, new-session PRD selector, parent mission creation, coordinator prompt/status files, `morpheus run start`, and coordinator graph edge shipped |
 | PRD run tree UI | Partially implemented in v0.8.0a5 | Shows virtual PRD parent rows with coordinator/worker sessions rendered underneath them; collapse/expand remains future polish |
 | PRD child worker spawn | Implemented in v0.8.0a5 | `w` spawns a manual child worker under the selected PRD parent/coordinator/worker with scope and verification prompts |

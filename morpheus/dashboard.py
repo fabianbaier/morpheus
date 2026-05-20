@@ -264,6 +264,10 @@ class LoopActionRequest:
     loop_id: int
     target_mission_id: str = ""
     target_tab_id: Optional[str] = None
+    name: Optional[str] = None
+    prompt: Optional[str] = None
+    interval: Optional[str] = None
+    command: Optional[str] = None
 
 
 @dataclass
@@ -1918,6 +1922,102 @@ class LoopScreen(ModalScreen[Optional[LoopRequest]]):
         self.dismiss(None)
 
 
+class LoopEditScreen(ModalScreen[Optional[LoopActionRequest]]):
+    """Edit an existing prompt loop from the cockpit."""
+
+    CSS = """
+    LoopEditScreen { align: center middle; }
+    #dialog {
+        width: 82;
+        height: 20;
+        border: round ansi_bright_yellow;
+        background: black;
+        padding: 1 2;
+    }
+    #dialog Label.title {
+        color: ansi_bright_yellow;
+        text-style: bold;
+        margin-bottom: 1;
+    }
+    #dialog Label.hint {
+        color: grey;
+        margin-bottom: 1;
+    }
+    Input {
+        background: black;
+        color: ansi_bright_yellow;
+        border: round yellow;
+        margin-bottom: 1;
+    }
+    Input:focus { border: round ansi_bright_yellow; }
+    Button { margin-right: 2; }
+    """
+
+    BINDINGS = [
+        Binding("escape", "cancel", "cancel"),
+    ]
+
+    def __init__(self, loop: db.PromptLoop):
+        super().__init__()
+        self.loop = loop
+
+    def compose(self) -> ComposeResult:
+        with Container(id="dialog"):
+            yield Label(f"{RABBIT}  EDIT LOOP #{self.loop.id}", classes="title")
+            yield Label(f"target: {_loop_target_label(self.loop)}", classes="hint")
+            yield Input(value=self.loop.name, placeholder="name", id="loop_name")
+            yield Input(value=self.loop.prompt, placeholder="prompt to run on every loop tick", id="loop_prompt")
+            yield Input(
+                value=loops_mod.format_interval(self.loop.interval_seconds),
+                placeholder="interval, e.g. 15m, 2h, daily",
+                id="loop_interval",
+            )
+            yield Input(value=self.loop.command, placeholder="command, e.g. codex exec", id="loop_command")
+            with Horizontal():
+                yield Button("save", variant="primary", id="loop_save")
+                yield Button("cancel", id="loop_cancel")
+
+    def on_mount(self) -> None:
+        self.query_one("#loop_name", Input).focus()
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        order = ["loop_name", "loop_prompt", "loop_interval", "loop_command"]
+        if event.input.id in order:
+            idx = order.index(event.input.id)
+            if idx < len(order) - 1:
+                self.query_one(f"#{order[idx + 1]}", Input).focus()
+            else:
+                self.action_submit()
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "loop_save":
+            self.action_submit()
+        else:
+            self.action_cancel()
+
+    def action_submit(self) -> None:
+        name = self.query_one("#loop_name", Input).value.strip()
+        prompt = self.query_one("#loop_prompt", Input).value.strip()
+        interval = self.query_one("#loop_interval", Input).value.strip() or loops_mod.format_interval(self.loop.interval_seconds)
+        command = self.query_one("#loop_command", Input).value.strip() or loops_mod.DEFAULT_COMMAND
+        if not prompt:
+            self.query_one("#loop_prompt", Input).focus()
+            return
+        if not name:
+            name = prompt[:48] + ("…" if len(prompt) > 48 else "")
+        self.dismiss(LoopActionRequest(
+            action="edit",
+            loop_id=self.loop.id,
+            name=name,
+            prompt=prompt,
+            interval=interval,
+            command=command,
+        ))
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
 class ProjectSwitchScreen(ModalScreen[Optional[ProjectSwitchRequest]]):
     """Switch the visible cockpit scope between project tenants."""
 
@@ -2198,7 +2298,7 @@ class LoopManagerScreen(ModalScreen[Optional[LoopActionRequest]]):
     LoopManagerScreen { align: center middle; }
     #loop-dialog {
         width: 104;
-        height: 31;
+        height: 34;
         border: round ansi_bright_yellow;
         background: black;
         padding: 1 2;
@@ -2217,7 +2317,7 @@ class LoopManagerScreen(ModalScreen[Optional[LoopActionRequest]]):
         margin-bottom: 1;
     }
     #loop_detail {
-        height: 11;
+        height: 13;
         border: round yellow;
         padding: 0 1;
         color: ansi_bright_yellow;
@@ -2233,6 +2333,7 @@ class LoopManagerScreen(ModalScreen[Optional[LoopActionRequest]]):
         Binding("k", "cursor_up", "prev"),
         Binding("down", "cursor_down", "next", show=False),
         Binding("up", "cursor_up", "prev", show=False),
+        Binding("e", "edit_selected", "edit"),
         Binding("p", "toggle_selected", "pause/resume"),
         Binding("t", "join_selected", "join"),
         Binding("d", "delete_selected", "delete"),
@@ -2243,13 +2344,17 @@ class LoopManagerScreen(ModalScreen[Optional[LoopActionRequest]]):
         *,
         loops: list[db.PromptLoop],
         runs_by_loop: dict[int, list[db.PromptLoopRun]],
-        join_target_label: str,
+        run_counts_by_loop: Optional[dict[int, int]] = None,
+        scope_label: str = "current project",
+        join_target_label: str = "ticker/context only",
         join_target_mission_id: str = "",
         join_target_tab_id: Optional[str] = None,
     ):
         super().__init__()
         self.loops = loops
         self.runs_by_loop = runs_by_loop
+        self.run_counts_by_loop = run_counts_by_loop or {}
+        self.scope_label = scope_label
         self.join_target_label = join_target_label
         self.join_target_mission_id = join_target_mission_id
         self.join_target_tab_id = join_target_tab_id
@@ -2258,10 +2363,14 @@ class LoopManagerScreen(ModalScreen[Optional[LoopActionRequest]]):
     def compose(self) -> ComposeResult:
         with Container(id="loop-dialog"):
             yield Label(f"{RABBIT}  LOOPS", classes="title")
-            yield Label(f"join target: {self.join_target_label}", classes="hint")
+            yield Label(
+                f"scope: {self.scope_label} · join target: {self.join_target_label}",
+                classes="hint",
+            )
             yield DataTable(id="loops_table")
             yield Static("", id="loop_detail")
             with Horizontal():
+                yield Button("edit", variant="primary", id="loop_edit")
                 yield Button("join target", variant="primary", id="loop_join")
                 yield Button("pause/resume", id="loop_toggle")
                 yield Button("delete", variant="error", id="loop_delete")
@@ -2270,7 +2379,7 @@ class LoopManagerScreen(ModalScreen[Optional[LoopActionRequest]]):
     def on_mount(self) -> None:
         table = self.query_one("#loops_table", DataTable)
         table.cursor_type = "row"
-        table.add_columns("ID", "ST", "NAME", "EVERY", "NEXT", "TARGET", "LAST")
+        table.add_columns("ID", "ST", "NAME", "EVERY", "NEXT", "TARGET", "RUNS", "LAST")
         for loop in self.loops:
             table.add_row(
                 str(loop.id),
@@ -2279,6 +2388,7 @@ class LoopManagerScreen(ModalScreen[Optional[LoopActionRequest]]):
                 loops_mod.format_interval(loop.interval_seconds),
                 loops_mod.format_due(loop.next_run_at),
                 _loop_target_label(loop),
+                str(self.run_counts_by_loop.get(loop.id, len(self.runs_by_loop.get(loop.id, [])))),
                 loop.last_summary or "—",
             )
         table.focus()
@@ -2289,7 +2399,9 @@ class LoopManagerScreen(ModalScreen[Optional[LoopActionRequest]]):
         self._refresh_detail()
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
-        if event.button.id == "loop_join":
+        if event.button.id == "loop_edit":
+            self.action_edit_selected()
+        elif event.button.id == "loop_join":
             self.action_join_selected()
         elif event.button.id == "loop_toggle":
             self.action_toggle_selected()
@@ -2316,6 +2428,12 @@ class LoopManagerScreen(ModalScreen[Optional[LoopActionRequest]]):
             return
         action = "pause" if loop.status == "active" else "resume"
         self.dismiss(LoopActionRequest(action=action, loop_id=loop.id))
+
+    def action_edit_selected(self) -> None:
+        loop = self._selected_loop()
+        if loop is None:
+            return
+        self.dismiss(LoopActionRequest(action="edit", loop_id=loop.id))
 
     def action_join_selected(self) -> None:
         loop = self._selected_loop()
@@ -2359,7 +2477,10 @@ class LoopManagerScreen(ModalScreen[Optional[LoopActionRequest]]):
 
     def _refresh_detail(self) -> None:
         loop = self._selected_loop()
-        detail = "no loops configured yet" if loop is None else self._detail(loop)
+        detail = (
+            f"no loops configured for {self.scope_label} yet\n"
+            "Press l to create one. Use launchd/cron or `morpheus loops run-due` to execute due loops."
+        ) if loop is None else self._detail(loop)
         self.query_one("#loop_detail", Static).update(detail)
 
     def _detail(self, loop: db.PromptLoop, *, confirm_delete: bool = False) -> str:
@@ -2371,14 +2492,16 @@ class LoopManagerScreen(ModalScreen[Optional[LoopActionRequest]]):
         ]
         runs = self.runs_by_loop.get(loop.id, [])
         if runs:
-            lines.append("recent runs:")
+            count = self.run_counts_by_loop.get(loop.id, len(runs))
+            lines.append(f"recent runs ({count} total, newest first):")
             for run in runs[:4]:
                 lines.append(
                     f"  #{run.id} {_format_dashboard_ts(run.started_at)} {run.status} "
                     f"{run.summary or run.output_path or 'no summary'}"
                 )
         else:
-            lines.append("recent runs: none")
+            lines.append("recent runs: none yet")
+            lines.append("execution is external: run `morpheus loops run-due` manually or from launchd/cron")
         if confirm_delete:
             lines.append("")
             lines.append("Press delete again to remove this loop. Output files remain on disk.")
@@ -3345,10 +3468,13 @@ class MorpheusApp(App):
         target_label, target_mission_id, target_tab_id = self._loop_target_for_selection()
         loops = self._visible_loops()
         runs_by_loop = {loop.id: db.loop_runs(loop.id, limit=5) for loop in loops}
+        run_counts_by_loop = {loop.id: db.loop_run_count(loop.id) for loop in loops}
         self.push_screen(
             LoopManagerScreen(
                 loops=loops,
                 runs_by_loop=runs_by_loop,
+                run_counts_by_loop=run_counts_by_loop,
+                scope_label=self._scope_text(),
                 join_target_label=target_label,
                 join_target_mission_id=target_mission_id,
                 join_target_tab_id=target_tab_id,
@@ -3624,6 +3750,9 @@ class MorpheusApp(App):
         if loop is None:
             self._push_alert(Alert(time.time(), "error", f"loop #{result.loop_id} not found"))
             return
+        if result.action == "edit":
+            self.push_screen(LoopEditScreen(loop), self._handle_loop_edit_result)
+            return
 
         try:
             if result.action in {"pause", "resume"}:
@@ -3696,6 +3825,64 @@ class MorpheusApp(App):
             return
 
         self._push_alert(Alert(time.time(), "summary", message))
+        self._refresh_table()
+
+    def _handle_loop_edit_result(self, result: Optional[LoopActionRequest]) -> None:
+        if result is None:
+            return
+        loop = db.get_loop(result.loop_id)
+        if loop is None:
+            self._push_alert(Alert(time.time(), "error", f"loop #{result.loop_id} not found"))
+            return
+
+        try:
+            interval_seconds = None
+            if result.interval is not None:
+                parsed = loops_mod.parse_interval(result.interval)
+                if abs(parsed - loop.interval_seconds) > 0.001:
+                    interval_seconds = parsed
+
+            name = result.name if result.name is not None and result.name != loop.name else None
+            prompt = result.prompt if result.prompt is not None and result.prompt != loop.prompt else None
+            command = result.command if result.command is not None and result.command != loop.command else None
+            if name is None and prompt is None and interval_seconds is None and command is None:
+                self._push_alert(Alert(time.time(), "summary", f"loop [{loop.name}] unchanged"))
+                return
+
+            updated = db.update_loop_details(
+                loop.id,
+                name=name,
+                prompt=prompt,
+                interval_seconds=interval_seconds,
+                command=command,
+            )
+            if updated is None:
+                raise ValueError(f"loop #{loop.id} not found")
+            ledger_mod.log_action(
+                "loop_edit",
+                tab_id=updated.target_tab_id,
+                details={"loop_id": updated.id, "target_mission_id": updated.target_mission_id},
+            )
+            if updated.target_mission_id:
+                db.add_event(
+                    updated.target_mission_id,
+                    kind="loop_updated",
+                    actor="morpheus",
+                    summary=f"Loop updated: {updated.name}",
+                    source_ref=f"loop:{updated.id}",
+                    metadata={"loop_id": updated.id, "target_tab_id": updated.target_tab_id},
+                )
+            ctx_mod.write_context_file()
+            ctx_mod.write_context_json()
+        except Exception as e:
+            self._push_alert(Alert(time.time(), "error", f"loop edit failed: {e}"))
+            return
+
+        self._push_alert(Alert(
+            time.time(),
+            "summary",
+            f"updated loop [{updated.name}] every {loops_mod.format_interval(updated.interval_seconds)}",
+        ))
         self._refresh_table()
 
     async def _handle_worker_result(self, result: Optional[WorkerRequest]) -> None:
