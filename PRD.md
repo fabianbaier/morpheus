@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| **Status** | v0.8.0a6 implemented (nonblocking PRD picker, edit mission, selected brief); next: resume fresh |
+| **Status** | v0.8.0a8 implemented (edit mission + selected brief); next: resume fresh |
 | **Author** | Fabian Baier |
 | **Last updated** | 2026-05-20 |
 | **Target platform** | macOS + iTerm2 |
@@ -370,7 +370,7 @@ The CLI remains the scriptable surface for the same mission model:
 | `morpheus ask "<query>"` | Ask questions over current Morpheus state |
 | `morpheus poll-prs` | One-shot PR review queue poll and optional draft spawn |
 | `morpheus ledger costs/actions` | Inspect cost and action ledgers |
-| `morpheus run find-prds [root]` | List PRD/spec candidates in a worktree |
+| `morpheus run find-prds [root]` | List Markdown source candidates in a worktree |
 | `morpheus run start <prd> [--cmd codex]` | Create a PRD parent mission, spawn one coordinator tab, and link it |
 | `morpheus loops add/list/run/run-due/pause/resume` | Configure recurring prompt loops and execute due loops from cron/launchd |
 | `morpheus mcp serve` | Expose Morpheus state to agent tools |
@@ -383,9 +383,9 @@ or spec file, with coordinator and worker sessions linked underneath it.
 
 Conservative v1 behavior:
 
-- The new-session flow shows PRD/spec candidates from the selected worktree or
-  current working directory.
-- PRD/spec discovery must be bounded and must not recursively scan broad roots
+- The new-session flow shows Markdown source files from the selected worktree or
+  current working directory, with PRD/spec-looking files sorted first.
+- Markdown source discovery must be bounded and must not recursively scan broad roots
   such as `$HOME`, `/Users`, or `/`. If a selected tab reports a broad cwd,
   Morpheus falls back to the dashboard/project cwd before opening the modal.
 - Choosing a PRD creates a parent `mission_memory` row with `source_kind=prd`,
@@ -770,9 +770,10 @@ This table is the source of truth for where the product stands right now.
 | PRD Runs foundation | Implemented in v0.8.0a1 | PRD finder, new-session PRD selector, parent mission creation, coordinator prompt/status files, `morpheus run start`, and coordinator graph edge shipped |
 | PRD run tree UI | Partially implemented in v0.8.0a5 | Shows virtual PRD parent rows with coordinator/worker sessions rendered underneath them; collapse/expand remains future polish |
 | PRD child worker spawn | Implemented in v0.8.0a5 | `w` spawns a manual child worker under the selected PRD parent/coordinator/worker with scope and verification prompts |
-| Edit mission flow | Implemented in v0.8.0a6 | `e` opens a dashboard editor for goal/title/why/done/criteria/plan/next/phase/blocker/source/issue/PR/worktree/claimed paths/topic, saves graph memory + live fields, and records a `mission_edit` event |
-| Brief selected | Implemented in v0.8.0a6 | `b` opens a cited local brief for the selected mission using graph memory, recent events, artifacts, and transcript tail |
 | Nonblocking PRD picker | Implemented in v0.8.0a6 | `n` uses a bounded PRD scan and refuses broad roots like `$HOME`, preventing the dashboard from freezing before the new-session modal opens |
+| Markdown source picker | Implemented in v0.8.0a7 | The `n` picker shows all discovered `.md`/`.markdown` files rather than only PRD-named files, while sorting PRD/spec candidates first |
+| Edit mission flow | Implemented in v0.8.0a8 | `e` opens a dashboard editor for goal/title/why/done/criteria/plan/next/phase/blocker/source/issue/PR/worktree/claimed paths/topic, saves graph memory + live fields, and records a `mission_edit` event |
+| Brief selected | Implemented in v0.8.0a8 | `b` opens a cited local brief for the selected mission using graph memory, recent events, artifacts, and transcript tail |
 | Resume fresh | Not implemented | `r` snapshots, archives old attachment, spawns replacement with mission context |
 | MCP mission tools | Partially shipped | Read-only session tools exist; graph read/update tools remain v0.7 |
 | 48-hour recall eval | Not implemented | Add fixture or dogfood checklist: stale mission → press `b` → know next action in <10s |

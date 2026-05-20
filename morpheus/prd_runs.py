@@ -69,7 +69,7 @@ class PRDRun:
 
 def find_prds(
     root: Path | str,
-    limit: int = 30,
+    limit: Optional[int] = None,
     max_entries: int = MAX_SCAN_ENTRIES,
     max_seconds: float = MAX_SCAN_SECONDS,
 ) -> list[PRDCandidate]:
@@ -82,17 +82,15 @@ def find_prds(
     candidates: list[Path] = []
     deadline = time.monotonic() + max_seconds if max_seconds else None
     for path in _walk_files(base, max_entries=max_entries, deadline=deadline):
-        if path.suffix.lower() not in {".md", ".markdown", ".txt"}:
+        if path.suffix.lower() not in {".md", ".markdown"}:
             continue
-        rel = path.relative_to(base)
-        searchable = str(rel).lower()
-        if any(hint in searchable for hint in PRD_NAME_HINTS):
-            candidates.append(path)
+        candidates.append(path)
 
     candidates.sort(key=lambda p: (_prd_score(base, p), str(p.relative_to(base)).lower()))
+    selected = candidates if limit is None else candidates[:limit]
     return [
         PRDCandidate(path=path, label=str(path.relative_to(base)))
-        for path in candidates[:limit]
+        for path in selected
     ]
 
 
@@ -420,6 +418,8 @@ def _prd_score(root: Path, path: Path) -> tuple[int, int]:
         rank = 1
     elif "prd" in name:
         rank = 2
-    else:
+    elif any(hint in str(rel).lower() for hint in PRD_NAME_HINTS):
         rank = 3
+    else:
+        rank = 4
     return rank, len(rel.parts)

@@ -943,9 +943,9 @@ class NewSessionScreen(ModalScreen[Optional[NewSessionRequest]]):
             yield Label(f"{RABBIT}  SPAWN NEW SESSION", classes="title")
             yield Input(placeholder="goal — one line, e.g. 'PR #224 review'", id="goal_input")
             yield Input(placeholder="command — e.g. 'codex' or 'claude'", id="cmd_input")
-            options = [("no PRD run", "")]
+            options = [("no PRD/source file", "")]
             options.extend((candidate.label, str(candidate.path)) for candidate in self.prd_candidates)
-            yield Select(options, prompt="PRD run (optional)", allow_blank=False, value="", id="prd_select")
+            yield Select(options, prompt="PRD/source file (optional)", allow_blank=False, value="", id="prd_select")
             yield Label("enter to spawn · esc to cancel", classes="hint")
             with Horizontal(id="buttons"):
                 yield Button("spawn", id="spawn_btn", variant="success")

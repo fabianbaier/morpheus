@@ -7,17 +7,33 @@ from morpheus import prd_runs
 
 
 class PRDRunsTest(unittest.TestCase):
-    def test_find_prds_prefers_prd_named_files(self) -> None:
+    def test_find_prds_lists_all_markdown_with_prd_files_first(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             (root / "docs").mkdir()
             (root / "PRD.md").write_text("# Main PRD\n", encoding="utf-8")
             (root / "docs" / "feature-spec.md").write_text("# Feature Spec\n", encoding="utf-8")
+            (root / "docs" / "reference.md").write_text("# Reference\n", encoding="utf-8")
+            (root / "notes.txt").write_text("not markdown\n", encoding="utf-8")
+            (root / "README.md").write_text("# Readme\n", encoding="utf-8")
             (root / "notes.md").write_text("# Notes\n", encoding="utf-8")
 
             candidates = prd_runs.find_prds(root)
 
-        self.assertEqual([candidate.label for candidate in candidates], ["PRD.md", "docs/feature-spec.md"])
+        self.assertEqual(
+            [candidate.label for candidate in candidates],
+            ["PRD.md", "docs/feature-spec.md", "notes.md", "README.md", "docs/reference.md"],
+        )
+
+    def test_find_prds_default_does_not_truncate_markdown_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for i in range(40):
+                (root / f"note-{i:02}.md").write_text("# note\n", encoding="utf-8")
+
+            candidates = prd_runs.find_prds(root, max_seconds=1)
+
+        self.assertEqual(len(candidates), 40)
 
     def test_find_prds_refuses_home_sized_root(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -52,7 +68,8 @@ class PRDRunsTest(unittest.TestCase):
 
             candidates = prd_runs.find_prds(root, max_entries=5, max_seconds=1)
 
-        self.assertEqual(candidates, [])
+        self.assertLessEqual(len(candidates), 5)
+        self.assertNotIn("PRD.md", [candidate.label for candidate in candidates])
 
     def test_title_from_prd_uses_first_heading(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
