@@ -493,6 +493,40 @@ class DashboardTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(app.tenant_id, "p_b")
         self.assertEqual(set(app.live_buffers), {"tab-b"})
 
+    def test_project_cleanup_result_purges_current_scope_and_switches_global(self) -> None:
+        project = dashboard.db.ProjectTenant(
+            tenant_id="p_old",
+            name="old",
+            root_path="/tmp/old",
+        )
+        app = DashboardHarness(project=project)
+        captured = {}
+        cleanup = dashboard.db.ProjectCleanupResult(
+            tenant_id=project.tenant_id,
+            name=project.name,
+            root_path=project.root_path,
+            deleted={"project_tenants": 1, "mission_memory": 2},
+        )
+
+        def fake_log_action(action, tab_id=None, details=None):
+            captured["ledger"] = (action, tab_id, details)
+            return 1
+
+        with (
+            patch.object(dashboard.db, "delete_project_tenant", new=lambda tenant_id, allow_live=False: cleanup),
+            patch.object(dashboard.ledger_mod, "log_action", new=fake_log_action),
+            patch.object(dashboard.db, "all_missions", new=lambda tenant_id=None: []),
+            patch.object(app, "_refresh_table", new=lambda: None),
+        ):
+            app._handle_project_switch_result(dashboard.ProjectSwitchRequest("p_old", action="delete"))
+
+        self.assertIsNone(app.project)
+        self.assertTrue(app.show_all)
+        self.assertEqual(app.tenant_id, "")
+        self.assertEqual(captured["ledger"][0], "project_delete")
+        self.assertEqual(captured["ledger"][2]["deleted"], cleanup.deleted)
+        self.assertIn("deleted project", app.alerts[-1].text)
+
     async def test_project_switch_key_opens_switcher(self) -> None:
         project = dashboard.db.ProjectTenant(
             tenant_id="p_current",

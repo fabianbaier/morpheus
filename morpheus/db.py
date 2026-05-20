@@ -143,6 +143,51 @@ class ProjectTenant:
 
 
 @dataclass
+class ProjectTenantUsage:
+    tenant_id: str
+    live_sessions: int = 0
+    memories: int = 0
+    active_memories: int = 0
+    archived_memories: int = 0
+    events: int = 0
+    artifacts: int = 0
+    edges: int = 0
+    notes: int = 0
+    loops: int = 0
+    loop_runs: int = 0
+
+    @property
+    def graph_rows(self) -> int:
+        return (
+            self.live_sessions
+            + self.memories
+            + self.events
+            + self.artifacts
+            + self.edges
+            + self.notes
+            + self.loops
+            + self.loop_runs
+        )
+
+    @property
+    def is_empty(self) -> bool:
+        return self.graph_rows == 0
+
+
+@dataclass
+class ProjectCleanupResult:
+    tenant_id: str
+    name: str = ""
+    root_path: str = ""
+    deleted: dict[str, int] = field(default_factory=dict)
+    blocked_reason: str = ""
+
+    @property
+    def total_deleted(self) -> int:
+        return sum(self.deleted.values())
+
+
+@dataclass
 class MissionEdge:
     id: int
     from_id: str
@@ -662,6 +707,385 @@ def all_project_tenants(include_archived: bool = False) -> list[ProjectTenant]:
     with _connect() as conn:
         rows = conn.execute(query).fetchall()
     return [_row_to_project_tenant(row) for row in rows]
+
+
+def project_tenant_usage(tenant_id: str) -> ProjectTenantUsage:
+    with _connect() as conn:
+        return _project_tenant_usage(conn, tenant_id)
+
+
+def empty_project_tenants(include_archived: bool = False) -> list[ProjectTenant]:
+    with _connect() as conn:
+        query = "SELECT * FROM project_tenants"
+        if not include_archived:
+            query += " WHERE archived_at IS NULL"
+        query += " ORDER BY last_seen_at DESC, name ASC"
+        tenants = [_row_to_project_tenant(row) for row in conn.execute(query).fetchall()]
+        return [
+            tenant
+            for tenant in tenants
+            if _project_tenant_usage(conn, tenant.tenant_id).is_empty
+        ]
+
+
+def prune_empty_project_tenant(tenant_id: str) -> ProjectCleanupResult:
+    with _connect() as conn:
+        tenant = conn.execute(
+            "SELECT * FROM project_tenants WHERE tenant_id = ?",
+            (tenant_id,),
+        ).fetchone()
+        if tenant is None:
+            return ProjectCleanupResult(
+                tenant_id=tenant_id,
+                blocked_reason="project tenant not found",
+            )
+        project = _row_to_project_tenant(tenant)
+        usage = _project_tenant_usage(conn, tenant_id)
+        if not usage.is_empty:
+            return ProjectCleanupResult(
+                tenant_id=project.tenant_id,
+                name=project.name,
+                root_path=project.root_path,
+                blocked_reason="project has related mission graph rows",
+            )
+        cur = conn.execute("DELETE FROM project_tenants WHERE tenant_id = ?", (tenant_id,))
+        return ProjectCleanupResult(
+            tenant_id=project.tenant_id,
+            name=project.name,
+            root_path=project.root_path,
+            deleted={"project_tenants": cur.rowcount},
+        )
+
+
+def prune_empty_project_tenants(include_archived: bool = False) -> list[ProjectCleanupResult]:
+    results: list[ProjectCleanupResult] = []
+    with _connect() as conn:
+        query = "SELECT * FROM project_tenants"
+        if not include_archived:
+            query += " WHERE archived_at IS NULL"
+        query += " ORDER BY last_seen_at DESC, name ASC"
+        tenants = [_row_to_project_tenant(row) for row in conn.execute(query).fetchall()]
+        for tenant in tenants:
+            if not _project_tenant_usage(conn, tenant.tenant_id).is_empty:
+                continue
+            cur = conn.execute(
+                "DELETE FROM project_tenants WHERE tenant_id = ?",
+                (tenant.tenant_id,),
+            )
+            results.append(ProjectCleanupResult(
+                tenant_id=tenant.tenant_id,
+                name=tenant.name,
+                root_path=tenant.root_path,
+                deleted={"project_tenants": cur.rowcount},
+            ))
+    return results
+
+
+def delete_project_tenant(
+    tenant_id: str,
+    *,
+    allow_live: bool = False,
+) -> ProjectCleanupResult:
+    """Remove a project tenant and all Morpheus-owned graph rows for it."""
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM project_tenants WHERE tenant_id = ?",
+            (tenant_id,),
+        ).fetchone()
+        if row is None:
+            return ProjectCleanupResult(
+                tenant_id=tenant_id,
+                blocked_reason="project tenant not found",
+            )
+        tenant = _row_to_project_tenant(row)
+        usage = _project_tenant_usage(conn, tenant_id)
+        if usage.live_sessions and not allow_live:
+            return ProjectCleanupResult(
+                tenant_id=tenant.tenant_id,
+                name=tenant.name,
+                root_path=tenant.root_path,
+                blocked_reason="project still has live session rows",
+            )
+
+        mission_ids, tab_ids, session_ids = _project_tenant_related_ids(conn, tenant_id)
+        loop_ids = _project_tenant_loop_ids(conn, mission_ids, tab_ids)
+        deleted: dict[str, int] = {}
+
+        deleted["prompt_loop_runs"] = _delete_project_loop_runs(
+            conn,
+            loop_ids,
+            mission_ids,
+            tab_ids,
+        )
+        deleted["prompt_loops"] = _delete_where_ids(conn, "prompt_loops", "id", loop_ids)
+        deleted["notes"] = _delete_project_notes(conn, tab_ids, session_ids)
+        deleted["mission_edges"] = _delete_project_edges(conn, mission_ids)
+        deleted["mission_artifacts"] = _delete_where_ids(
+            conn,
+            "mission_artifacts",
+            "mission_id",
+            mission_ids,
+        )
+        deleted["mission_events"] = _delete_where_ids(
+            conn,
+            "mission_events",
+            "mission_id",
+            mission_ids,
+        )
+        deleted["missions"] = _delete_where_ids(conn, "missions", "tab_id", tab_ids)
+        deleted["mission_memory"] = _delete_where_ids(
+            conn,
+            "mission_memory",
+            "mission_id",
+            mission_ids,
+        )
+        deleted["action_ledger"] = _delete_project_action_entries(
+            conn,
+            tenant,
+            mission_ids,
+            tab_ids,
+        )
+        deleted["project_tenants"] = conn.execute(
+            "DELETE FROM project_tenants WHERE tenant_id = ?",
+            (tenant_id,),
+        ).rowcount
+
+    return ProjectCleanupResult(
+        tenant_id=tenant.tenant_id,
+        name=tenant.name,
+        root_path=tenant.root_path,
+        deleted={key: value for key, value in deleted.items() if value},
+    )
+
+
+def _project_tenant_usage(conn: sqlite3.Connection, tenant_id: str) -> ProjectTenantUsage:
+    mission_ids, tab_ids, session_ids = _project_tenant_related_ids(conn, tenant_id)
+    loop_ids = _project_tenant_loop_ids(conn, mission_ids, tab_ids)
+    return ProjectTenantUsage(
+        tenant_id=tenant_id,
+        live_sessions=_count(conn, "missions", "tenant_id = ?", (tenant_id,)),
+        memories=_count(conn, "mission_memory", "tenant_id = ?", (tenant_id,)),
+        active_memories=_count(
+            conn,
+            "mission_memory",
+            "tenant_id = ? AND archived_at IS NULL",
+            (tenant_id,),
+        ),
+        archived_memories=_count(
+            conn,
+            "mission_memory",
+            "tenant_id = ? AND archived_at IS NOT NULL",
+            (tenant_id,),
+        ),
+        events=_count_where_ids(conn, "mission_events", "mission_id", mission_ids),
+        artifacts=_count_where_ids(conn, "mission_artifacts", "mission_id", mission_ids),
+        edges=_count_project_edges(conn, mission_ids),
+        notes=_count_project_notes(conn, tab_ids, session_ids),
+        loops=len(loop_ids),
+        loop_runs=_count_project_loop_runs(conn, loop_ids, mission_ids, tab_ids),
+    )
+
+
+def _project_tenant_related_ids(
+    conn: sqlite3.Connection,
+    tenant_id: str,
+) -> tuple[list[str], list[str], list[str]]:
+    mission_rows = conn.execute(
+        "SELECT tab_id, mission_id, session_id FROM missions WHERE tenant_id = ?",
+        (tenant_id,),
+    ).fetchall()
+    memory_rows = conn.execute(
+        "SELECT mission_id FROM mission_memory WHERE tenant_id = ?",
+        (tenant_id,),
+    ).fetchall()
+    mission_ids = sorted({
+        row["mission_id"]
+        for row in [*mission_rows, *memory_rows]
+        if row["mission_id"]
+    })
+    tab_ids = sorted({row["tab_id"] for row in mission_rows if row["tab_id"]})
+    session_ids = sorted({row["session_id"] for row in mission_rows if row["session_id"]})
+    return mission_ids, tab_ids, session_ids
+
+
+def _project_tenant_loop_ids(
+    conn: sqlite3.Connection,
+    mission_ids: list[str],
+    tab_ids: list[str],
+) -> list[int]:
+    where, params = _or_in_conditions([
+        ("target_mission_id", mission_ids),
+        ("target_tab_id", tab_ids),
+    ])
+    if not where:
+        return []
+    rows = conn.execute(
+        f"SELECT id FROM prompt_loops WHERE {where}",
+        params,
+    ).fetchall()
+    return sorted({int(row["id"]) for row in rows})
+
+
+def _count(
+    conn: sqlite3.Connection,
+    table: str,
+    where: str = "",
+    params: Iterable[Any] = (),
+) -> int:
+    query = f"SELECT COUNT(*) AS n FROM {table}"
+    if where:
+        query += f" WHERE {where}"
+    row = conn.execute(query, tuple(params)).fetchone()
+    return int(row["n"] or 0)
+
+
+def _placeholders(values: Iterable[Any]) -> str:
+    return ",".join("?" for _ in values)
+
+
+def _count_where_ids(
+    conn: sqlite3.Connection,
+    table: str,
+    column: str,
+    values: list[Any],
+) -> int:
+    if not values:
+        return 0
+    placeholders = _placeholders(values)
+    return _count(conn, table, f"{column} IN ({placeholders})", values)
+
+
+def _delete_where_ids(
+    conn: sqlite3.Connection,
+    table: str,
+    column: str,
+    values: list[Any],
+) -> int:
+    if not values:
+        return 0
+    placeholders = _placeholders(values)
+    return conn.execute(
+        f"DELETE FROM {table} WHERE {column} IN ({placeholders})",
+        values,
+    ).rowcount
+
+
+def _or_in_conditions(pairs: Iterable[tuple[str, list[Any]]]) -> tuple[str, list[Any]]:
+    clauses: list[str] = []
+    params: list[Any] = []
+    for column, values in pairs:
+        if not values:
+            continue
+        clauses.append(f"{column} IN ({_placeholders(values)})")
+        params.extend(values)
+    return " OR ".join(clauses), params
+
+
+def _count_project_edges(conn: sqlite3.Connection, mission_ids: list[str]) -> int:
+    where, params = _or_in_conditions([
+        ("from_id", mission_ids),
+        ("to_id", mission_ids),
+    ])
+    if not where:
+        return 0
+    return _count(conn, "mission_edges", where, params)
+
+
+def _delete_project_edges(conn: sqlite3.Connection, mission_ids: list[str]) -> int:
+    where, params = _or_in_conditions([
+        ("from_id", mission_ids),
+        ("to_id", mission_ids),
+    ])
+    if not where:
+        return 0
+    return conn.execute(f"DELETE FROM mission_edges WHERE {where}", params).rowcount
+
+
+def _count_project_notes(
+    conn: sqlite3.Connection,
+    tab_ids: list[str],
+    session_ids: list[str],
+) -> int:
+    where, params = _or_in_conditions([
+        ("tab_id", tab_ids),
+        ("session_id", session_ids),
+    ])
+    if not where:
+        return 0
+    return _count(conn, "notes", where, params)
+
+
+def _delete_project_notes(
+    conn: sqlite3.Connection,
+    tab_ids: list[str],
+    session_ids: list[str],
+) -> int:
+    where, params = _or_in_conditions([
+        ("tab_id", tab_ids),
+        ("session_id", session_ids),
+    ])
+    if not where:
+        return 0
+    return conn.execute(f"DELETE FROM notes WHERE {where}", params).rowcount
+
+
+def _count_project_loop_runs(
+    conn: sqlite3.Connection,
+    loop_ids: list[int],
+    mission_ids: list[str],
+    tab_ids: list[str],
+) -> int:
+    where, params = _or_in_conditions([
+        ("loop_id", loop_ids),
+        ("target_mission_id", mission_ids),
+        ("target_tab_id", tab_ids),
+    ])
+    if not where:
+        return 0
+    return _count(conn, "prompt_loop_runs", where, params)
+
+
+def _delete_project_loop_runs(
+    conn: sqlite3.Connection,
+    loop_ids: list[int],
+    mission_ids: list[str],
+    tab_ids: list[str],
+) -> int:
+    where, params = _or_in_conditions([
+        ("loop_id", loop_ids),
+        ("target_mission_id", mission_ids),
+        ("target_tab_id", tab_ids),
+    ])
+    if not where:
+        return 0
+    return conn.execute(f"DELETE FROM prompt_loop_runs WHERE {where}", params).rowcount
+
+
+def _delete_project_action_entries(
+    conn: sqlite3.Connection,
+    tenant: ProjectTenant,
+    mission_ids: list[str],
+    tab_ids: list[str],
+) -> int:
+    if not _table_exists(conn, "action_ledger"):
+        return 0
+    deleted = _delete_where_ids(conn, "action_ledger", "tab_id", tab_ids)
+    for token in [tenant.tenant_id, tenant.root_path, *mission_ids]:
+        if not token:
+            continue
+        deleted += conn.execute(
+            "DELETE FROM action_ledger WHERE details LIKE ?",
+            (f"%{token}%",),
+        ).rowcount
+    return deleted
+
+
+def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+        (table,),
+    ).fetchone()
+    return row is not None
 
 
 def _ensure_mission_identity(conn: sqlite3.Connection, mission: Mission) -> None:

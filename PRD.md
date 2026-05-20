@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| **Status** | v0.8.0a25 implemented (cwd project tenancy + cached activity snapshot); next: 48-hour recall eval |
+| **Status** | v0.8.0a25 implemented (cwd project tenancy + cleanup + cached activity snapshot); next: 48-hour recall eval |
 | **Author** | Fabian Baier |
 | **Last updated** | 2026-05-20 |
 | **Target platform** | macOS + iTerm2 |
@@ -369,6 +369,7 @@ The CLI remains the scriptable surface for the same mission model:
 | `morpheus snapshot <tab_prefix>` | Dump a tab's mission + buffer to markdown |
 | `morpheus context [--format md/json/short]` | Print the shared cross-session snapshot |
 | `morpheus activity [--format table/json/short] [--refresh]` | Print cached live per-session headlines and transcript tails; `--refresh` forces an iTerm poll |
+| `morpheus projects list/prune/delete` | Inspect known project tenants and remove empty or explicitly deleted tenant graph state |
 | `morpheus note "<text>"` | Post a cross-session note attached to the current tab |
 | `morpheus notes [--limit 15]` | List recent cross-session notes |
 | `morpheus brief` | Produce a morning/evening operational digest |
@@ -455,6 +456,16 @@ Required behavior:
   and, later, `--project <name-or-path>` for selecting another tenant.
 - Context files should keep the existing global `~/.morpheus/context.md` while
   also allowing tenant-scoped context output for project-local agents.
+- Project cleanup must be first-class. `morpheus projects list` shows every
+  known tenant with live/session graph counts, `morpheus projects prune`
+  removes only empty tenant rows, and `morpheus projects delete <project>`
+  deliberately removes that tenant plus all related Morpheus-owned DB graph
+  rows so no mission, memory, event, artifact, edge, note, loop, loop-run, or
+  old action-ledger row is left orphaned.
+- The cockpit project switcher must allow pruning empty tenants and deleting
+  non-live tenant graph state with confirmation. Live sessions remain
+  ask-first: close or prune live tabs before deleting the project tenant, or
+  use an explicit CLI flag that closes live tabs first.
 
 Non-goals for the first tenant implementation:
 
@@ -476,6 +487,11 @@ Implementation status:
 - 2026-05-20: Follow-up UX fix implemented after dogfood. The cockpit header
   shows the active project root and hidden-session count, and `t` opens a
   project switcher with global fleet plus known tenants.
+- 2026-05-20: Project cleanup follow-up 100% complete locally. DB-level tenant
+  usage/purge primitives, `morpheus projects list/prune/delete`, project
+  switcher prune/delete controls, and focused cleanup tests passed in
+  `make test`. Dogfood pruned two empty `/private/tmp` tenants from the real
+  Morpheus DB.
 
 ### 6.7 Prompt Loops
 
