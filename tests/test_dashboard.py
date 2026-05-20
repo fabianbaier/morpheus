@@ -14,6 +14,7 @@ from morpheus.dashboard import (
     NewSessionScreen,
     NoteScreen,
     _session_headline,
+    _stream_shard_text,
     _tail_lines,
 )
 
@@ -119,6 +120,22 @@ class DashboardTest(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(rendered, "Assuming you mean X/Twitter: two debate clusters.")
+
+    def test_stream_shard_text_embeds_live_output_in_mission_label(self) -> None:
+        live = LiveBuffer(
+            tab_id="tab-123456",
+            goal="current debate on X",
+            state="working",
+            last_event="active output",
+            buffer="Searching the web\nTwo debate clusters are driving the timeline.",
+            observed_at=0,
+        )
+
+        rendered = _stream_shard_text(live, width=80)
+
+        self.assertIn("current debate on X", rendered)
+        self.assertIn("Two debate clusters", rendered)
+        self.assertNotIn("Searching the web", rendered)
 
     async def test_finished_session_pushes_summary_ticker_and_event(self) -> None:
         app = DashboardHarness()

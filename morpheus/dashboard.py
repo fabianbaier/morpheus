@@ -5,9 +5,9 @@ The morpheus tab is your command center; the iTerm tabs are your workers.
 
   ┌─ MORPHEUS banner ─────────────────────────────────────────────────────┐
   │                                                                       │
-  │  ┌── live streams ────┐  ┌── missions (sorted newest-active first) ┐  │
-  │  │  terminal tails +  │  │  cursor-navigable, ticker-flash on      │  │
-  │  │  Matrix separators │  │  state change (green/yellow/red row)    │  │
+  │  ┌── stream rain ─────┐  ┌── missions (sorted newest-active first) ┐  │
+  │  │  Matrix rain with  │  │  cursor-navigable, ticker-flash on      │  │
+  │  │  live output shards│  │  state change (green/yellow/red row)    │  │
   │  └────────────────────┘  └────────────────────────────────────────┘   │
   │  ┌── 🐇 alerts ──────────────────────────────────────────────────┐    │
   │  └────────────────────────────────────────────────────────────────┘   │
@@ -116,16 +116,35 @@ class LiveBuffer:
     observed_at: float
 
 
+@dataclass
+class StreamShard:
+    tab_id: str
+    text: str
+    x: int
+    y: int
+    speed_ticks: int
+    tick_counter: int = 0
+
+    def tick(self, height: int) -> bool:
+        self.tick_counter += 1
+        if self.tick_counter < self.speed_ticks:
+            return True
+        self.tick_counter = 0
+        self.y += 1
+        return self.y < height
+
+
 # ── rain widget ───────────────────────────────────────────────────────────
 
 class LiveStreamWidget(Static):
-    """Live terminal tails with Matrix texture between session streams."""
+    """Matrix rain with live terminal output embedded as falling shards."""
 
     def __init__(self, **kw):
         super().__init__("", **kw)
         self.rain: Optional[rain_mod.Rain] = None
         self.buffers: dict[str, LiveBuffer] = {}
         self.selected_tab_id: Optional[str] = None
+        self.shards: dict[str, StreamShard] = {}
 
     def on_show(self) -> None:
         self._ensure_rain()
@@ -151,6 +170,7 @@ class LiveStreamWidget(Static):
     def update_buffers(self, buffers: dict[str, LiveBuffer], selected_tab_id: Optional[str]) -> None:
         self.buffers = buffers
         self.selected_tab_id = selected_tab_id
+        self._sync_shards()
         self._render_live()
 
     def tick_rain(self, missions: list[db.Mission]) -> None:
@@ -160,48 +180,83 @@ class LiveStreamWidget(Static):
             return
         self.rain.update_missions(missions)
         self.rain.tick()
+        self._sync_shards()
+        self._tick_shards()
         self._render_live()
 
     def _render_live(self) -> None:
         width = max(24, self.size.width - 4)
         height = max(6, self.size.height - 2)
-        text = Text()
-        text.append("LIVE STREAMS\n", style="bold bright_green")
+        grid = self._rain_grid(width, height)
 
         ordered = self._ordered_buffers()
         if not ordered:
-            text.append("waiting for observed terminal output\n", style=COL_DIMMER)
-            text.append(self._matrix_line(width), style="color(22)")
-            self.update(text)
+            self._overlay_text(grid, 0, 0, "awaiting live streams", COL_DIMMER)
+            self.update(self._grid_to_text(grid))
             return
 
-        used_lines = 1
-        for i, live in enumerate(ordered[:4]):
-            if used_lines >= height - 2:
+        for shard in self._ordered_shards():
+            if 0 <= shard.y < height:
+                live = self.buffers.get(shard.tab_id)
+                style = self._shard_style(live)
+                self._overlay_text(grid, shard.x, shard.y, shard.text, style)
+                if shard.y + 1 < height:
+                    self._overlay_text(grid, shard.x, shard.y + 1, self._ghost_text(shard.text), "color(29)")
+
+        self.update(self._grid_to_text(grid))
+
+    def _rain_grid(self, width: int, height: int) -> list[list[tuple[str, str]]]:
+        if self.rain is None:
+            self.rain = rain_mod.Rain(cols=width, rows=height)
+        elif self.rain.cols != width or self.rain.rows != height:
+            self.rain.resize(cols=width, rows=height)
+
+        col_at_x: list[object | None] = [None] * width
+        for col in self.rain.columns:
+            if 0 <= col.x < width:
+                col_at_x[col.x] = col
+
+        grid: list[list[tuple[str, str]]] = []
+        for y in range(height):
+            row: list[tuple[str, str]] = []
+            for x in range(width):
+                col = col_at_x[x]
+                if col is None:
+                    row.append((" ", ""))
+                else:
+                    row.append(col.get_cell(y))
+            grid.append(row)
+        return grid
+
+    def _grid_to_text(self, grid: list[list[tuple[str, str]]]) -> Text:
+        out = Text()
+        for y, row in enumerate(grid):
+            for ch, style in row:
+                out.append(ch, style=style)
+            if y < len(grid) - 1:
+                out.append("\n")
+        return out
+
+    def _overlay_text(
+        self,
+        grid: list[list[tuple[str, str]]],
+        x: int,
+        y: int,
+        value: str,
+        style: str,
+    ) -> None:
+        if not grid or y < 0 or y >= len(grid):
+            return
+        width = len(grid[y])
+        if width <= 0:
+            return
+        x = max(0, min(x, width - 1))
+        value = _truncate(value, max(1, width - x), strip=False)
+        for offset, ch in enumerate(value):
+            pos = x + offset
+            if pos >= width:
                 break
-            if i > 0:
-                text.append(self._matrix_line(width), style="color(22)")
-                text.append("\n")
-                used_lines += 1
-
-            header = self._stream_header(live, width)
-            text.append(header)
-            text.append("\n")
-            used_lines += 1
-
-            remaining = max(1, height - used_lines - 1)
-            line_budget = min(5 if live.tab_id == self.selected_tab_id else 3, remaining)
-            for line in _tail_lines(live.buffer, limit=line_budget, width=width):
-                style = "bright_white" if live.tab_id == self.selected_tab_id else COL_BODY
-                text.append(line, style=style)
-                text.append("\n")
-                used_lines += 1
-                if used_lines >= height - 1:
-                    break
-
-        if used_lines < height - 1:
-            text.append(self._matrix_line(width), style="color(22)")
-        self.update(text)
+            grid[y][pos] = (ch, style)
 
     def _ordered_buffers(self) -> list[LiveBuffer]:
         items = list(self.buffers.values())
@@ -217,20 +272,77 @@ class LiveStreamWidget(Static):
             ),
         )
 
-    def _stream_header(self, live: LiveBuffer, width: int) -> Text:
-        tab_short = (live.tab_id or "?").split("-")[0]
-        emoji = naming.STATE_EMOJI.get(live.state, "⚪")
-        label = f"{emoji} {tab_short} {live.goal or '(untitled)'}"
-        age = naming.format_age(max(0.0, time.time() - live.observed_at))
-        suffix = f" {live.state} · {age} ago"
-        raw = _truncate(f"{label} {suffix}", width)
-        style = "bold bright_green" if live.tab_id == self.selected_tab_id else STATE_TEXT_STYLE.get(live.state, COL_BODY)
-        return Text(raw, style=style)
+    def _ordered_shards(self) -> list[StreamShard]:
+        ordered_tabs = [live.tab_id for live in self._ordered_buffers()]
+        index = {tab_id: i for i, tab_id in enumerate(ordered_tabs)}
+        return sorted(self.shards.values(), key=lambda shard: index.get(shard.tab_id, 99), reverse=True)
 
-    def _matrix_line(self, width: int) -> str:
-        if width <= 0:
-            return ""
-        return "".join(random.choice(rain_mod.CHARS) for _ in range(width))
+    def _sync_shards(self) -> None:
+        width = max(24, self.size.width - 4)
+        height = max(6, self.size.height - 2)
+        ordered = self._ordered_buffers()[:8]
+        active = {live.tab_id for live in ordered}
+        for tab_id in list(self.shards.keys()):
+            if tab_id not in active:
+                self.shards.pop(tab_id, None)
+
+        for index, live in enumerate(ordered):
+            text = _stream_shard_text(live, width=max(12, width - 2))
+            if not text:
+                continue
+            existing = self.shards.get(live.tab_id)
+            if existing is not None and existing.text == text:
+                existing.speed_ticks = self._shard_speed(live)
+                continue
+            self.shards[live.tab_id] = StreamShard(
+                tab_id=live.tab_id,
+                text=text,
+                x=self._shard_x(live.tab_id, index, width, len(text)),
+                y=random.randint(0, max(0, height // 3)),
+                speed_ticks=self._shard_speed(live),
+            )
+
+    def _tick_shards(self) -> None:
+        height = max(6, self.size.height - 2)
+        for tab_id, shard in list(self.shards.items()):
+            if shard.tick(height):
+                continue
+            live = self.buffers.get(tab_id)
+            if live is None:
+                self.shards.pop(tab_id, None)
+                continue
+            text = _stream_shard_text(live, width=max(12, self.size.width - 6))
+            shard.text = text
+            shard.y = -random.randint(0, max(1, height // 2))
+            shard.x = self._shard_x(tab_id, 0, max(24, self.size.width - 4), len(text))
+
+    def _shard_x(self, tab_id: str, index: int, width: int, text_len: int) -> int:
+        if width <= text_len + 1:
+            return 0
+        band = max(1, width // max(1, min(8, len(self.buffers) or 1)))
+        base = (index * band + (abs(hash(tab_id)) % max(1, band))) % width
+        return min(base, max(0, width - text_len - 1))
+
+    def _shard_speed(self, live: LiveBuffer) -> int:
+        if live.tab_id == self.selected_tab_id:
+            return 1
+        return {"working": 1, "blocked": 2, "crashed": 1, "idle": 3, "finished": 5}.get(live.state, 3)
+
+    def _shard_style(self, live: Optional[LiveBuffer]) -> str:
+        if live is None:
+            return "bright_green"
+        if live.tab_id == self.selected_tab_id:
+            return "bold bright_white"
+        return {
+            "blocked": "bold bright_yellow",
+            "crashed": "bold bright_red",
+            "working": "bright_cyan",
+            "idle": "bright_green",
+            "finished": "green",
+        }.get(live.state, "bright_green")
+
+    def _ghost_text(self, value: str) -> str:
+        return "".join(ch if ch == " " or random.random() < 0.16 else random.choice(rain_mod.CHARS) for ch in value)
 
 
 RainWidget = LiveStreamWidget
@@ -269,6 +381,17 @@ def _session_headline(
             continue
         return _truncate(line, width)
     return _truncate(fallback, width) if fallback else ""
+
+
+def _stream_shard_text(live: LiveBuffer, width: int) -> str:
+    tab_short = (live.tab_id or "?").split("-")[0]
+    goal = live.goal or tab_short
+    label = _truncate(goal, 22)
+    snippet = _session_headline(live.buffer, fallback=live.last_event, width=max(8, width - len(label) - 8))
+    if not snippet:
+        return ""
+    emoji = naming.STATE_EMOJI.get(live.state, "⚪")
+    return _truncate(f"{emoji} {label} :: {snippet}", width)
 
 
 def _is_headline_noise(line: str) -> bool:

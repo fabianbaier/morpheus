@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| **Status** | v0.7.0a4 implemented (session-end rabbit ticker headlines); next: edit mission flow |
+| **Status** | v0.7.0a5 implemented (Matrix rain output shards); next: edit mission flow |
 | **Author** | Fabian Baier |
 | **Last updated** | 2026-05-20 |
 | **Target platform** | macOS + iTerm2 |
@@ -264,12 +264,14 @@ carries operational signal.
 
 Required live-stream behavior:
 
-- The Matrix rain surface shows **real terminal output tails** from active
-  sessions, not only decorative rain or metadata.
+- The Matrix rain surface shows **real terminal output shards** from active
+  sessions embedded in the falling rain, not a static terminal log next to or
+  below decorative rain.
 - The stream mix is relevance-ranked: selected session first, then blocked /
   crashed / working / recently active sessions.
-- Matrix texture appears **between** session streams so the UI feels like a
-  unified live field while still exposing actual agent activity.
+- Matrix texture appears as the base layer of the stream field. Live session
+  output falls through it as bright readable shards, so the panel feels like one
+  combined Matrix rain made from all active sessions.
 - Web searches, tool progress, intermediate summaries, final responses, build
   output, prompts, and errors must appear in Morpheus quickly enough that the
   user can understand what is happening without switching tabs.
@@ -643,8 +645,9 @@ This table is the source of truth for where the product stands right now.
 | Provenance model | Foundation implemented | Graph fields store source kind/ref and confidence; UI trust treatment still pending |
 | Loop phase / proof tracking | Foundation implemented | `phase`, `last_verified_at`, events, artifacts exist; selected cockpit card now displays phase/events/artifacts |
 | Mission card panel | Implemented in v0.7.0a2 | Right-side Textual card shows selected mission graph fields, events, artifacts, unset memory gaps |
-| Live session streams | Implemented in v0.7.0a3 | Left panel now renders real terminal tails from selected/relevant sessions with Matrix separators; PRD now requires live tool/search progress and latest response tails to be visible from Morpheus before attaching |
+| Live session streams | Implemented in v0.7.0a3 | Dashboard captures real terminal tails from selected/relevant sessions; v0.7.0a5 changes the visual treatment from static tails to Matrix rain shards |
 | Session-end rabbit ticker | Implemented in v0.7.0a4 | Finished sessions now emit bottom-strip completion headlines from the latest substantive terminal output and store a mission summary event when possible |
+| Matrix rain output shards | Implemented in v0.7.0a5 | Left panel is rain-first again: real terminal output is embedded as falling bright shards inside the Matrix rain instead of rendered as a static terminal tail |
 | Edit mission flow | Not implemented | `e` opens goal/why/plan/next/criteria/source/proof editor |
 | Brief selected | Not implemented | `b` renders a cited why/status/next card from graph + transcript tail |
 | Resume fresh | Not implemented | `r` snapshots, archives old attachment, spawns replacement with mission context |
