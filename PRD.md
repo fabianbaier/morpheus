@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| **Status** | v0.8.0a23 implemented (idle ticker reconciliation); next: 48-hour recall eval |
+| **Status** | v0.8.0a23 implemented (idle ticker reconciliation); cwd project tenancy planned; implementation in progress |
 | **Author** | Fabian Baier |
 | **Last updated** | 2026-05-20 |
 | **Target platform** | macOS + iTerm2 |
@@ -415,7 +415,54 @@ plus assignment events. In v0.8.0a9, `d` on a virtual parent row archives the
 run and closes live child tabs; `p` archives orphan parent rows that no longer
 have live children.
 
-### 6.6 Prompt Loops
+### 6.6 Project Tenancy
+
+Morpheus must support multiple project cockpits on the same machine without
+splitting the mission graph into disconnected state stores. The default tenant
+is the project implied by the directory where the user runs `morpheus`.
+
+Required behavior:
+
+- `cd ~/project-a && morpheus` opens a Project A cockpit.
+- `cd ~/project-b && morpheus` opens a Project B cockpit.
+- Each cockpit defaults to showing and controlling only missions whose terminal
+  cwd belongs to that project tenant.
+- The global mission graph remains one SQLite-backed store under `~/.morpheus/`
+  so cross-project recall, proof, daemon observation, and collision detection
+  keep working.
+- Project identity is resolved from the nearest Git worktree root first, then
+  known project markers (`pyproject.toml`, `package.json`, `Cargo.toml`,
+  `go.mod`, `.git`, etc.), then canonical cwd.
+- Existing live tabs are assigned to tenants by their iTerm-reported cwd on each
+  tick. When cwd is unavailable, Morpheus may use a window-level cockpit binding
+  as a low-confidence fallback, but the durable tenant assignment should be
+  repaired once cwd is known.
+- iTerm windows are useful visual boundaries and spawn targets, but they are
+  not the source of truth. Tabs can move between windows; tenant identity lives
+  in mission graph metadata.
+- Spawned tabs from a project cockpit should start in that project's root and
+  inherit the project tenant.
+- CLI commands default to the current project tenant when run from a project
+  directory: `morpheus`, `morpheus list`, `morpheus context`, and graph views.
+- CLI commands need explicit global escape hatches: `--all` for fleet-wide views
+  and, later, `--project <name-or-path>` for selecting another tenant.
+- Context files should keep the existing global `~/.morpheus/context.md` while
+  also allowing tenant-scoped context output for project-local agents.
+
+Non-goals for the first tenant implementation:
+
+- Do not create one SQLite database per project.
+- Do not store durable Morpheus state inside project repositories.
+- Do not make iTerm window identity the only tenant boundary.
+- Do not hide cross-project collisions from the global daemon/cockpit.
+
+Implementation status:
+
+- 2026-05-20: Design accepted. Planned implementation is one shared DB with
+  `project_tenants`, `tenant_id`, and `project_root` metadata plus tenant-scoped
+  default filters in the dashboard, list, context, and graph surfaces.
+
+### 6.7 Prompt Loops
 
 Prompt loops are recurring prompts that behave like small cron-fed sensors or
 workers. They are not always-on agents. Morpheus stores their schedule, target,
