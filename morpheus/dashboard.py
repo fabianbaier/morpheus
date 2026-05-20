@@ -649,16 +649,24 @@ class MorpheusApp(App):
                     ))
                     return
 
-    async def action_new_session(self) -> None:
+    def action_new_session(self) -> None:
         if self.iterm_conn is None:
             return
-        result = await self.push_screen_wait(NewSessionScreen())
+        self.push_screen(NewSessionScreen(), self._handle_new_session_result)
+
+    async def _handle_new_session_result(self, result: Optional[tuple[str, str]]) -> None:
         if not result:
             return
         goal, cmd = result
         if not cmd:
             return
-        info = await iterm_client.spawn_tab(self.iterm_conn, command=cmd, goal=goal)
+        if self.iterm_conn is None:
+            return
+        try:
+            info = await iterm_client.spawn_tab(self.iterm_conn, command=cmd, goal=goal)
+        except Exception as e:
+            self._push_alert(Alert(time.time(), "error", f"spawn failed: {e}"))
+            return
         if info is None:
             self._push_alert(Alert(time.time(), "error", "spawn failed — is iTerm focused?"))
             return
@@ -754,10 +762,12 @@ class MorpheusApp(App):
             f"snapshot → {out_path.name}",
         ))
 
-    async def action_post_note(self) -> None:
+    def action_post_note(self) -> None:
         table = self.query_one(MissionsTable)
         attach_tab = table.selected_tab_id()
-        result = await self.push_screen_wait(NoteScreen(attach_tab_id=attach_tab))
+        self.push_screen(NoteScreen(attach_tab_id=attach_tab), self._handle_note_result)
+
+    async def _handle_note_result(self, result: Optional[tuple[str, str, Optional[str]]]) -> None:
         if not result:
             return
         kind, text, tab_id = result
