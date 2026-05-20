@@ -160,6 +160,7 @@ morpheus brief
 morpheus ask "what needs my attention?"
 morpheus graph status
 morpheus graph show <mission-or-tab-prefix>
+morpheus graph recall-eval <mission-or-tab-prefix>
 morpheus run find-prds .
 morpheus run start ./PRD.md --cmd "codex"
 morpheus loops add "market scan" "summarize tomorrow's market catalysts" --every 30m
@@ -249,6 +250,7 @@ morpheus graph status
 morpheus graph show <tab-prefix-or-mission-id>
 morpheus graph event <ref> "decided to split auth tests" --kind decision
 morpheus graph artifact <ref> ./pytest.log --kind test --status pass
+morpheus graph recall-eval <ref>
 ```
 
 The MCP server exposes the same graph layer to agents through
@@ -260,6 +262,24 @@ messages.
 Snapshots automatically attach a `snapshot` artifact to the selected mission.
 When a tab is closed or disappears, the live attachment is removed but the
 mission memory is archived instead of forgotten.
+
+### 48-Hour Recall Eval
+
+`morpheus graph recall-eval` checks whether stale mission graph data has enough
+local context for the `b` mission brief to recover intent and next action within
+the 10-second dogfood target. It scores stale age, why, done definition,
+acceptance criteria, next step, recent decision, recent check, and proof
+artifact fields.
+
+```bash
+morpheus graph recall-eval <mission-or-tab-prefix>
+morpheus graph recall-eval --include-archived --record-event
+morpheus graph recall-eval --json <mission-or-tab-prefix>
+```
+
+With no refs, the command scans active missions that are at least 48 hours
+stale. `--record-event` appends a deterministic `recall_eval` event to each
+evaluated mission.
 
 ## PRD Runs
 
@@ -389,6 +409,6 @@ Next implementation phases:
 30. Closed-row dismiss/prune actions. Done in `0.8.0a22`.
 31. Idle ticker reconciliation when another watcher observes the transition first. Done in `0.8.0a23`.
 32. White-rabbit ticker noise reduction for focus/dismiss bookkeeping. Done in `0.8.0a24`.
-33. 48-hour recall eval.
+33. 48-hour recall eval. Done in `0.8.0a25`.
 
 > "I can only show you the door. You're the one that has to walk through it."

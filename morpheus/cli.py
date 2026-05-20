@@ -19,7 +19,7 @@ from morpheus import ask as ask_mod
 from morpheus import brief as brief_mod
 from morpheus import config as cfg_mod
 from morpheus import context as ctx_mod
-from morpheus import core, daemon as daemon_mod, db, iterm_client, ledger as ledger_mod, loops as loops_mod, mission_graph as graph_mod, naming, notifier as notifier_mod, prd_runs, trigger as trigger_mod, __version__
+from morpheus import core, daemon as daemon_mod, db, iterm_client, ledger as ledger_mod, loops as loops_mod, mission_graph as graph_mod, naming, notifier as notifier_mod, prd_runs, recall_eval, trigger as trigger_mod, __version__
 
 app = typer.Typer(
     name="morpheus",
@@ -1283,6 +1283,203 @@ def graph_show(
                 f"  {e.from_id} -[{e.relation}]-> {e.to_id} {e.reason}",
                 markup=False,
             )
+
+
+@graph_app.command("recall-eval")
+def graph_recall_eval(
+    refs: Optional[list[str]] = typer.Argument(
+        None,
+        help="Mission ids/prefixes or tab ids/prefixes. Default: all stale active missions.",
+    ),
+    stale_hours: float = typer.Option(
+        48.0,
+        "--stale-hours",
+        help="Minimum idle/closed age for the 48-hour recall gate.",
+    ),
+    target_seconds: float = typer.Option(
+        10.0,
+        "--target-seconds",
+        help="Human recall target this readiness score is proxying.",
+    ),
+    include_archived: bool = typer.Option(
+        False,
+        "--include-archived",
+        help="When no refs are given, include archived mission memory rows.",
+    ),
+    include_fresh: bool = typer.Option(
+        False,
+        "--include-fresh",
+        help="When no refs are given, include missions younger than --stale-hours.",
+    ),
+    record_event: bool = typer.Option(
+        False,
+        "--record-event",
+        help="Append a recall_eval graph event to each evaluated mission.",
+    ),
+    json_out: bool = typer.Option(False, "--json", help="Emit machine-readable JSON."),
+):
+    """Evaluate stale mission recall readiness from graph-backed brief fields."""
+    if stale_hours <= 0:
+        console.print("[red]--stale-hours must be positive[/red]")
+        raise typer.Exit(1)
+    if target_seconds <= 0:
+        console.print("[red]--target-seconds must be positive[/red]")
+        raise typer.Exit(1)
+
+    try:
+        results = _recall_eval_results(
+            refs or [],
+            stale_seconds=stale_hours * 3600,
+            target_seconds=target_seconds,
+            include_archived=include_archived,
+            include_fresh=include_fresh,
+        )
+    except ValueError as e:
+        console.print(f"[red]{e}[/red]")
+        raise typer.Exit(1)
+
+    if json_out:
+        console.print_json(json.dumps([result.to_dict() for result in results]))
+    else:
+        _print_recall_eval_results(results, stale_hours=stale_hours)
+
+    if record_event:
+        for result in results:
+            db.add_event(
+                result.mission_id,
+                kind="recall_eval",
+                actor="morpheus",
+                summary=result.event_summary(),
+                source_ref="morpheus graph recall-eval",
+                metadata=result.to_dict(),
+            )
+        if not json_out:
+            console.print(f"[green]recorded recall_eval event(s):[/green] {len(results)}")
+
+
+def _recall_eval_results(
+    refs: list[str],
+    *,
+    stale_seconds: float,
+    target_seconds: float,
+    include_archived: bool,
+    include_fresh: bool,
+) -> list[recall_eval.RecallEvaluation]:
+    live_by_mission: dict[str, list[db.Mission]] = {}
+    for mission in db.all_missions():
+        if mission.mission_id:
+            live_by_mission.setdefault(mission.mission_id, []).append(mission)
+
+    memories: list[db.MissionMemory] = []
+    if refs:
+        for ref in refs:
+            resolved = _resolve_recall_ref(ref)
+            if resolved is None:
+                raise ValueError(f"no mission matching '{ref}'")
+            memories.append(resolved.memory)
+            if resolved.live:
+                live_by_mission[resolved.mission_id] = resolved.live
+    else:
+        memories = db.all_memory(include_archived=include_archived)
+
+    results: list[recall_eval.RecallEvaluation] = []
+    seen: set[str] = set()
+    for memory in memories:
+        if memory.mission_id in seen:
+            continue
+        seen.add(memory.mission_id)
+        result = recall_eval.evaluate_mission(
+            memory,
+            live=live_by_mission.get(memory.mission_id, []),
+            events=db.recent_events(memory.mission_id, limit=20),
+            artifacts=db.artifacts_for_mission(memory.mission_id, limit=20),
+            stale_seconds=stale_seconds,
+            target_seconds=target_seconds,
+        )
+        if refs or include_fresh or (
+            result.age_seconds is not None and result.age_seconds >= stale_seconds
+        ):
+            results.append(result)
+    return results
+
+
+def _resolve_recall_ref(ref: str) -> Optional[graph_mod.ResolvedMission]:
+    """Resolve one ref for recall eval, rejecting ambiguous prefixes."""
+    needle = ref.strip()
+    if not needle:
+        return None
+
+    live = db.all_missions()
+    memories = db.all_memory(include_archived=True)
+    memory_by_id = {memory.mission_id: memory for memory in memories}
+
+    exact_ids = {
+        mission.mission_id for mission in live
+        if mission.mission_id and (mission.tab_id == needle or mission.mission_id == needle)
+    }
+    exact_ids.update(
+        memory.mission_id for memory in memories
+        if memory.mission_id == needle
+    )
+    candidate_ids = exact_ids
+    if not candidate_ids:
+        candidate_ids = {
+            mission.mission_id for mission in live
+            if mission.mission_id and (
+                mission.tab_id.startswith(needle)
+                or mission.mission_id.startswith(needle)
+            )
+        }
+        candidate_ids.update(
+            memory.mission_id for memory in memories
+            if memory.mission_id.startswith(needle)
+        )
+
+    if not candidate_ids:
+        return None
+    if len(candidate_ids) > 1:
+        choices = ", ".join(graph_mod.short_id(mission_id) for mission_id in sorted(candidate_ids))
+        raise ValueError(f"ambiguous mission ref '{ref}' matches: {choices}")
+
+    mission_id = next(iter(candidate_ids))
+    memory = memory_by_id.get(mission_id) or db.get_memory(mission_id)
+    if memory is None:
+        return None
+    return graph_mod.ResolvedMission(
+        mission_id=mission_id,
+        memory=memory,
+        live=[mission for mission in live if mission.mission_id == mission_id],
+    )
+
+
+def _print_recall_eval_results(
+    results: list[recall_eval.RecallEvaluation],
+    *,
+    stale_hours: float,
+) -> None:
+    if not results:
+        console.print(f"[dim]no missions at or beyond {stale_hours:g}h stale[/dim]")
+        return
+
+    table = Table(title="MORPHEUS 48-hour recall eval", header_style="bold green")
+    table.add_column("RESULT", no_wrap=True)
+    table.add_column("SCORE", justify="right", no_wrap=True)
+    table.add_column("AGE", justify="right", no_wrap=True)
+    table.add_column("MISSION", style="cyan", no_wrap=True)
+    table.add_column("TITLE", overflow="fold")
+    table.add_column("MISSING", overflow="fold")
+    for result in results:
+        status = "[green]PASS[/green]" if result.passed else "[red]FAIL[/red]"
+        missing = ", ".join(result.missing_labels) if result.missing_labels else "none"
+        table.add_row(
+            status,
+            f"{result.score}%",
+            recall_eval.format_age(result.age_seconds),
+            graph_mod.short_id(result.mission_id),
+            escape(result.title),
+            escape(missing),
+        )
+    console.print(table)
 
 
 @graph_app.command("event")
