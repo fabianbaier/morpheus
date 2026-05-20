@@ -1,5 +1,6 @@
 import asyncio
 import tempfile
+import time
 import unittest
 from contextlib import contextmanager
 from pathlib import Path
@@ -530,6 +531,86 @@ class DashboardTest(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(len(events), 1)
         self.assertEqual(events[0]["metadata"]["summary_kind"], "ready")
+
+    async def test_observed_idle_session_reconciles_ready_ticker_if_transition_was_missed(self) -> None:
+        app = DashboardHarness()
+        events = []
+        now = time.time()
+        mission = dashboard.db.Mission(
+            tab_id="tab-123456",
+            mission_id="m_20260520000102_abcd1234",
+            goal="workday coordinator",
+            state="idle",
+            last_event="idle 44s",
+            buffer_hash="hash-ready",
+            buffer_changed_at=now - 44,
+        )
+        tab = dashboard.iterm_client.TabInfo(
+            tab_id=mission.tab_id,
+            session_id="session-123456",
+            window_id="window-123456",
+            current_name="workday1 coordinator",
+            buffer="\n".join(
+                [
+                    "Checked the dashboard and tests.",
+                    "Bottom line: The repo is clean and aligned with origin/main.",
+                    "› Use /skills to list available skills",
+                ]
+            ),
+        )
+        detection = SimpleNamespace(last_event="idle 44s")
+
+        def fake_add_event(mission_id, kind, summary, actor="user", source_ref="", metadata=None):
+            events.append(
+                {
+                    "mission_id": mission_id,
+                    "kind": kind,
+                    "summary": summary,
+                    "actor": actor,
+                    "source_ref": source_ref,
+                    "metadata": metadata,
+                }
+            )
+            return 1
+
+        with patch.object(dashboard.time, "time", return_value=now), patch.object(
+            dashboard.db, "add_event", new=fake_add_event
+        ):
+            await app._on_tab_observed(tab, mission, detection)
+            await app._on_tab_observed(tab, mission, detection)
+
+        self.assertEqual(len(app.alerts), 1)
+        self.assertEqual(
+            app.alerts[0].text,
+            "ready [workday coordinator] — Bottom line: The repo is clean and aligned with origin/main.",
+        )
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["metadata"]["summary_kind"], "ready")
+
+    async def test_stale_observed_idle_session_does_not_replay_ready_ticker(self) -> None:
+        app = DashboardHarness()
+        now = time.time()
+        mission = dashboard.db.Mission(
+            tab_id="tab-123456",
+            mission_id="m_20260520000102_abcd1234",
+            goal="old idle",
+            state="idle",
+            last_event="idle 10m",
+            buffer_hash="hash-old",
+            buffer_changed_at=now - dashboard.READY_RECONCILE_SECONDS - 1,
+        )
+        tab = dashboard.iterm_client.TabInfo(
+            tab_id=mission.tab_id,
+            session_id="session-123456",
+            window_id="window-123456",
+            current_name="old idle",
+            buffer="This finished a while ago.",
+        )
+
+        with patch.object(dashboard.time, "time", return_value=now):
+            await app._on_tab_observed(tab, mission, SimpleNamespace(last_event="idle 10m"))
+
+        self.assertEqual(list(app.alerts), [])
 
     def test_scan_new_missions_silently_drops_self_tab(self) -> None:
         app = MorpheusApp()

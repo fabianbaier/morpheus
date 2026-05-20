@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| **Status** | v0.8.0a22 implemented (closed-row dismiss/prune); next: 48-hour recall eval |
+| **Status** | v0.8.0a23 implemented (idle ticker reconciliation); next: 48-hour recall eval |
 | **Author** | Fabian Baier |
 | **Last updated** | 2026-05-20 |
 | **Target platform** | macOS + iTerm2 |
@@ -293,7 +293,10 @@ Required live-stream behavior:
   items.
 - Agent sessions that finish a response and return to an idle prompt should also
   produce a ticker headline. A hard process exit is not required; `working →
-  idle` with new substantive output counts as "ready for review."
+  idle` with new substantive output counts as "ready for review." The cockpit
+  should also emit that ready headline when it observes a recently idle session
+  whose transition was already written by another watcher, such as the launchd
+  daemon.
 - Ready/completed headlines must summarize the latest assistant answer block,
   not merely the last visible terminal line. They should ignore Codex prompt
   chrome, model/status lines, web-search trace lines, source URLs, and
@@ -775,6 +778,7 @@ This table is the source of truth for where the product stands right now.
 | Closed-session provider resume | Implemented in v0.8.0a22 | Archived missions keep provider resume metadata; closed rows remain selectable and `r` opens a new iTerm tab with exact Codex session IDs when the terminal exposed one, then types the Morpheus recovery prompt into the resumed CLI. Pressing `d` or `p` on a closed row now dismisses that resumable attachment from the dashboard without deleting graph history |
 | Robust self-tab exclusion | Implemented in v0.7.0a6 | Dashboard passes its own tab/session IDs into the watcher; core also recognizes the Morpheus screen by buffer if iTerm leaves the title as `Python"` |
 | Ready-response rabbit ticker | Implemented in v0.8.0a2 | `working → idle` now emits a `ready [...]` headline by extracting the latest assistant answer block, skipping Codex chrome/separators/source URLs, and compressing it to one sentence |
+| Idle ticker reconciliation | Implemented in v0.8.0a23 | The dashboard reconciles recently idle observed sessions into the white-rabbit ticker even if another watcher updated SQLite before the cockpit saw the state transition |
 | Newest-first rabbit ticker | Implemented in v0.8.0a3 | Bottom alert strip redraws from the newest-first alert deque so fresh session headlines stay at the top instead of appending chronologically |
 | Prompt loops foundation | Implemented in v0.8.0a4 | `l` creates recurring prompt loops; `morpheus loops run-due` runs due prompts, captures output, publishes ticker notes, and routes graph events/artifacts to target missions |
 | PRD Runs foundation | Implemented in v0.8.0a1 | PRD finder, new-session PRD selector, parent mission creation, coordinator prompt/status files, `morpheus run start`, and coordinator graph edge shipped |

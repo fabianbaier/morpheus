@@ -344,13 +344,14 @@ make daemon
 
 ## Roadmap
 
-Current status: v0.8.0a22 has PRD Runs foundation, PRD tree/manual workers,
+Current status: v0.8.0a23 has PRD Runs foundation, PRD tree/manual workers,
 newest-first ready tickers, prompt loops foundation, nonblocking/Markdown PRD
 picker, edit mission flow, selected mission briefs, PRD parent cleanup, and an
 output-first mission card, plus a user PATH install target, resume-fresh, and
 MCP mission graph update tools, direct terminal broadcast, dense always-alive
 Matrix rain, a low-FPS rain render path, a zoom-safe compact cockpit layout,
-exact Codex closed-session provider resume, and closed-row dismissal.
+exact Codex closed-session provider resume, closed-row dismissal, and idle
+ticker reconciliation.
 
 Next implementation phases:
 
@@ -385,6 +386,7 @@ Next implementation phases:
 28. Closed-session provider resume. Done in `0.8.0a20`.
 29. Exact Codex resume IDs and post-launch recovery prompt handoff. Done in `0.8.0a21`.
 30. Closed-row dismiss/prune actions. Done in `0.8.0a22`.
-31. 48-hour recall eval.
+31. Idle ticker reconciliation when another watcher observes the transition first. Done in `0.8.0a23`.
+32. 48-hour recall eval.
 
 > "I can only show you the door. You're the one that has to walk through it."

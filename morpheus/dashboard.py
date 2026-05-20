@@ -108,6 +108,7 @@ FLASH_DURATION = 3.0  # seconds
 ORPHAN_PRD_PRUNE_SECONDS = 60.0
 MISSION_CARD_OUTPUT_LINES = 18
 MISSION_CARD_EXPANDED_OUTPUT_LINES = 10
+READY_RECONCILE_SECONDS = 5 * 60.0
 SNAPSHOT_DIR = Path.home() / ".morpheus" / "snapshots"
 
 # Sort order for the missions table when there are no flashes pulling
@@ -2266,6 +2267,20 @@ class MorpheusApp(App):
             last_event=detection.last_event,
             buffer=tab.buffer,
             observed_at=time.time(),
+        )
+        self._reconcile_observed_ready_summary(mission)
+
+    def _reconcile_observed_ready_summary(self, mission: db.Mission) -> None:
+        if mission.state != "idle":
+            return
+        if not mission.buffer_changed_at:
+            return
+        if (time.time() - mission.buffer_changed_at) > READY_RECONCILE_SECONDS:
+            return
+        self._push_session_summary_alert(
+            mission,
+            verb="ready",
+            fallback="",
         )
 
     def _do_rain_animate(self) -> None:
