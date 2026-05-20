@@ -2545,7 +2545,7 @@ class MorpheusApp(App):
         await self._claim_self_tab()
         self._push_alert(Alert(
             time.time(), "spawn",
-            f"morpheus dashboard online — follow the white rabbit."
+            f"morpheus dashboard online - {self._scope_text()}"
         ))
 
         # Heavy tick: enumerate iTerm tabs, detect state, write DB + titles + context.

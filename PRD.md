@@ -428,6 +428,12 @@ Required behavior:
 - `cd ~/project-b && morpheus` opens a Project B cockpit.
 - Each cockpit defaults to showing and controlling only missions whose terminal
   cwd belongs to that project tenant.
+- The cockpit header must show the active project name and root path, plus a
+  hidden-session count when other projects have live sessions outside the current
+  scope.
+- The cockpit must provide an in-place project switcher (`t`) with a global
+  fleet option and every known project tenant so the user can recover if they
+  launched Morpheus from the wrong cwd.
 - The global mission graph remains one SQLite-backed store under `~/.morpheus/`
   so cross-project recall, proof, daemon observation, and collision detection
   keep working.
@@ -467,6 +473,9 @@ Implementation status:
   scoping, and focused tenant tests are in progress locally.
 - 2026-05-20: Implementation 100% complete locally. `make test` passed with
   compileall, 86 unit tests, and `git diff --check`.
+- 2026-05-20: Follow-up UX fix implemented after dogfood. The cockpit header
+  shows the active project root and hidden-session count, and `t` opens a
+  project switcher with global fleet plus known tenants.
 
 ### 6.7 Prompt Loops
 
