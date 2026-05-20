@@ -13,6 +13,7 @@ from morpheus.dashboard import (
     MorpheusApp,
     NewSessionScreen,
     NoteScreen,
+    _session_headline,
     _tail_lines,
 )
 
@@ -110,6 +111,57 @@ class DashboardTest(unittest.IsolatedAsyncioTestCase):
         rendered = _tail_lines("old\n\nmiddle\nlatest and very long", limit=2, width=12)
 
         self.assertEqual(rendered, ["middle", "latest and …"])
+
+    def test_session_headline_prefers_final_substantive_line(self) -> None:
+        rendered = _session_headline(
+            "\nSearching the web\nAssuming you mean X/Twitter: two debate clusters.\n› Use /skills to list available skills",
+            fallback="process completed",
+        )
+
+        self.assertEqual(rendered, "Assuming you mean X/Twitter: two debate clusters.")
+
+    async def test_finished_session_pushes_summary_ticker_and_event(self) -> None:
+        app = DashboardHarness()
+        captured = {}
+        mission = dashboard.db.Mission(
+            tab_id="tab-123456",
+            mission_id="m_20260520000102_abcd1234",
+            goal="current debate on X",
+            state="finished",
+            last_event="process completed",
+        )
+        app.live_buffers[mission.tab_id] = LiveBuffer(
+            tab_id=mission.tab_id,
+            goal=mission.goal,
+            state=mission.state,
+            last_event=mission.last_event,
+            buffer="Searching the web\nTwo debate clusters are driving the timeline.",
+            observed_at=0,
+        )
+
+        def fake_add_event(mission_id, kind, summary, actor="user", source_ref="", metadata=None):
+            captured["event"] = {
+                "mission_id": mission_id,
+                "kind": kind,
+                "summary": summary,
+                "actor": actor,
+                "source_ref": source_ref,
+                "metadata": metadata,
+            }
+            return 1
+
+        with patch.object(dashboard.db, "add_event", new=fake_add_event):
+            await app._on_state_change(mission, "working", "finished")
+
+        alert = app.alerts[0]
+        self.assertEqual(alert.kind, "summary")
+        self.assertEqual(
+            alert.text,
+            "completed [current debate on X] — Two debate clusters are driving the timeline.",
+        )
+        self.assertEqual(captured["event"]["kind"], "summary")
+        self.assertEqual(captured["event"]["actor"], "morpheus")
+        self.assertEqual(captured["event"]["summary"], alert.text)
 
     async def test_dashboard_and_modal_css_mounts(self) -> None:
         app = DashboardHarness()

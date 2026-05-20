@@ -74,7 +74,9 @@ selected and most relevant sessions with Matrix separators between streams. The
 mission table controls selection, and the right card shows the selected mission's
 graph memory plus the latest terminal tail. Use `j`/`k` or arrows to move, then
 press `Enter` to jump into the real iTerm tab when you need to respond directly.
-Use `n` to spawn a new session without leaving Morpheus.
+Use `n` to spawn a new session without leaving Morpheus. The bottom white-rabbit
+strip acts like a ticker: blocked prompts, collisions, spawns, notes, and
+completed-session headlines roll in there.
 
 Core commands:
 
@@ -208,9 +210,10 @@ Next implementation phases:
 1. Stable mission IDs and graph storage. Done in `0.7.0a1`.
 2. Mission card panel in the cockpit. Done in `0.7.0a2`.
 3. Live terminal streams in the cockpit. Done in `0.7.0a3`.
-4. Edit mission flow for why/plan/next/provenance/proof fields.
-5. `b` brief-selected using mission graph plus transcript tail.
-6. Resume-fresh flow that snapshots, archives old attachment, and spawns a new
+4. Session-end rabbit ticker headlines. Done in `0.7.0a4`.
+5. Edit mission flow for why/plan/next/provenance/proof fields.
+6. `b` brief-selected using mission graph plus transcript tail.
+7. Resume-fresh flow that snapshots, archives old attachment, and spawns a new
    session linked by a `spawned_from` edge.
 
 > "I can only show you the door. You're the one that has to walk through it."

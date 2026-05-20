@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| **Status** | v0.7.0a3 implemented (live session streams + selected dashboard card); next: edit mission flow |
+| **Status** | v0.7.0a4 implemented (session-end rabbit ticker headlines); next: edit mission flow |
 | **Author** | Fabian Baier |
 | **Last updated** | 2026-05-20 |
 | **Target platform** | macOS + iTerm2 |
@@ -242,7 +242,7 @@ Required cockpit layout:
 │ Matrix session streams │ Selected live transcript      │ Mission card │
 │ + sortable mission list│ tail + alert history          │ why/next/etc │
 ├───────────────────────┴──────────────────────────────┴─────────────┤
-│ 🐇 alerts: blocked prompts, collisions, token guard, trigger spawns  │
+│ 🐇 ticker: blocked prompts, session summaries, collisions, spawns    │
 └────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -285,6 +285,10 @@ Required live-stream behavior:
 - Future owned-PTY support must preserve the same contract: Morpheus is the
   live observation and control surface; per-session shells remain instantly
   attachable.
+- The bottom white-rabbit strip is a ticker, not just an error log. When a
+  session finishes or closes, it should show a short headline from the latest
+  substantive terminal output so completed work arrives as skimmable ticker
+  items.
 
 Acceptance test: start a Codex session that performs a web search, keep focus
 in Morpheus, and verify the cockpit shows the search/tool progress and latest
@@ -640,6 +644,7 @@ This table is the source of truth for where the product stands right now.
 | Loop phase / proof tracking | Foundation implemented | `phase`, `last_verified_at`, events, artifacts exist; selected cockpit card now displays phase/events/artifacts |
 | Mission card panel | Implemented in v0.7.0a2 | Right-side Textual card shows selected mission graph fields, events, artifacts, unset memory gaps |
 | Live session streams | Implemented in v0.7.0a3 | Left panel now renders real terminal tails from selected/relevant sessions with Matrix separators; PRD now requires live tool/search progress and latest response tails to be visible from Morpheus before attaching |
+| Session-end rabbit ticker | Implemented in v0.7.0a4 | Finished sessions now emit bottom-strip completion headlines from the latest substantive terminal output and store a mission summary event when possible |
 | Edit mission flow | Not implemented | `e` opens goal/why/plan/next/criteria/source/proof editor |
 | Brief selected | Not implemented | `b` renders a cited why/status/next card from graph + transcript tail |
 | Resume fresh | Not implemented | `r` snapshots, archives old attachment, spawns replacement with mission context |

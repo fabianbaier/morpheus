@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import random
+import re
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -63,6 +64,9 @@ STATE_TEXT_STYLE = {
     "unknown":  "color(250)",
 }
 
+ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+
 # Stock-ticker row background colors (entire row paints this color for ~3s
 # after a state change, then settles back to default).
 FLASH_BG = {
@@ -92,6 +96,7 @@ class Alert:
         t.append(f"  {RABBIT}  ", style="bright_white")
         style = {
             "state": "bold bright_white",
+            "summary": "bold bright_green",
             "note":  "bright_green",
             "spawn": COL_ACCENT,
             "close": COL_MUTED,
@@ -232,18 +237,55 @@ RainWidget = LiveStreamWidget
 
 
 def _tail_lines(buffer: str, limit: int, width: int) -> list[str]:
-    lines = [line.rstrip() for line in buffer.splitlines()]
+    lines = [_clean_terminal_line(line, strip=False).rstrip() for line in buffer.splitlines()]
     lines = [line for line in lines if line.strip()]
     if not lines:
         return ["(no visible output yet)"]
-    return [_truncate(line, width) for line in lines[-limit:]]
+    return [_truncate(line, width, strip=False) for line in lines[-limit:]]
 
 
-def _truncate(value: str, width: int) -> str:
-    cleaned = value.replace("\t", "    ")
+def _truncate(value: str, width: int, strip: bool = True) -> str:
+    cleaned = _clean_terminal_line(value, strip=strip)
     if len(cleaned) <= width:
         return cleaned
     return cleaned[: max(0, width - 1)] + "…"
+
+
+def _clean_terminal_line(value: str, strip: bool = True) -> str:
+    cleaned = ANSI_RE.sub("", value)
+    cleaned = CONTROL_RE.sub("", cleaned)
+    cleaned = cleaned.replace("\t", "    ")
+    return cleaned.strip() if strip else cleaned
+
+
+def _session_headline(
+    buffer: str,
+    fallback: str = "",
+    width: int = 120,
+) -> str:
+    for raw in reversed(buffer.splitlines()):
+        line = _clean_terminal_line(raw)
+        if _is_headline_noise(line):
+            continue
+        return _truncate(line, width)
+    return _truncate(fallback, width) if fallback else ""
+
+
+def _is_headline_noise(line: str) -> bool:
+    if len(line) < 3:
+        return True
+    lowered = line.lower()
+    if lowered.startswith("use /skills to list"):
+        return True
+    if lowered.startswith("› use /skills to list"):
+        return True
+    if lowered.startswith("> use /skills to list"):
+        return True
+    if lowered.startswith("gpt-") and "·" in lowered:
+        return True
+    if lowered in {"searching the web", "thinking", "working"}:
+        return True
+    return False
 
 
 # ── missions table ────────────────────────────────────────────────────────
@@ -845,6 +887,10 @@ class MorpheusApp(App):
     async def _on_state_change(self, mission: db.Mission, old: str, new: str) -> None:
         # Start a flash for this row.
         self.flashing[mission.tab_id] = (time.time() + FLASH_DURATION, new)
+        if new == "finished":
+            self._push_session_end_alert(mission)
+            return
+
         # Push an alert for notable transitions.
         if new in ("blocked", "crashed", "finished") or old in ("blocked", "crashed"):
             emoji_old = naming.STATE_EMOJI.get(old, "⚪")
@@ -854,6 +900,29 @@ class MorpheusApp(App):
                 time.time(), "state",
                 f"{emoji_old} → {emoji_new}  [{goal}] is now {new}",
             ))
+
+    def _push_session_end_alert(self, mission: db.Mission) -> None:
+        goal = mission.goal or (mission.tab_id or "?").split("-")[0]
+        live = self.live_buffers.get(mission.tab_id)
+        headline = _session_headline(
+            live.buffer if live else "",
+            fallback=mission.last_event or "session ended",
+        )
+        detail = f" — {headline}" if headline else ""
+        text = f"completed [{goal}]{detail}"
+        self._push_alert(Alert(time.time(), "summary", text))
+        if mission.mission_id:
+            try:
+                db.add_event(
+                    mission.mission_id,
+                    kind="summary",
+                    actor="morpheus",
+                    summary=text,
+                    source_ref=f"tab:{mission.tab_id}",
+                    metadata={"state": mission.state, "last_event": mission.last_event},
+                )
+            except Exception:
+                pass
 
     def _scan_new_missions(self, missions: list[db.Mission]) -> None:
         current = {m.tab_id for m in missions}
@@ -870,10 +939,13 @@ class MorpheusApp(App):
                 f"new session [{m.goal or '(untitled)'}] {t.split('-')[0]}",
             ))
         for t in closed_tabs:
-            self.live_buffers.pop(t, None)
+            live = self.live_buffers.pop(t, None)
+            goal = (live.goal if live else "") or t.split("-")[0]
+            headline = _session_headline(live.buffer if live else "")
+            detail = f" — {headline}" if headline else ""
             self._push_alert(Alert(
                 time.time(), "close",
-                f"session [{t.split('-')[0]}] closed",
+                f"closed [{goal}]{detail}",
             ))
         self.last_seen_tabs = current
 
