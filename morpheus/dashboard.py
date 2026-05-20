@@ -1973,8 +1973,14 @@ class MorpheusApp(App):
     def action_new_session(self) -> None:
         if self.iterm_conn is None:
             return
-        root = self._selected_worktree_or_cwd()
-        candidates = prd_runs.find_prds(root)
+        root = prd_runs.scan_root_for_worktree(
+            self._selected_worktree_or_cwd(),
+            fallback=Path.cwd(),
+        )
+        try:
+            candidates = prd_runs.find_prds(root)
+        except Exception:
+            candidates = []
         self.push_screen(NewSessionScreen(prd_candidates=candidates, root=root), self._handle_new_session_result)
 
     def action_brief_selected(self) -> None:
