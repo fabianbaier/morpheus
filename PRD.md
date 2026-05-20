@@ -2,9 +2,9 @@
 
 | Field | Value |
 |---|---|
-| **Status** | v0.6.0 (config + worktree + token guard + ledger + ask + spawn-from-trigger + MCP server — full roadmap shipped 2026-05-19) |
+| **Status** | v0.6.2 PRD alignment (v0.6.0 shipped; v0.7 Mission Graph Cockpit specified, not implemented) |
 | **Author** | Fabian Baier |
-| **Last updated** | 2026-05-19 |
+| **Last updated** | 2026-05-20 |
 | **Target platform** | macOS + iTerm2 |
 | **Repo** | `~/github/fabianbaier/morpheus` |
 
@@ -16,15 +16,24 @@
 
 ## 1. Executive Summary
 
-Morpheus is **mission control for your iTerm tabs**. It is the supervisor process
-that turns ~20 open codex / claude / shell sessions into a coherent operational
-picture — by augmenting the surfaces you already have (the tab bar, native
-notifications, shell prompts) rather than building a new triage UI you'd have to
-remember to check.
+Morpheus is a **terminal-native mission graph cockpit for parallel AI agents**. It
+turns ~20 open codex / claude / shell sessions into a coherent operational
+picture by owning the mission layer: what each session exists to do, what it is
+waiting on, what it decided, what it should do next, and whether it is safe to
+close, resume, or spawn a replacement.
 
-**Core thesis**: the tab bar is already a dashboard. It's just dumb. Tab titles
-don't reflect state. There's no triage at a glance. Morpheus makes the tab bar
-smart, and nothing else changes about how you work.
+**Core thesis**: the tab bar is not the product. The tab bar is a signal strip.
+The source of truth is the Morpheus cockpit: one keyboard-driven terminal UI
+with Matrix-style live streams, durable mission cards, a compounding mission
+graph, direct jump/attach actions, and sharp alerts for sessions that need the
+user's eyes.
+
+The v0.6 implementation already proves the base layer: iTerm observation,
+smart titles, Textual dashboard, launchd daemon, notifications, briefings,
+worktree warnings, token guard, cost/action ledger, spawn-from-trigger, and MCP
+state exposure. v0.7 must now solve the deeper pain: **intent recovery across
+days**. If Morpheus cannot tell the user "why this session exists, what changed,
+what proof exists, and what to do next" after two days away, it has failed.
 
 ---
 
@@ -65,67 +74,139 @@ From Claude Code Insights (1,382 messages across 149 sessions, 2026-04-14 →
 
 - **More tabs** → more archaeology
 - **Tmux** alone → same problem, different multiplexer
+- **Smart tab titles alone** → better labels, same forgotten intent
 - **An inbox / triage queue** → just another tab to forget. (Explicitly
   rejected — see `feedback_morpheus_no_inbox.md`.)
 - **Slack / Notion task list** → context-switching out of the terminal
+- **A pretty Matrix animation alone** → vibe without operational leverage
+
+### 2.4 Competitive and pattern research
+
+Adversarial review changed the v0.7 wedge. The nearby market already has many
+ways to run multiple agents in one terminal, board, or dashboard. Morpheus must
+therefore not compete as "another multi-agent TUI." It must compete as the
+durable mission-graph layer that makes old sessions instantly understandable.
+
+Research inputs and takeaways:
+
+- **CCPM** (`automazeio/ccpm`) — spec-driven workflow: ideas → PRDs → epics →
+  tasks → GitHub issues → parallel worktrees → commits. Takeaway: Morpheus needs
+  traceability fields (`source_doc`, `epic_ref`, `issue_ref`,
+  `acceptance_criteria`, `proof_artifacts`) so every mission can explain where
+  its work came from and how "done" is judged.
+- **Claude Code** — great because it is terminal-native, repo-aware, resumable,
+  worktree-friendly, memory-aware, hookable, permissioned, and built around a
+  visible agent loop. Takeaway: Morpheus should not become a coding agent; it
+  should be the cross-session layer that tracks loop phase, proof, permissions,
+  cost, and resumability across Claude, Codex, OpenCode, and shell sessions.
+- **Karpathy LLM Wiki pattern** — raw sources stay immutable, the LLM maintains
+  an interlinked markdown wiki, and an index/log/lint loop makes knowledge
+  compound. Takeaway: transcripts are raw sources, mission cards are maintained
+  wiki pages, and the mission graph links sessions, topics, files, PRs,
+  decisions, blockers, proof, and archived snapshots.
+- **Open-source session managers** — Claude Squad, Agent Session Manager, agtx,
+  Agent Deck, lazyagent, Kolu, Cline, OpenCode, Roo Code, and Aider show the
+  convergent primitives: tmux/worktrees, live previews, task boards, hooks,
+  prompt sending, cost/token views, subagent trees, and plan/act modes.
+  Takeaway: Morpheus can borrow those primitives, but its unique value must be
+  "48-hour recall": select an old mission and know what it was for without
+  reading a transcript.
 
 ---
 
 ## 3. Goals & Non-Goals
 
-### Goals (v0)
+### Goals (current + next)
 
-- G1: At a glance, the user can tell which tab needs his attention.
-- G2: Spawning a new session is one keystroke from anywhere.
-- G3: Stale sessions are visible and prunable in seconds.
-- G4: When a long-running session is about to blow its token budget, the user
-  can snapshot it to markdown and resume in a fresh session.
-- G5: Every agent session can see what every other session is doing, in real
-  time, without leaving the terminal.
-
-### Goals (v0.1+)
-
-- G6: Morpheus runs unattended via launchd; the user doesn't have to remember
+- G1: At a glance, the user can tell which sessions need attention now.
+- G2: For any session, the user can recover the mission in under 2 seconds:
+  goal, why it exists, current plan, last decision, blocker, and next step.
+- G3: Spawning a new agent session is one keyboard action from the cockpit and
+  always creates a durable mission card.
+- G4: Stale sessions are visible, explainable, and prunable in seconds.
+- G5: Long-running sessions can be snapshotted and resumed without losing
+  mission continuity.
+- G6: Worktree/path collisions are surfaced before they corrupt commits.
+- G7: Morpheus runs unattended via launchd; the user does not have to remember
   to start it.
-- G7: A morning brief assembles overnight changes (GH activity, calendar,
-  stale sessions, decisions needed) into a single readable digest.
-- G8: New PR review requests spawn pre-loaded draft sessions automatically.
-- G9: Web-search topic watchers push curated info on the user's schedule.
+- G8: Morning/evening briefings show overnight work, stale sessions, PR queue,
+  decisions needed, and yesterday's unfinished intent.
+- G9: New PR review requests can spawn pre-loaded draft sessions automatically,
+  inside daily cost and autonomy caps.
+- G10: Every agent session can see what every other session is doing without
+  leaving the terminal, via context files and MCP tools.
+- G11: Every durable mission can show lineage and proof: source PRD/issue,
+  acceptance criteria, branch/worktree, claimed paths, checks run, artifacts,
+  and confidence.
+- G12: Mission knowledge compounds across sessions via a local graph of
+  missions, topics, decisions, blockers, files, PRs, snapshots, and evidence.
 
 ### Non-Goals (forever)
 
 - N1: Replace tmux / iTerm. Morpheus is a layer on top, not a replacement.
-- N2: An inbox or triage UI separate from the tab bar. (See feedback memory.)
+- N2: Build an inbox. Morpheus is an operating cockpit, not another queue.
 - N3: Auto-merge / auto-push / auto-approve PRs. Soft-autonomy ladder caps
   destructive actions at "ask first" forever.
 - N4: Build new tooling for things the user already has: `loop`, `schedule`,
   `scheduled-tasks` MCP, `gh`, `codex`, `claude`. Compose; do not rebuild.
 - N5: Cross-platform on day one. macOS + iTerm2 only. Linux/tmux is v1.0.
+- N6: Treat the tab bar as sufficient. Tab titles are alerts; mission cards are
+  memory.
+- N7: Replace CCPM, agtx, Agent Deck, or any task board. Morpheus can link to
+  their artifacts, but its core is mission recall and agent attention routing.
 
 ---
 
 ## 4. Design Principles
 
-1. **The tab bar IS the dashboard.** Augment it; don't build alongside it.
-2. **No new triage surfaces.** Inbox, queue, sidebar — all rejected. If
-   information needs to find the user, it goes through surfaces he already
-   uses (tab titles, native notifications, shell prompt).
-3. **Mission cards are the kernel.** Every session has a goal, a state, a
-   last event, a next-step. The card is what survives across context switches.
-4. **Silent by default, loud when it matters.** Notifications fire only on
+1. **The cockpit is the source of truth.** The tab bar, native notifications,
+   shell prompt, and MCP tools are surfaces over one durable mission model.
+2. **The tab bar is a signal strip.** It should say "look here now," not carry
+   the whole product. If a detail cannot fit in a tab title, it belongs in the
+   cockpit mission card.
+3. **The mission graph is the kernel.** Every session attaches to a durable
+   mission node with a goal, why, state, phase, current plan, last decision,
+   blocker, next step, claimed paths, repo, branch, worktree, command, links,
+   source docs, and proof artifacts. The graph is what survives context switches
+   and reboots.
+4. **Keyboard-first, terminal-native.** The happy path is `morpheus`, then
+   `j/k`, `Enter`, `n`, `s`, `/`, `p`, `d`. No mouse, no browser, no ceremony.
+5. **Matrix is structure, not decoration.** Streams encode live session state;
+   the aesthetic earns its keep only when it makes attention routing faster.
+6. **Loop state beats transcript length.** The cockpit should show whether a
+   mission is planning, editing, testing, reviewing, blocked, or done-needs-human
+   before asking the user to read raw chat.
+7. **Facts need provenance.** User-authored truth, transcript-derived evidence,
+   and LLM-inferred summaries must be stored separately. A summary without a
+   source is a hint, not truth.
+8. **Silent by default, loud when it matters.** Notifications fire only on
    true emergencies (blocked > 30s on critical-tagged sessions, prod alerts).
-5. **Soft-autonomy ladder.** Per-action class authorization:
+9. **Soft-autonomy ladder.** Per-action class authorization:
    - Always allowed: polling, summarizing, web search, draft session creation
    - Ask first: spawning a live session that runs commands, killing a session,
      deleting files
    - Never: merging, pushing, approving PRs, sending external messages
-6. **Compose existing primitives.** `loop`, `schedule`, `scheduled-tasks` MCP,
+10. **Compose existing primitives.** `loop`, `schedule`, `scheduled-tasks` MCP,
    `codex exec`, `claude -p`, `gh` — Morpheus orchestrates these, doesn't
    replace them.
-7. **State is durable.** SQLite + JSON files in `~/.morpheus/` survive iTerm
-   restarts and reboots.
-8. **Cross-session awareness is a first-class feature.** Agents can see what
-   other agents are doing, in real time, via a shared context file.
+11. **State is durable.** SQLite + JSON files in `~/.morpheus/` survive iTerm
+   restarts and reboots. If a session disappears, the mission remains.
+12. **Coordination must be active.** Passive "please check context first"
+    conventions are useful but not enough; Morpheus should surface collisions
+    and claims directly in the cockpit.
+
+### 4.1 Hard product stance
+
+Strong claim: **Morpheus wins only if it becomes the place the user lives while
+running agents.** A tab-title enhancer is useful but not important enough.
+A Matrix animation is delightful but not sufficient. The valuable product is
+the thing that lets the user run 20 agents for three days and still know, in
+seconds, what each agent is for, what it touched, what it decided, what it
+needs, and whether to continue, snapshot, archive, or kill it.
+
+Build fewer clever automations until the cockpit can do that. The next unit of
+value is not another watcher; it is a durable mission graph plus fast keyboard
+control.
 
 ---
 
@@ -145,11 +226,62 @@ From Claude Code Insights (1,382 messages across 149 sessions, 2026-04-14 →
 
 ---
 
-## 6. Product Surface (v0)
+## 6. Product Surface
 
-### 6.1 The tab bar
+### 6.1 Primary surface: the mission cockpit
 
-Every iTerm tab gets a smart title, refreshed every ~5 seconds:
+A single dedicated terminal tab running `morpheus` is the home base. It is not
+an inbox. It is an operating cockpit for active sessions.
+
+Required cockpit layout:
+
+```
+┌────────────────────────────────────────────────────────────────────┐
+│ MORPHEUS        🔴 2 blocked   💀 1 crashed   🟢 9 working          │
+├───────────────────────┬──────────────────────────────┬─────────────┤
+│ Matrix session streams │ Selected live transcript      │ Mission card │
+│ + sortable mission list│ tail + alert history          │ why/next/etc │
+├───────────────────────┴──────────────────────────────┴─────────────┤
+│ 🐇 alerts: blocked prompts, collisions, token guard, trigger spawns  │
+└────────────────────────────────────────────────────────────────────┘
+```
+
+The cockpit answers three questions faster than tab switching can:
+
+- **What needs me now?** Blocked, crashed, done-needs-review, collision, and
+  token-risk sessions float to the top.
+- **What was this about?** The mission card shows goal, why, plan, last
+  decision, loop phase, current blocker, next step, repo, branch, worktree,
+  claimed paths, source doc/issue, command, linked PR, checks, proof artifacts,
+  age, and snapshot location.
+- **What can I do next?** Every common action is a keybinding, not a ceremony.
+
+### 6.2 Keyboard and function map
+
+| Key | Function | Required behavior |
+|---|---|---|
+| `j` / `k` or arrows | Move selection | Moves through sessions without changing focus in iTerm |
+| `Enter` | Attach / focus | Jumps to the selected iTerm tab or owned PTY session |
+| `n` | New mission | Opens goal + command form; creates mission card before launch |
+| `b` | Brief selected | Shows a short "why / status / next step" card for selected session |
+| `e` | Edit mission | Edits goal, why, plan, next step, tags, linked PR, worktree |
+| `a` | Answer prompt | Drafts a response for the selected blocked session; sending is ask-first with preview |
+| `s` | Snapshot | Writes transcript + mission card to `~/.morpheus/snapshots/` |
+| `r` | Resume fresh | Spawns a new session seeded with the snapshot + mission card |
+| `/` | Note / claim | Posts a note or path/worktree claim |
+| `p` | Prune | Archives stale/finished sessions after confirmation |
+| `d` | Dismiss / close | Closes selected live tab or archives an already-dead mission |
+| `g` | Go to alert | Cycles through current 🐇 alerts |
+| `?` | Help | Shows the keymap in-place |
+| `q` | Quit dashboard | Leaves daemon and tab-title updates running |
+
+Strong requirement: if a function changes session lifecycle or sends text into
+another session, it must write an action ledger entry. If it spends money, it
+must write a cost ledger entry.
+
+### 6.3 Secondary surface: tab titles
+
+Every iTerm tab still gets a smart title, refreshed every ~5 seconds:
 
 | Prefix | Meaning |
 |---|---|
@@ -159,14 +291,19 @@ Every iTerm tab gets a smart title, refreshed every ~5 seconds:
 | ⚫ | Finished (no activity for > 30 min) |
 | 💀 | Crashed (matched a crash pattern) |
 | `36h •` prefix | Stale (idle/finished and aged past threshold) |
-| `▶ MORPHEUS` | The Morpheus tab itself (self-excluded from monitoring) |
+| `▶ MORPHEUS` | The Morpheus cockpit itself (self-excluded from monitoring) |
 
-### 6.2 CLI commands
+Tab titles are intentionally lossy. They are allowed to encode state, age, and
+short goal. They are not allowed to be the only place mission intent lives.
+
+### 6.4 CLI commands
+
+The CLI remains the scriptable surface for the same mission model:
 
 | Command | Purpose |
 |---|---|
-| `morpheus` | Launch the dashboard in the current tab |
-| `morpheus watch` | Run the tick loop in the foreground (titles only, no dashboard) |
+| `morpheus` | Launch the cockpit in the current tab |
+| `morpheus watch` | Run the tick loop in the foreground |
 | `morpheus spawn "<goal>" "<cmd>"` | Open a new iTerm tab, run the command, register mission |
 | `morpheus list` | Print every registered mission with state, age, last event |
 | `morpheus prune [--older-than 4h]` | Interactively close stale tabs |
@@ -174,22 +311,14 @@ Every iTerm tab gets a smart title, refreshed every ~5 seconds:
 | `morpheus context [--format md/json/short]` | Print the shared cross-session snapshot |
 | `morpheus note "<text>"` | Post a cross-session note attached to the current tab |
 | `morpheus notes [--limit 15]` | List recent cross-session notes |
+| `morpheus brief` | Produce a morning/evening operational digest |
+| `morpheus ask "<query>"` | Ask questions over current Morpheus state |
+| `morpheus poll-prs` | One-shot PR review queue poll and optional draft spawn |
+| `morpheus ledger costs/actions` | Inspect cost and action ledgers |
+| `morpheus mcp serve` | Expose Morpheus state to agent tools |
 | `morpheus doctor` | Diagnose iTerm2 + Python API connectivity |
-| `morpheus version` | Print version |
 
-### 6.3 The dashboard tab
-
-A single dedicated tab running `morpheus` (or `morpheus dashboard`):
-
-- Banner: MORPHEUS ASCII title in green
-- Summary line: total sessions, counts by state
-- Table: every mission sorted with **blocked first**, then crashed, working,
-  idle, finished. Columns: ID, state emoji, goal, age, last event, live?
-- Self-marked with `▶ MORPHEUS` prefix so the watcher skips this tab
-- Drives the same tick loop as `watch` — running the dashboard also keeps
-  every other tab's title updated
-
-### 6.4 Cross-session context
+### 6.5 Cross-session context
 
 Two files maintained by the tick loop:
 
@@ -208,12 +337,12 @@ shared state.
 
 ## 7. Architecture
 
-### 7.1 Process model (v0)
+### 7.1 Process model (current v0.6)
 
 ```
                               ┌─────────────────────┐
-                              │  morpheus dashboard │ ← one iTerm tab
-                              │  (or `morpheus watch`)│
+                              │  morpheus cockpit   │ ← one iTerm tab
+                              │  Textual dashboard  │
                               └──────────┬──────────┘
                                          │
                        iTerm2 Python API │  every ~5s:
@@ -250,8 +379,41 @@ shared state.
                               for cross-session messaging
 ```
 
-In v0 the dashboard process IS the daemon. v0.1 splits them: a launchd-managed
-background daemon owns the tick loop, the dashboard becomes a pure renderer.
+In v0.6, launchd can own the background tick loop while the cockpit renders
+the same SQLite-backed state. The cockpit may still co-run ticks when the daemon
+is not installed, but that is a fallback, not the primary model.
+
+### 7.1.1 Target process model (v0.7)
+
+v0.7 keeps the iTerm bridge, but promotes the mission model above the tab
+model. A tab can disappear; the mission should not.
+
+```
+                   ┌──────────────────────────────┐
+                   │ launchd morpheus daemon      │
+                   │ poll / detect / trigger / log│
+                   └──────────────┬───────────────┘
+                                  │
+        ┌─────────────────────────▼─────────────────────────┐
+        │ ~/.morpheus/morpheus.db                           │
+        │ missions + graph + notes + events + artifacts     │
+        │ edges + ledgers                                   │
+        └──────────────┬────────────────────┬───────────────┘
+                       │                    │
+        ┌──────────────▼────────────┐ ┌─────▼────────────────┐
+        │ terminal cockpit          │ │ iTerm bridge          │
+        │ Matrix streams + cards    │ │ tab titles / focus    │
+        └──────────────┬────────────┘ └─────┬────────────────┘
+                       │                    │
+        ┌──────────────▼────────────────────▼───────────────┐
+        │ agent sessions: managed new sessions + imported tabs│
+        └────────────────────────────────────────────────────┘
+```
+
+The v0.7 architectural rule: all new sessions created by Morpheus must create
+or update the mission graph first, then launch the command. Imported iTerm tabs
+can remain best-effort observed sessions, but managed sessions get durable
+mission graph memory, provenance, loop phase, and proof tracking.
 
 ### 7.2 Module layout
 
@@ -259,20 +421,30 @@ background daemon owns the tick loop, the dashboard becomes a pure renderer.
 |---|---|
 | `morpheus/cli.py` | Typer entry points |
 | `morpheus/core.py` | The tick loop and `_tick()` |
-| `morpheus/dashboard.py` | Rich Live dashboard (runs the tick loop too) |
-| `morpheus/db.py` | SQLite schema, `Mission`, `Note`, CRUD |
+| `morpheus/dashboard.py` | Textual cockpit with Matrix rain, mission table, alerts, keybindings |
+| `morpheus/db.py` | SQLite schema, `Mission`, `MissionMemory`, `MissionEvent`, `MissionArtifact`, `MissionEdge`, `Note`, CRUD |
 | `morpheus/detect.py` | State classifier from pane buffer |
 | `morpheus/iterm_client.py` | Thin async wrapper over iterm2 Python API |
 | `morpheus/naming.py` | Tab-title formatting, goal inference |
 | `morpheus/context.py` | Cross-session snapshot builders |
+| `morpheus/daemon.py` | launchd install/uninstall/status and beacon integration |
+| `morpheus/brief.py` | Morning/evening state digest |
+| `morpheus/ask.py` | Conversational query over Morpheus state |
+| `morpheus/trigger.py` | GitHub PR polling and draft session spawn |
+| `morpheus/ledger.py` | Cost and action ledger tables |
+| `morpheus/config.py` | `~/.morpheus/config.toml` defaults and loader |
+| `morpheus/mcp_server.py` | MCP tools exposing read-only state + notes/claims |
+| `morpheus/mission_graph.py` | v0.7 graph helpers: provenance, edges, stale/lint checks |
+| `morpheus/proof.py` | v0.7 proof artifact capture and last-check summaries |
 
 ### 7.3 State schema
 
-**`missions`**
+**`missions` (live session attachments)**
 
 | Column | Type | Notes |
 |---|---|---|
 | `tab_id` | TEXT PK | iTerm-assigned tab ID |
+| `mission_id` | TEXT | Stable mission ID, nullable for imported unknown tabs until claimed |
 | `session_id` | TEXT | iTerm session ID (matches `$ITERM_SESSION_ID`) |
 | `goal` | TEXT | Auto-inferred or user-provided |
 | `state` | TEXT | working / idle / blocked / finished / crashed / unknown |
@@ -284,6 +456,77 @@ background daemon owns the tick loop, the dashboard becomes a pure renderer.
 | `linked_pr` | INTEGER | PR number, nullable |
 | `linked_worktree` | TEXT | Absolute path, nullable |
 | `created_at`, `updated_at` | REAL | Lifecycle |
+
+**`mission_memory` (v0.7 durable mission node)**
+
+| Column | Type | Notes |
+|---|---|---|
+| `mission_id` | TEXT PK | Stable ID that survives tab replacement |
+| `title` | TEXT | Human-readable short mission name |
+| `why` | TEXT | Why this session exists |
+| `done_definition` | TEXT | What "done" means for this mission |
+| `acceptance_criteria` | TEXT | Bulleted or JSON checklist |
+| `current_plan` | TEXT | Short plan or checklist |
+| `next_step` | TEXT | The next human or agent action |
+| `last_decision` | TEXT | Most recent meaningful user/agent decision |
+| `last_summary` | TEXT | LLM or user summary of transcript state |
+| `blocked_on` | TEXT | Prompt, missing info, external dependency, or review |
+| `phase` | TEXT | planning / editing / testing / reviewing / blocked / done_needs_human / archived |
+| `confidence` | REAL | 0.0-1.0 summary confidence; low confidence means "read transcript" |
+| `source_kind` | TEXT | user / transcript / inferred / imported |
+| `source_ref` | TEXT | PRD path, issue URL, transcript span, snapshot path, or null |
+| `epic_ref` | TEXT | Optional CCPM/agtx/spec epic reference |
+| `issue_ref` | TEXT | GitHub issue/PR/task reference |
+| `last_verified_at` | REAL | Last time checks/proof were captured |
+| `claimed_paths` | TEXT | JSON list of paths this mission is touching |
+| `topic` | TEXT | Optional topic/thread grouping |
+| `created_at`, `updated_at` | REAL | Lifecycle |
+| `archived_at` | REAL | Set when live tab is gone but mission remains |
+
+**`mission_events` (append-only timeline)**
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | INTEGER PK AUTO | |
+| `mission_id` | TEXT FK | |
+| `ts` | REAL | Unix timestamp |
+| `kind` | TEXT | state_change / decision / blocker / prompt / answer / check / summary / archive / resume |
+| `actor` | TEXT | user / morpheus / codex / claude / shell / imported |
+| `summary` | TEXT | Short event summary |
+| `source_ref` | TEXT | Transcript span, snapshot path, command, or URL |
+| `metadata_json` | TEXT | Structured extra data |
+
+**`mission_artifacts` (proof and outputs)**
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | INTEGER PK AUTO | |
+| `mission_id` | TEXT FK | |
+| `kind` | TEXT | snapshot / diff / test / build / pr / issue / doc / screenshot / log |
+| `path_or_url` | TEXT | Local path or external URL |
+| `status` | TEXT | pending / pass / fail / unknown |
+| `summary` | TEXT | Human-readable artifact summary |
+| `created_at` | REAL | Unix timestamp |
+
+**`mission_edges` (local knowledge graph)**
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | INTEGER PK AUTO | |
+| `from_id` | TEXT | Mission/topic/artifact/entity ID |
+| `to_id` | TEXT | Mission/topic/artifact/entity ID |
+| `relation` | TEXT | relates_to / blocks / supersedes / duplicates / touches / proves / spawned_from |
+| `reason` | TEXT | Why the edge exists |
+| `created_at` | REAL | Unix timestamp |
+
+Strong requirement: `mission_memory` and the graph tables are not nice-to-have.
+Without them, Morpheus still tells the user "something is happening" but cannot
+answer "what was I trying to accomplish, why, with what proof, and what is
+connected to it?"
+
+Provenance rule: user-authored fields beat transcript-derived fields, which
+beat LLM-inferred fields. The UI must show low-confidence inferred summaries as
+untrusted hints, not as durable truth.
 
 **`notes`**
 
@@ -344,6 +587,26 @@ connect."
 | Self-excludes Morpheus's own tab | ✓ |
 | Reconciles missions for closed tabs | ✓ |
 | Logging to `~/.morpheus/morpheus.log` | ✓ |
+
+### 8.1 Current progress tracker
+
+This table is the source of truth for where the product stands right now.
+
+| Area | Status | Evidence / next step |
+|---|---|---|
+| v0.6 runtime foundation | Shipped | iTerm observation, Textual cockpit, launchd, notifications, briefings, trigger spawn, ledgers, MCP |
+| PRD strategic pivot | Done in v0.6.2 | Product stance now says Mission Graph Cockpit, not tab-title manager |
+| Competitive research | Done in v0.6.2 | CCPM, Claude Code, Karpathy LLM Wiki, and open-source session managers folded into requirements |
+| Stable mission ID design | Specified, not implemented | Add `mission_id` to live sessions and make `tab_id` an attachment |
+| Mission graph schema | Specified, not implemented | Add `mission_memory`, `mission_events`, `mission_artifacts`, `mission_edges` |
+| Provenance model | Specified, not implemented | Store user-authored, transcript-derived, and inferred facts separately |
+| Loop phase / proof tracking | Specified, not implemented | Track phase, checks, artifacts, confidence, and `last_verified_at` |
+| Mission card panel | Not implemented | Build selected-session card in the Textual cockpit |
+| Edit mission flow | Not implemented | `e` opens goal/why/plan/next/criteria/source/proof editor |
+| Brief selected | Not implemented | `b` renders a cited why/status/next card from graph + transcript tail |
+| Resume fresh | Not implemented | `r` snapshots, archives old attachment, spawns replacement with mission context |
+| MCP mission tools | Partially shipped | Read-only session tools exist; graph read/update tools remain v0.7 |
+| 48-hour recall eval | Not implemented | Add fixture or dogfood checklist: stale mission → press `b` → know next action in <10s |
 
 ---
 
@@ -482,6 +745,62 @@ Remaining for v0.1.x:
 - 🔜 **MCP spawn/kill** — deferred to v0.7 (FastMCP + iTerm async
   context lifecycle needs more design).
 
+### v0.7 — Mission Graph Cockpit (NEXT)
+
+This is the strategic pivot from "better tab manager" to "AI-agent mission
+control." v0.6 watches sessions well; v0.7 makes sessions explain themselves
+and link themselves into a durable local knowledge graph.
+
+Must ship:
+- **Stable mission IDs** — missions survive tab closure, restart, snapshot,
+  and resume. `tab_id` becomes an attachment, not the identity.
+- **Mission graph schema** — `mission_memory`, `mission_events`,
+  `mission_artifacts`, and `mission_edges` with migration from current
+  `missions` rows.
+- **Loop phase tracking** — each mission exposes `phase`, `blocked_on`,
+  `last_verified_at`, checks run, and proof status so the cockpit shows where
+  the agent is in the plan-act-observe loop.
+- **Provenance-aware memory** — user-authored fields, transcript-derived
+  evidence, and LLM-inferred summaries are stored separately; low-confidence
+  inferred summaries are visibly marked.
+- **Traceability links** — optional `source_doc`, `epic_ref`, `issue_ref`,
+  `acceptance_criteria`, linked PR, branch, worktree, claimed paths, and proof
+  artifacts.
+- **Mission card panel** — selected session shows the full card in the
+  cockpit, not just state/goal/last event.
+- **Edit mission flow** — `e` opens an inline form to correct goal, why,
+  done definition, acceptance criteria, phase, next step, source links, linked
+  PR, worktree, and claimed paths.
+- **Brief selected** — `b` produces a terse cited "what this is / why it
+  matters / what happened / what proof exists / what to do next" card from the
+  mission graph and recent transcript.
+- **Resume fresh** — `r` snapshots the selected session and spawns a new
+  session seeded with the snapshot + mission graph card, then links old and new
+  attachments with a `spawned_from` edge.
+- **Archive instead of forget** — closing a tab archives the mission; it does
+  not delete the historical record unless explicitly purged.
+- **Topic threads** — group sessions by PR, feature, incident, or research
+  topic; show per-topic status, stale work, and graph links.
+- **MCP mission tools** — expose mission graph read/update tools; keep
+  spawn/kill as ask-first actions.
+- **Session-manager integrations** — link to CCPM/agtx/Agent Deck artifacts
+  when present, but keep Morpheus's own state local and terminal-native.
+- **48-hour recall eval** — dogfood and document the stale-session test: select
+  an untouched mission after 48 hours, press `b`, and recover next action in
+  under 10 seconds.
+
+Success bar: after leaving a session alone for 48 hours, the user should be
+able to select it, press `b`, and know exactly why it exists, what happened,
+what proof exists, what it is connected to, and what to do next without reading
+the transcript.
+
+Not in v0.7:
+- Web dashboard
+- Multi-user/shared mode
+- Full custom terminal multiplexer
+- Automatic destructive actions
+- Web-search topic watcher execution unless mission graph recall is already solid
+
 ### v1.0 — Cross-platform + extensibility
 
 - Linux + tmux support (parity of features via tmux control mode)
@@ -545,11 +864,14 @@ Agents can be instructed to:
 For Claude Code / Codex specifically, this can be encoded in a project
 `AGENTS.md` or `CLAUDE.md` so agents check it automatically.
 
-### 10.4 Future: MCP integration (v0.4)
+### 10.4 MCP integration
 
-A Morpheus MCP server will expose `list_sessions()`, `get_session(id)`,
-`post_note(text)`, `claim_path(path)` as first-class tools. Claude Code with
-the MCP enabled will see cross-session state without needing shell calls.
+The Morpheus MCP server exposes `list_sessions()`, `get_session(id)`,
+`get_context()`, `get_context_short()`, `post_note(text)`, `claim_path(path)`,
+`daily_spend()`, and `recent_actions()` as first-class tools. Claude Code and
+Codex can see cross-session state without shelling out. v0.7 should extend MCP
+with mission-graph read/update tools while keeping spawn/kill behind ask-first
+authorization.
 
 ---
 
@@ -620,36 +942,74 @@ Generic regexes will false-positive.
 Self-detection prefix (`▶ MORPHEUS`) used by the watcher to skip itself.
 Could fail if the user renames the tab.
 
-**Mitigations**: also detect by checking if the tab is running the morpheus
-process (PID lookup) — defer to v0.1.
+**Mitigations**: re-claim the Morpheus title every tick; later, also detect by
+checking if the tab is running the morpheus process (PID lookup).
 
 ### 11.10 Forgetting the daemon is running
 
-In v0 the user runs `morpheus dashboard` in a tab; if they close it, title
-updates stop silently.
+If the daemon is not installed, the user may be relying on the cockpit's
+co-running tick loop. If they close the cockpit, title updates stop silently.
 
-**Mitigations**: v0.1 launchd integration eliminates this entirely.
+**Mitigations**: `morpheus install-daemon` makes the watcher always-on, and
+`morpheus daemon-status` reports the health beacon age.
+
+### 11.11 False memory and summary drift
+
+Mission summaries can become worse than useless if they hallucinate, compress
+away the real blocker, or overwrite user intent with model guesses.
+
+**Mitigations**: provenance columns, confidence score, append-only
+`mission_events`, cited transcript/snapshot references, and UI labels that
+distinguish user-authored truth from inferred summaries.
+
+### 11.12 Commodity session manager trap
+
+The space already has tmux/worktree dashboards, task boards, cost views, and
+prompt-sending tools. Building only those primitives would make Morpheus a
+late clone.
+
+**Mitigations**: v0.7 prioritizes 48-hour mission recall, mission graph,
+provenance, proof artifacts, and intent recovery before broader multiplexer
+features.
 
 ---
 
-## 12. Open Questions
+## 12. Decisions & Open Questions
 
-- **Q1**: Should the Matrix-rain dashboard be the default view in v0.1, or
-  remain optional via `morpheus dashboard --rain`?
-- **Q2**: How aggressively should Morpheus auto-infer the `goal` from
-  command context? More inference = better default titles, but more risk of
-  wrong titles that the user has to correct.
-- **Q3**: What's the right format for the "morning brief" — markdown
-  rendered in the terminal, a Slack DM, a macOS notification, or a file the
-  user opens in their preferred reader?
-- **Q4**: Should `morpheus note --kind claim "<path>"` actively prevent
-  other agents from editing the claimed path, or just warn? Active
-  prevention requires fs-event watching.
-- **Q5**: For spawn-from-trigger draft sessions (v0.3): should they be
-  paused before running the first command, or before the very first prompt
-  in the codex session? The former is safer, the latter is more useful.
-- **Q6**: Does the user prefer the Morpheus tab to be pinned to the leftmost
-  position in iTerm (always-known location) or just exist wherever opened?
+Resolved decisions from the adversarial review:
+
+- **D1**: v0.7 uses a new durable graph layer rather than migrating all live
+  tab state directly into `missions`. `missions` remains the live attachment
+  table; `mission_memory`, `mission_events`, `mission_artifacts`, and
+  `mission_edges` own durable recall.
+- **D2**: The product name for v0.7 is **Mission Graph Cockpit**, not the old
+  mission-memory cockpit label. Memory is necessary; graph/provenance/proof is the
+  stronger wedge.
+- **D3**: `a` never blindly answers a blocked prompt. It drafts a response,
+  previews it, sends only after confirmation, and logs the action.
+- **D4**: `b` starts manual-only. Automatic summaries come later, after
+  provenance and confidence marking exist.
+- **D5**: Archives store card fields + snapshot paths by default. Full
+  transcript is captured by explicit snapshot or token-risk trigger.
+- **D6**: Morpheus does not rebuild CCPM/agtx/Agent Deck. It links to their
+  artifacts when present and owns recall across them.
+
+Open questions:
+
+- **Q1**: Should v0.7 export the mission graph as markdown wiki files in
+  addition to SQLite? Recommendation: SQLite first, markdown export second.
+  The graph needs reliable queries; markdown is excellent for review and git
+  history but slower as the primary store.
+- **Q2**: Should `morpheus spawn` require `why`, `done_definition`, and
+  `acceptance_criteria`, or allow blank fields and prompt later?
+  Recommendation: require them in the cockpit form, allow blanks only from CLI
+  for speed.
+- **Q3**: Should Morpheus eventually own PTY sessions rather than observing
+  iTerm tabs? Recommendation: yes for managed sessions, but v0.7 should keep
+  the iTerm bridge and first fix mission graph recall.
+- **Q4**: Should graph linting be a command (`morpheus graph lint`) or part of
+  `morpheus brief`? Recommendation: start as a command, then include top issues
+  in the brief once noise is low.
 
 ---
 
@@ -657,6 +1017,7 @@ updates stop silently.
 
 - iTerm replacement / re-implementation
 - A custom terminal multiplexer
+- Tab-title-only product direction
 - An inbox UI of any kind
 - Auto-merge, auto-push, auto-approve PRs, auto-send messages
 - Cloud hosting / multi-user / SaaS
@@ -687,16 +1048,17 @@ Brief either prints to stdout or fires as a macOS notification (`--notify`).
 Optional: scheduled by launchd at 08:00 + 18:00 (see v0.6 schedule
 integration).
 
-**08:30 — start the day in MORPHEUS**
+**08:30 — start the day in the cockpit**
 
 ```
 morpheus    # ← in a dedicated iTerm tab
 ```
 
-Dashboard opens. Ticker shows all 10 sessions sorted by recency. The 1
-blocked-from-overnight is at the top with a fresh yellow flash.
-You hit `Enter`, iTerm jumps to that tab, you resolve it, come back to
-morpheus with `⌘+1`.
+Cockpit opens. Streams show all 10 sessions; blocked/crashed/token-risk
+sessions are grouped at the top. The selected mission card shows why the
+overnight session exists, what it was trying to finish, and the exact prompt
+blocking it. You hit `Enter`, iTerm jumps to that tab, you resolve it, then
+come back to morpheus with `⌘+1`.
 
 **09:15 — new PR review request lands**
 
@@ -707,10 +1069,10 @@ review and approve. Three keystrokes total.
 
 **14:00 — context lost on a long-running codex**
 
-Tab 7 has been chewing on x402 testing for 90 minutes; you have no
-recall. Hover over it with `j`, mission card shows: goal,
-last-meaningful-event (LLM-summarized from buffer), suggested
-next-step. Full recall in 2 seconds.
+Tab 7 has been chewing on x402 testing for 90 minutes; you have no recall.
+Move to it with `j`, press `b`, and Morpheus shows: goal, why it matters,
+current plan, last decision, blocker, claimed paths, and suggested next step.
+Full recall in 2 seconds.
 
 **16:00 — token-blowup risk**
 
@@ -759,7 +1121,7 @@ claim, defers.
 | `morpheus doctor` | Diagnose iTerm2 + Python API connectivity |
 | `morpheus version` | Print morpheus version |
 
-## 15. Config schema (v0.4 — proposed)
+## 15. Config schema (current + v0.7 target)
 
 `~/.morpheus/config.toml`:
 
@@ -794,6 +1156,16 @@ allowed_actions = ["poll", "summarize", "research", "draft"]
 ask_first_actions = ["spawn", "kill", "delete"]
 denied_actions = ["merge", "push", "approve", "external-message"]
 
+[mission_graph]              # v0.7 target
+enabled = true
+summary_confidence_floor = 0.65
+markdown_export = false
+auto_lint = false
+require_spawn_why = true
+require_spawn_done_definition = true
+require_spawn_acceptance_criteria = true
+proof_commands = ["test", "lint", "build"]
+
 [colors]
 # Override the palette (Rich color names or color(N))
 state_working = "bright_green"
@@ -822,6 +1194,22 @@ flash_duration_secs = 3.0
 - Claude Code Insights (2026-05-19) — multi-clauding stats, friction surfaces
 - Prior conversation: 2026-05-19 design session covering architecture, scope,
   adversarial pass, and the codex challenge (running at time of v0 writing)
+- CCPM — https://github.com/automazeio/ccpm
+- Claude Code docs — https://code.claude.com/docs/en/overview,
+  https://code.claude.com/docs/en/agent-sdk/agent-loop,
+  https://code.claude.com/docs/en/memory,
+  https://code.claude.com/docs/en/hooks,
+  https://code.claude.com/docs/en/worktrees
+- Karpathy LLM Wiki — https://gist.github.com/karpathy/442a6bf555914893e9891c11519de94f
+- Open-source adjacent tools: https://github.com/smtg-ai/claude-squad,
+  https://github.com/izll/agent-session-manager,
+  https://github.com/fynnfluegge/agtx,
+  https://github.com/asheshgoplani/agent-deck,
+  https://github.com/chojs23/lazyagent,
+  https://kolu.dev/,
+  https://github.com/anomalyco/opencode,
+  https://github.com/cline/cline,
+  https://github.com/Aider-AI/aider
 
 ---
 
