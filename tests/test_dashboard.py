@@ -136,7 +136,7 @@ class DashboardTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("verify the b key modal [prd:PRD.md]", brief.body)
         self.assertIn("latest terminal detail [tab:tab-123456]", brief.body)
 
-    def test_mission_card_render_includes_graph_memory(self) -> None:
+    def test_mission_card_render_prioritizes_latest_output_when_collapsed(self) -> None:
         card = MissionCardWidget()
         mission = dashboard.db.Mission(
             tab_id="tab-123456",
@@ -181,21 +181,28 @@ class DashboardTest(unittest.IsolatedAsyncioTestCase):
             goal=mission.goal,
             state=mission.state,
             last_event="active output",
-            buffer="alpha\nSearching the web\nfinal response line",
+            buffer="\n".join(f"line {i}" for i in range(12)),
             observed_at=0,
         )
 
         rendered = card._render_card(mission, memory, [event], [artifact], live).plain
 
         self.assertIn("Graph card", rendered)
-        self.assertIn("phase: planning", rendered)
-        self.assertIn("why: recover stale agent intent", rendered)
-        self.assertIn("next: wire edit flow", rendered)
+        self.assertIn("tab tab", rendered)
         self.assertIn("LATEST OUTPUT", rendered)
-        self.assertIn("Searching the web", rendered)
-        self.assertIn("final response line", rendered)
-        self.assertIn("decision build card before edit flow", rendered)
-        self.assertIn("pass test tests/test_dashboard.py", rendered)
+        self.assertIn("line 0", rendered)
+        self.assertIn("line 11", rendered)
+        self.assertNotIn("why: recover stale agent intent", rendered)
+        self.assertNotIn("decision build card before edit flow", rendered)
+
+        card.toggle_details()
+        expanded = card._render_card(mission, memory, [event], [artifact], live).plain
+
+        self.assertIn("phase: planning", expanded)
+        self.assertIn("why: recover stale agent intent", expanded)
+        self.assertIn("next: wire edit flow", expanded)
+        self.assertIn("decision build card before edit flow", expanded)
+        self.assertIn("pass test tests/test_dashboard.py", expanded)
 
     def test_tail_lines_prefers_recent_non_empty_output(self) -> None:
         rendered = _tail_lines("old\n\nmiddle\nlatest and very long", limit=2, width=12)
@@ -1001,6 +1008,19 @@ class DashboardTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(captured["loop"]["command"], "codex exec")
         self.assertEqual(captured["loop"]["target_mission_id"], "")
         self.assertIsNone(captured["loop"]["target_tab_id"])
+
+    async def test_space_toggles_mission_card_details(self) -> None:
+        app = DashboardHarness()
+
+        with isolated_dashboard_runtime():
+            async with app.run_test(size=(120, 40)) as pilot:
+                card = app.query_one(MissionCardWidget)
+                self.assertFalse(card.details_expanded)
+
+                await pilot.press("space")
+                await pilot.pause()
+
+                self.assertTrue(card.details_expanded)
 
 
 if __name__ == "__main__":

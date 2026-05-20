@@ -99,6 +99,8 @@ FLASH_BG = {
 }
 FLASH_DURATION = 3.0  # seconds
 ORPHAN_PRD_PRUNE_SECONDS = 60.0
+MISSION_CARD_OUTPUT_LINES = 18
+MISSION_CARD_EXPANDED_OUTPUT_LINES = 10
 
 # Sort order for the missions table when there are no flashes pulling
 # things up — newest activity first.
@@ -749,8 +751,15 @@ class MissionsTable(DataTable):
 class MissionCardWidget(Static):
     """Right-side durable mission graph card for the selected session."""
 
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        self.details_expanded = False
+
     def on_mount(self) -> None:
         self.update(self._empty())
+
+    def toggle_details(self) -> None:
+        self.details_expanded = not self.details_expanded
 
     def update_card(self, mission: Optional[db.Mission], live: Optional[LiveBuffer] = None) -> None:
         if mission is None:
@@ -780,8 +789,21 @@ class MissionCardWidget(Static):
         title = (memory.title if memory else "") or mission.goal or "(untitled)"
         text.append("MISSION CARD\n", style="bold bright_green")
         text.append(f"{title}\n", style="bold white")
+        compact = [
+            f"tab {(mission.tab_id or '?').split('-')[0]}",
+            mission.state or "unknown",
+        ]
+        if memory and memory.phase:
+            compact.append(memory.phase)
+        text.append(" · ".join(compact), style=STATE_TEXT_STYLE.get(mission.state, COL_DIMMER))
         text.append("\n")
 
+        self._render_latest_output(text, live)
+
+        if not self.details_expanded:
+            return text
+
+        text.append("\n")
         self._field(text, "mission", mission.mission_id or "unset", muted=not mission.mission_id)
         self._field(text, "tab", (mission.tab_id or "?").split("-")[0])
         self._field(text, "state", mission.state, style=STATE_TEXT_STYLE.get(mission.state, COL_BODY))
@@ -811,14 +833,6 @@ class MissionCardWidget(Static):
         if memory.topic:
             self._field(text, "topic", memory.topic)
 
-        text.append("\nLATEST OUTPUT\n", style="bold bright_green")
-        if live and live.buffer:
-            for line in _tail_lines(live.buffer, limit=6, width=90):
-                text.append(line, style=COL_BODY)
-                text.append("\n")
-        else:
-            text.append("unset\n", style=COL_DIMMER)
-
         text.append("\nEVENTS\n", style="bold bright_green")
         if events:
             for event in events:
@@ -844,6 +858,17 @@ class MissionCardWidget(Static):
             text.append("unset\n", style=COL_DIMMER)
 
         return text
+
+    def _render_latest_output(self, text: Text, live: Optional[LiveBuffer]) -> None:
+        text.append("\nLATEST OUTPUT\n", style="bold bright_green")
+        if live and live.buffer:
+            limit = MISSION_CARD_EXPANDED_OUTPUT_LINES if self.details_expanded else MISSION_CARD_OUTPUT_LINES
+            for line in _tail_lines(live.buffer, limit=limit, width=110):
+                text.append("  ", style=COL_DIMMER)
+                text.append(line, style=COL_BODY)
+                text.append("\n")
+        else:
+            text.append("unset\n", style=COL_DIMMER)
 
     def _field(
         self,
@@ -1513,6 +1538,7 @@ FOOTER_BINDINGS = [
     Binding("n", "new_session", "new"),
     Binding("b", "brief_selected", "brief"),
     Binding("e", "edit_mission", "edit"),
+    Binding("space", "toggle_card_details", "details"),
     Binding("d", "kill_session", "kill"),
     Binding("p", "prune_stale", "prune"),
     Binding("s", "snapshot_session", "snapshot"),
@@ -2054,6 +2080,14 @@ class MorpheusApp(App):
             ),
             self._handle_loop_result,
         )
+
+    def action_toggle_card_details(self) -> None:
+        try:
+            card = self.query_one(MissionCardWidget)
+            card.toggle_details()
+            self._refresh_mission_card(db.all_missions())
+        except Exception:
+            return
 
     def action_new_worker(self) -> None:
         if self.iterm_conn is None:

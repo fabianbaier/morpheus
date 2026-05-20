@@ -72,8 +72,9 @@ morpheus
 Inside the cockpit, the left panel is a Matrix rain field made from active
 sessions: recent terminal output appears as bright falling shards inside the
 rain, with selected and urgent sessions rendered more prominently. The mission
-table controls selection, and the right card shows the selected mission's graph
-memory plus the latest terminal tail. Use `j`/`k` or arrows to move, then press
+table controls selection, and the right card prioritizes the selected mission's
+latest terminal output. Press `space` to expand or collapse the graph metadata,
+events, and artifacts underneath it. Use `j`/`k` or arrows to move, then press
 `b` for a cited graph/transcript brief, `e` to correct mission memory, or
 `Enter` to jump into the real iTerm tab when you need to respond directly. Use
 `n` to spawn a new session without leaving Morpheus. The bottom white-rabbit
@@ -271,9 +272,10 @@ make daemon
 
 ## Roadmap
 
-Current status: v0.8.0a9 has PRD Runs foundation, PRD tree/manual workers,
+Current status: v0.8.0a10 has PRD Runs foundation, PRD tree/manual workers,
 newest-first ready tickers, prompt loops foundation, nonblocking/Markdown PRD
-picker, edit mission flow, selected mission briefs, and PRD parent cleanup.
+picker, edit mission flow, selected mission briefs, PRD parent cleanup, and an
+output-first mission card.
 
 Next implementation phases:
 
@@ -294,7 +296,8 @@ Next implementation phases:
 15. Edit mission flow for why/plan/next/provenance/proof fields. Done in `0.8.0a8`.
 16. `b` brief-selected using mission graph plus transcript tail. Done in `0.8.0a8`.
 17. PRD parent row kill/prune cleanup. Done in `0.8.0a9`.
-18. Resume-fresh flow that snapshots, archives old attachment, and spawns a new
+18. Output-first mission card with `space` details toggle. Done in `0.8.0a10`.
+19. Resume-fresh flow that snapshots, archives old attachment, and spawns a new
    session linked by a `spawned_from` edge.
 
 > "I can only show you the door. You're the one that has to walk through it."

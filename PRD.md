@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| **Status** | v0.8.0a9 implemented (PRD parent cleanup); next: resume fresh |
+| **Status** | v0.8.0a10 implemented (output-first mission card); next: resume fresh |
 | **Author** | Fabian Baier |
 | **Last updated** | 2026-05-20 |
 | **Target platform** | macOS + iTerm2 |
@@ -318,6 +318,7 @@ attach.
 | `n` | New mission | Opens goal + command form; creates mission card before launch |
 | `b` | Brief selected | Shows a short "why / status / next step" card for selected session |
 | `e` | Edit mission | Edits goal, why, plan, next step, tags, linked PR, worktree |
+| `Space` | Toggle mission details | Expands/collapses metadata under the selected mission's latest output |
 | `a` | Answer prompt | Drafts a response for the selected blocked session; sending is ask-first with preview |
 | `s` | Snapshot | Writes transcript + mission card to `~/.morpheus/snapshots/` |
 | `r` | Resume fresh | Spawns a new session seeded with the snapshot + mission card |
@@ -761,7 +762,7 @@ This table is the source of truth for where the product stands right now.
 | Mission graph schema | Implemented in v0.7.0 foundation | `mission_memory`, `mission_events`, `mission_artifacts`, `mission_edges` added |
 | Provenance model | Foundation implemented | Graph fields store source kind/ref and confidence; UI trust treatment still pending |
 | Loop phase / proof tracking | Foundation implemented | `phase`, `last_verified_at`, events, artifacts exist; selected cockpit card now displays phase/events/artifacts |
-| Mission card panel | Implemented in v0.7.0a2 | Right-side Textual card shows selected mission graph fields, events, artifacts, unset memory gaps |
+| Mission card panel | Implemented in v0.8.0a10 | Right-side Textual card defaults to mission title/status plus a prominent latest-output block; `Space` expands graph fields, events, and artifacts underneath |
 | Live session streams | Implemented in v0.7.0a3 | Dashboard captures real terminal tails from selected/relevant sessions; v0.7.0a5 changes the visual treatment from static tails to Matrix rain shards |
 | Session-end rabbit ticker | Implemented in v0.7.0a4 | Finished sessions now emit bottom-strip completion headlines from the latest substantive terminal output and store a mission summary event when possible |
 | Matrix rain output shards | Implemented in v0.7.0a5 | Left panel is rain-first again: real terminal output is embedded as falling bright shards inside the Matrix rain instead of rendered as a static terminal tail |
@@ -777,6 +778,7 @@ This table is the source of truth for where the product stands right now.
 | Edit mission flow | Implemented in v0.8.0a8 | `e` opens a dashboard editor for goal/title/why/done/criteria/plan/next/phase/blocker/source/issue/PR/worktree/claimed paths/topic, saves graph memory + live fields, and records a `mission_edit` event |
 | Brief selected | Implemented in v0.8.0a8 | `b` opens a cited local brief for the selected mission using graph memory, recent events, artifacts, and transcript tail |
 | PRD parent cleanup | Implemented in v0.8.0a9 | `d` on a virtual PRD parent archives the run and closes live coordinator/worker tabs; `p` archives orphan PRD parent rows with no live child tabs |
+| Output-first mission card | Implemented in v0.8.0a10 | The selected card shows much more latest terminal output by default and moves mission/graph metadata behind the `Space` details toggle |
 | Resume fresh | Not implemented | `r` snapshots, archives old attachment, spawns replacement with mission context |
 | MCP mission tools | Partially shipped | Read-only session tools exist; graph read/update tools remain v0.7 |
 | 48-hour recall eval | Not implemented | Add fixture or dogfood checklist: stale mission → press `b` → know next action in <10s |
@@ -939,8 +941,8 @@ Must ship:
 - **Traceability links** — optional `source_doc`, `epic_ref`, `issue_ref`,
   `acceptance_criteria`, linked PR, branch, worktree, claimed paths, and proof
   artifacts.
-- **Mission card panel** — selected session shows the full card in the
-  cockpit, not just state/goal/last event.
+- **Mission card panel** — selected session shows a compact identity line plus
+  the latest terminal output first; `Space` expands the full graph card.
 - **Edit mission flow** — `e` opens an inline form to correct goal, why,
   done definition, acceptance criteria, phase, next step, source links, linked
   PR, worktree, and claimed paths.
