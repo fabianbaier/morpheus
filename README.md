@@ -191,6 +191,9 @@ v0.8 starts a conservative PRD Run workflow. From the cockpit, `n` shows PRD/spe
 candidates from the selected worktree; picking one creates a parent mission from
 the PRD, writes a status file under `~/.morpheus/runs/<mission>/`, and spawns one
 coordinator tab linked by a graph edge.
+The PRD picker uses a bounded scan and refuses broad roots like `$HOME`, so a
+session whose cwd is your home directory will fall back to the dashboard/project
+cwd instead of freezing the cockpit.
 
 From the CLI:
 
@@ -263,7 +266,7 @@ make daemon
 
 ## Roadmap
 
-Current status: v0.8.0a5 has PRD Runs foundation, PRD tree/manual workers,
+Current status: v0.8.0a6 has PRD Runs foundation, PRD tree/manual workers,
 newest-first ready tickers, and prompt loops foundation.
 
 Next implementation phases:
@@ -280,9 +283,10 @@ Next implementation phases:
 10. PRD Runs foundation. Done in `0.8.0a1`.
 11. PRD run tree in the cockpit. Done in `0.8.0a5`.
 12. Manual child-worker spawn under a PRD run. Done in `0.8.0a5`.
-13. Edit mission flow for why/plan/next/provenance/proof fields.
-14. `b` brief-selected using mission graph plus transcript tail.
-15. Resume-fresh flow that snapshots, archives old attachment, and spawns a new
+13. Nonblocking PRD picker. Done in `0.8.0a6`.
+14. Edit mission flow for why/plan/next/provenance/proof fields.
+15. `b` brief-selected using mission graph plus transcript tail.
+16. Resume-fresh flow that snapshots, archives old attachment, and spawns a new
    session linked by a `spawned_from` edge.
 
 > "I can only show you the door. You're the one that has to walk through it."

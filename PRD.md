@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| **Status** | v0.8.0a5 implemented (PRD tree + manual workers); next: edit/brief flows |
+| **Status** | v0.8.0a6 implemented (nonblocking PRD picker); next: edit/brief flows |
 | **Author** | Fabian Baier |
 | **Last updated** | 2026-05-20 |
 | **Target platform** | macOS + iTerm2 |
@@ -385,6 +385,9 @@ Conservative v1 behavior:
 
 - The new-session flow shows PRD/spec candidates from the selected worktree or
   current working directory.
+- PRD/spec discovery must be bounded and must not recursively scan broad roots
+  such as `$HOME`, `/Users`, or `/`. If a selected tab reports a broad cwd,
+  Morpheus falls back to the dashboard/project cwd before opening the modal.
 - Choosing a PRD creates a parent `mission_memory` row with `source_kind=prd`,
   a source artifact, and a run status file under `~/.morpheus/runs/<mission>/`.
 - Morpheus spawns exactly one coordinator tab and links it to the parent mission
@@ -768,6 +771,7 @@ This table is the source of truth for where the product stands right now.
 | PRD Runs foundation | Implemented in v0.8.0a1 | PRD finder, new-session PRD selector, parent mission creation, coordinator prompt/status files, `morpheus run start`, and coordinator graph edge shipped |
 | PRD run tree UI | Partially implemented in v0.8.0a5 | Shows virtual PRD parent rows with coordinator/worker sessions rendered underneath them; collapse/expand remains future polish |
 | PRD child worker spawn | Implemented in v0.8.0a5 | `w` spawns a manual child worker under the selected PRD parent/coordinator/worker with scope and verification prompts |
+| Nonblocking PRD picker | Implemented in v0.8.0a6 | `n` uses a bounded PRD scan and refuses broad roots like `$HOME`, preventing the dashboard from freezing before the new-session modal opens |
 | Edit mission flow | Not implemented | `e` opens goal/why/plan/next/criteria/source/proof editor |
 | Brief selected | Not implemented | `b` renders a cited why/status/next card from graph + transcript tail |
 | Resume fresh | Not implemented | `r` snapshots, archives old attachment, spawns replacement with mission context |

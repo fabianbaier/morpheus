@@ -32,7 +32,24 @@ SKIP_DIRS = {
     ".pytest_cache",
     "dist",
     "build",
+    "Library",
+    "Applications",
+    "Downloads",
+    "Desktop",
+    "Documents",
 }
+PROJECT_MARKERS = {
+    ".git",
+    ".jj",
+    ".hg",
+    "pyproject.toml",
+    "package.json",
+    "Cargo.toml",
+    "go.mod",
+    "Gemfile",
+}
+MAX_SCAN_ENTRIES = 2500
+MAX_SCAN_SECONDS = 0.25
 
 
 @dataclass
@@ -50,13 +67,21 @@ class PRDRun:
     prompt_path: Path
 
 
-def find_prds(root: Path | str, limit: int = 30) -> list[PRDCandidate]:
+def find_prds(
+    root: Path | str,
+    limit: int = 30,
+    max_entries: int = MAX_SCAN_ENTRIES,
+    max_seconds: float = MAX_SCAN_SECONDS,
+) -> list[PRDCandidate]:
     base = Path(root).expanduser().resolve()
     if not base.exists():
         return []
+    if _is_broad_root(base):
+        return []
 
     candidates: list[Path] = []
-    for path in _walk_files(base):
+    deadline = time.monotonic() + max_seconds if max_seconds else None
+    for path in _walk_files(base, max_entries=max_entries, deadline=deadline):
         if path.suffix.lower() not in {".md", ".markdown", ".txt"}:
             continue
         rel = path.relative_to(base)
@@ -69,6 +94,28 @@ def find_prds(root: Path | str, limit: int = 30) -> list[PRDCandidate]:
         PRDCandidate(path=path, label=str(path.relative_to(base)))
         for path in candidates[:limit]
     ]
+
+
+def scan_root_for_worktree(root: Path | str, fallback: Optional[Path | str] = None) -> Path:
+    """Return a bounded PRD-scan root for a selected tab/worktree.
+
+    iTerm/Codex sessions can report `$HOME` as their cwd. Scanning that from the
+    TUI would block the cockpit, so broad roots fall back to the dashboard cwd.
+    """
+    base = Path(root).expanduser().resolve()
+    if base.is_file():
+        base = base.parent
+    candidate = _nearest_project_root(base) or base
+    if not _is_broad_root(candidate):
+        return candidate
+
+    fallback_base = Path(fallback or Path.cwd()).expanduser().resolve()
+    if fallback_base.is_file():
+        fallback_base = fallback_base.parent
+    fallback_candidate = _nearest_project_root(fallback_base) or fallback_base
+    if _is_broad_root(fallback_candidate):
+        return fallback_base
+    return fallback_candidate
 
 
 def create_prd_run(prd_path: Path | str, title: Optional[str] = None) -> PRDRun:
@@ -312,12 +359,56 @@ def write_coordinator_prompt(run: PRDRun) -> None:
     )
 
 
-def _walk_files(root: Path) -> Iterable[Path]:
-    for path in root.rglob("*"):
-        if any(part in SKIP_DIRS for part in path.parts):
+def _walk_files(
+    root: Path,
+    *,
+    max_entries: int = MAX_SCAN_ENTRIES,
+    deadline: Optional[float] = None,
+) -> Iterable[Path]:
+    stack = [root]
+    visited = 0
+    while stack:
+        if deadline is not None and time.monotonic() > deadline:
+            return
+        current = stack.pop()
+        try:
+            entries = sorted(current.iterdir(), key=lambda p: p.name.lower())
+        except OSError:
             continue
-        if path.is_file():
-            yield path
+        dirs: list[Path] = []
+        for entry in entries:
+            visited += 1
+            if visited > max_entries:
+                return
+            try:
+                if entry.is_symlink():
+                    continue
+                if entry.is_dir():
+                    if entry.name in SKIP_DIRS or entry.name.startswith("."):
+                        continue
+                    dirs.append(entry)
+                elif entry.is_file():
+                    yield entry
+            except OSError:
+                continue
+        stack.extend(reversed(dirs))
+
+
+def _nearest_project_root(path: Path) -> Optional[Path]:
+    current = path.resolve()
+    if current.is_file():
+        current = current.parent
+    for candidate in [current, *current.parents]:
+        if any((candidate / marker).exists() for marker in PROJECT_MARKERS):
+            return candidate
+    return None
+
+
+def _is_broad_root(path: Path) -> bool:
+    base = path.expanduser().resolve()
+    home = Path.home().resolve()
+    broad = {Path("/").resolve(), home, home.parent.resolve()}
+    return base in broad
 
 
 def _prd_score(root: Path, path: Path) -> tuple[int, int]:
