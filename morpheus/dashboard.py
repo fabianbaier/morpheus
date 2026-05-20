@@ -698,6 +698,7 @@ class MissionsTable(DataTable):
         flashing: dict[str, tuple[float, str]],
         prd_parents: Optional[list[db.MissionMemory]] = None,
         prd_edges: Optional[list[db.MissionEdge]] = None,
+        closed_memories: Optional[list[db.MissionMemory]] = None,
     ) -> None:
         # Preserve cursor position by live tab or virtual mission across refreshes.
         prior_ref = self.row_refs[self.cursor_row] if (
@@ -762,18 +763,36 @@ class MissionsTable(DataTable):
                 "",
             ))
 
+        for memory in closed_memories or []:
+            rows.append((
+                MissionRowRef(mission_id=memory.mission_id, role="closed", virtual=True),
+                None,
+                memory,
+                "",
+            ))
+
         now = time.time()
 
         for row_ref, mission, parent, prefix in rows:
             self.row_refs.append(row_ref)
             self.row_tab_ids.append(row_ref.tab_id)
             if parent is not None:
-                emoji = "▣"
-                age = naming.format_age(naming.now_minus(parent.updated_at))
-                tab_short = "PRD"
-                goal_disp = parent.title or parent.mission_id
-                last_evt = parent.next_step or "PRD run"
-                cell_style = "bold bright_green"
+                if row_ref.role == "closed":
+                    emoji = "↻"
+                    age = naming.format_age(naming.now_minus(parent.closed_at or parent.archived_at or parent.updated_at))
+                    tab_short = "closed"
+                    goal_disp = f"closed: {parent.title or parent.mission_id}"
+                    provider = parent.agent_kind or "agent"
+                    confidence = f" ({parent.resume_confidence})" if parent.resume_confidence else ""
+                    last_evt = f"resume {provider}{confidence}"
+                    cell_style = COL_MUTED
+                else:
+                    emoji = "▣"
+                    age = naming.format_age(naming.now_minus(parent.updated_at))
+                    tab_short = "PRD"
+                    goal_disp = parent.title or parent.mission_id
+                    last_evt = parent.next_step or "PRD run"
+                    cell_style = "bold bright_green"
             else:
                 assert mission is not None
                 emoji = naming.STATE_EMOJI.get(mission.state, "⚪")
@@ -1071,6 +1090,43 @@ def _resume_base_command(cmd: str) -> str:
 
 def _resume_command(base_cmd: str, prompt: str) -> str:
     return f"{_resume_base_command(base_cmd)} {shlex.quote(prompt)}"
+
+
+def _closed_resume_prompt(memory: db.MissionMemory) -> str:
+    parts = [
+        "Resume this Morpheus mission in a new terminal tab.",
+        f"Mission: {memory.title or memory.mission_id}",
+    ]
+    if memory.why:
+        parts.append(f"Why: {memory.why}")
+    if memory.current_plan:
+        parts.append(f"Current plan: {memory.current_plan}")
+    if memory.next_step:
+        parts.append(f"Next step: {memory.next_step}")
+    if memory.blocked_on:
+        parts.append(f"Blocked on: {memory.blocked_on}")
+    parts.append(
+        "First recover context from the resumed conversation and Morpheus mission graph, "
+        "then check git status before making changes."
+    )
+    return "\n".join(parts)
+
+
+def _closed_resume_command(memory: db.MissionMemory) -> str:
+    if not memory.resume_command:
+        return ""
+    if memory.agent_kind in {"codex", "claude"}:
+        return f"{memory.resume_command} {shlex.quote(_closed_resume_prompt(memory))}"
+    return memory.resume_command
+
+
+def _post_spawn_resume_text(memory: db.MissionMemory) -> str:
+    if memory.agent_kind != "gemini":
+        return ""
+    prompt = _closed_resume_prompt(memory)
+    if memory.resume_ref:
+        return f"/chat resume {memory.resume_ref}\n{prompt}\n"
+    return f"{prompt}\n"
 
 
 def _resume_prompt(
@@ -2189,6 +2245,7 @@ class MorpheusApp(App):
         try:
             missions = db.all_missions()
             prd_parents, prd_edges = self._prd_tree_context()
+            closed_memories = self._closed_resumable_memories(missions)
         except Exception:
             return
         self.current_missions = missions
@@ -2197,11 +2254,23 @@ class MorpheusApp(App):
         self.flashing = {k: v for k, v in self.flashing.items() if v[0] > now}
         try:
             table = self.query_one(MissionsTable)
-            table.refresh_rows(missions, self.flashing, prd_parents, prd_edges)
+            table.refresh_rows(missions, self.flashing, prd_parents, prd_edges, closed_memories)
             self._refresh_mission_card(missions)
             self._refresh_live_stream(render=False, sync=False)
         except Exception:
             pass
+
+    def _closed_resumable_memories(self, missions: list[db.Mission]) -> list[db.MissionMemory]:
+        live_ids = {mission.mission_id for mission in missions if mission.mission_id}
+        memories = db.all_memory(include_archived=True)
+        return [
+            memory for memory in memories
+            if memory.archived_at is not None
+            and memory.mission_id not in live_ids
+            and memory.resume_command
+            and memory.topic != "prd-run"
+            and memory.source_kind != "prd"
+        ][:20]
 
     def _prd_tree_context(self) -> tuple[list[db.MissionMemory], list[db.MissionEdge]]:
         parents = [
@@ -3044,6 +3113,11 @@ class MorpheusApp(App):
         table = self.query_one(MissionsTable)
         old_tab_id = table.selected_tab_id()
         if not old_tab_id:
+            mission_id = table.selected_mission_id()
+            if mission_id:
+                await self._resume_closed_mission(mission_id)
+                return
+        if not old_tab_id:
             self._push_alert(Alert(time.time(), "error", "no live mission selected to resume"))
             return
         live = await iterm_client.enumerate_tabs(self.iterm_conn)
@@ -3155,6 +3229,90 @@ class MorpheusApp(App):
             time.time(),
             "spawn",
             f"{status} [{goal}] → {info.tab_id.split('-')[0]}",
+        ))
+        self._refresh_table()
+
+    async def _resume_closed_mission(self, mission_id: str) -> None:
+        memory = db.get_memory(mission_id)
+        if memory is None:
+            self._push_alert(Alert(time.time(), "error", f"mission [{mission_id[:12]}] not found"))
+            return
+        cmd = _closed_resume_command(memory)
+        if not cmd:
+            self._push_alert(Alert(
+                time.time(),
+                "error",
+                f"mission [{mission_id[:12]}] has no provider resume command; use snapshot/manual resume",
+            ))
+            return
+        goal = memory.title or mission_id
+        try:
+            info = await iterm_client.spawn_tab(self.iterm_conn, command=cmd, goal=goal)
+        except Exception as e:
+            self._push_alert(Alert(time.time(), "error", f"closed resume failed: {e}"))
+            return
+        if info is None:
+            self._push_alert(Alert(time.time(), "error", "closed resume failed — is iTerm focused?"))
+            return
+
+        followup = _post_spawn_resume_text(memory)
+        if followup:
+            try:
+                await asyncio.sleep(0.7)
+                await iterm_client.send_text_to_tabs(self.iterm_conn, [info.tab_id], followup)
+            except Exception:
+                pass
+
+        now = time.time()
+        mission = db.Mission(
+            tab_id=info.tab_id,
+            session_id=info.session_id,
+            mission_id=memory.mission_id,
+            goal=goal,
+            state="working",
+            cmd=cmd,
+            buffer_changed_at=now,
+            last_event_at=now,
+            created_at=now,
+        )
+        db.upsert(mission)
+        memory.archived_at = None
+        if memory.phase == "archived":
+            memory.phase = "working"
+        memory.last_tab_id = info.tab_id
+        db.upsert_memory(memory)
+        db.add_event(
+            memory.mission_id,
+            kind="resume",
+            actor="morpheus",
+            summary=f"Closed mission resumed into {info.tab_id.split('-')[0]}",
+            source_ref=f"tab:{info.tab_id}",
+            metadata={
+                "agent_kind": memory.agent_kind,
+                "resume_confidence": memory.resume_confidence,
+                "resume_ref": memory.resume_ref,
+                "command": cmd,
+            },
+        )
+        ledger_mod.log_action(
+            "resume_closed",
+            tab_id=info.tab_id,
+            details={
+                "mission_id": memory.mission_id,
+                "agent_kind": memory.agent_kind,
+                "resume_confidence": memory.resume_confidence,
+                "resume_ref": memory.resume_ref,
+            },
+        )
+        try:
+            ctx_mod.write_context_file()
+            ctx_mod.write_context_json()
+        except Exception:
+            pass
+        self._push_alert(Alert(
+            time.time(),
+            "spawn",
+            f"resumed closed [{goal}] → {info.tab_id.split('-')[0]}",
         ))
         self._refresh_table()
 

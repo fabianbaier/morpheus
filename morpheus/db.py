@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import secrets
+import shlex
 import sqlite3
 import time
 from contextlib import contextmanager
@@ -59,6 +60,12 @@ class MissionMemory:
     last_verified_at: float = 0.0
     claimed_paths: str = "[]"
     topic: str = ""
+    agent_kind: str = ""
+    resume_ref: str = ""
+    resume_command: str = ""
+    resume_confidence: str = ""
+    last_tab_id: str = ""
+    closed_at: float = 0.0
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
     archived_at: Optional[float] = None
@@ -170,6 +177,12 @@ CREATE TABLE IF NOT EXISTS mission_memory (
     last_verified_at    REAL NOT NULL DEFAULT 0,
     claimed_paths       TEXT NOT NULL DEFAULT '[]',
     topic               TEXT NOT NULL DEFAULT '',
+    agent_kind          TEXT NOT NULL DEFAULT '',
+    resume_ref          TEXT NOT NULL DEFAULT '',
+    resume_command      TEXT NOT NULL DEFAULT '',
+    resume_confidence   TEXT NOT NULL DEFAULT '',
+    last_tab_id         TEXT NOT NULL DEFAULT '',
+    closed_at           REAL NOT NULL DEFAULT 0,
     created_at          REAL NOT NULL DEFAULT 0,
     updated_at          REAL NOT NULL DEFAULT 0,
     archived_at         REAL
@@ -288,6 +301,12 @@ def _connect() -> Iterator[sqlite3.Connection]:
 def _ensure_schema(conn: sqlite3.Connection) -> None:
     conn.executescript(_SCHEMA)
     _ensure_column(conn, "missions", "mission_id", "TEXT NOT NULL DEFAULT ''")
+    _ensure_column(conn, "mission_memory", "agent_kind", "TEXT NOT NULL DEFAULT ''")
+    _ensure_column(conn, "mission_memory", "resume_ref", "TEXT NOT NULL DEFAULT ''")
+    _ensure_column(conn, "mission_memory", "resume_command", "TEXT NOT NULL DEFAULT ''")
+    _ensure_column(conn, "mission_memory", "resume_confidence", "TEXT NOT NULL DEFAULT ''")
+    _ensure_column(conn, "mission_memory", "last_tab_id", "TEXT NOT NULL DEFAULT ''")
+    _ensure_column(conn, "mission_memory", "closed_at", "REAL NOT NULL DEFAULT 0")
     conn.execute("CREATE INDEX IF NOT EXISTS missions_mission_id_idx ON missions(mission_id)")
 
 
@@ -300,6 +319,116 @@ def _ensure_column(conn: sqlite3.Connection, table: str, column: str, ddl: str) 
 def _new_mission_id(now: Optional[float] = None) -> str:
     ts = time.strftime("%Y%m%d%H%M%S", time.localtime(now or time.time()))
     return f"m_{ts}_{secrets.token_hex(4)}"
+
+
+def _infer_agent_kind(command: str) -> str:
+    try:
+        parts = shlex.split(command or "")
+    except ValueError:
+        parts = (command or "").split()
+    if not parts:
+        return ""
+    exe = Path(parts[0]).name.lower()
+    if exe in {"codex", "claude", "gemini"}:
+        return exe
+    return ""
+
+
+def _option_value(parts: list[str], *names: str) -> str:
+    for idx, part in enumerate(parts):
+        for name in names:
+            if part == name and idx + 1 < len(parts):
+                return parts[idx + 1]
+            if part.startswith(f"{name}="):
+                return part.split("=", 1)[1]
+    return ""
+
+
+def _resume_ref_from_command(command: str, agent_kind: str) -> tuple[str, str]:
+    try:
+        parts = shlex.split(command or "")
+    except ValueError:
+        parts = (command or "").split()
+    if not parts:
+        return "", "unavailable"
+    if agent_kind == "codex":
+        if "resume" in parts:
+            idx = parts.index("resume")
+            for value in parts[idx + 1:]:
+                if value.startswith("-"):
+                    continue
+                return value, "exact"
+        return "", "fallback"
+    if agent_kind == "claude":
+        ref = _option_value(parts, "--resume", "-r", "--session-id")
+        return ref, "exact" if ref else "fallback"
+    if agent_kind == "gemini":
+        joined = " ".join(parts)
+        if "/chat resume" in joined:
+            tail = joined.split("/chat resume", 1)[1].strip()
+            return tail.split()[0] if tail else "", "exact" if tail else "fallback"
+        return "", "fallback"
+    return "", "unavailable"
+
+
+def _with_worktree(command: str, linked_worktree: str) -> str:
+    if not linked_worktree:
+        return command
+    return f"cd {shlex.quote(linked_worktree)} && {command}"
+
+
+def _resume_command_for_mission(mission: Mission) -> tuple[str, str, str, str]:
+    agent_kind = _infer_agent_kind(mission.cmd)
+    resume_ref, confidence = _resume_ref_from_command(mission.cmd, agent_kind)
+    if agent_kind == "codex":
+        base = f"codex resume {shlex.quote(resume_ref)}" if resume_ref else "codex resume --last"
+    elif agent_kind == "claude":
+        base = f"claude --resume {shlex.quote(resume_ref)}" if resume_ref else "claude --continue"
+    elif agent_kind == "gemini":
+        base = "gemini"
+    else:
+        return "", "", "", "unavailable"
+    return agent_kind, resume_ref, _with_worktree(base, mission.linked_worktree), confidence
+
+
+def _persist_resume_metadata(
+    conn: sqlite3.Connection,
+    mission: Mission,
+    *,
+    closed_at: float = 0.0,
+) -> None:
+    if not mission.mission_id:
+        return
+    agent_kind, resume_ref, resume_command, confidence = _resume_command_for_mission(mission)
+    conn.execute(
+        """
+        UPDATE mission_memory
+           SET agent_kind = CASE WHEN ? != '' THEN ? ELSE agent_kind END,
+               resume_ref = CASE WHEN ? != '' THEN ? ELSE resume_ref END,
+               resume_command = CASE WHEN ? != '' THEN ? ELSE resume_command END,
+               resume_confidence = CASE WHEN ? != '' THEN ? ELSE resume_confidence END,
+               last_tab_id = CASE WHEN ? != '' THEN ? ELSE last_tab_id END,
+               closed_at = CASE WHEN ? > 0 THEN ? ELSE closed_at END,
+               updated_at = ?
+         WHERE mission_id = ?
+        """,
+        (
+            agent_kind,
+            agent_kind,
+            resume_ref,
+            resume_ref,
+            resume_command,
+            resume_command,
+            confidence,
+            confidence,
+            mission.tab_id,
+            mission.tab_id,
+            closed_at,
+            closed_at,
+            time.time(),
+            mission.mission_id,
+        ),
+    )
 
 
 def new_mission_id(now: Optional[float] = None) -> str:
@@ -409,6 +538,7 @@ def upsert(mission: Mission) -> None:
         if row and row["mission_id"]:
             mission.mission_id = row["mission_id"]
         _ensure_memory_row(conn, mission, mission.updated_at)
+        _persist_resume_metadata(conn, mission)
 
 
 def get(tab_id: str) -> Optional[Mission]:
@@ -438,6 +568,9 @@ def update_mission_details(
             """,
             (goal, linked_pr, linked_worktree, now, tab_id),
         )
+        row = conn.execute("SELECT * FROM missions WHERE tab_id = ?", (tab_id,)).fetchone()
+        if row is not None:
+            _persist_resume_metadata(conn, _row_to_mission(row))
     return cur.rowcount > 0
 
 
@@ -450,10 +583,12 @@ def all_missions() -> list[Mission]:
 def delete(tab_id: str) -> None:
     with _connect() as conn:
         row = conn.execute(
-            "SELECT mission_id FROM missions WHERE tab_id = ?",
+            "SELECT * FROM missions WHERE tab_id = ?",
             (tab_id,),
         ).fetchone()
         if row and row["mission_id"]:
+            mission = _row_to_mission(row)
+            _persist_resume_metadata(conn, mission, closed_at=time.time())
             _archive_mission(conn, row["mission_id"], f"tab {tab_id} deleted", f"tab:{tab_id}")
         conn.execute("DELETE FROM missions WHERE tab_id = ?", (tab_id,))
 
@@ -463,9 +598,11 @@ def reconcile_missing(known_tab_ids: Iterable[str]) -> int:
     known = list(known_tab_ids)
     with _connect() as conn:
         if not known:
-            rows = conn.execute("SELECT tab_id, mission_id FROM missions").fetchall()
+            rows = conn.execute("SELECT * FROM missions").fetchall()
             for row in rows:
                 if row["mission_id"]:
+                    mission = _row_to_mission(row)
+                    _persist_resume_metadata(conn, mission, closed_at=time.time())
                     _archive_mission(
                         conn,
                         row["mission_id"],
@@ -477,11 +614,13 @@ def reconcile_missing(known_tab_ids: Iterable[str]) -> int:
 
         placeholders = ",".join("?" * len(known))
         rows = conn.execute(
-            f"SELECT tab_id, mission_id FROM missions WHERE tab_id NOT IN ({placeholders})",
+            f"SELECT * FROM missions WHERE tab_id NOT IN ({placeholders})",
             known,
         ).fetchall()
         for row in rows:
             if row["mission_id"]:
+                mission = _row_to_mission(row)
+                _persist_resume_metadata(conn, mission, closed_at=time.time())
                 _archive_mission(
                     conn,
                     row["mission_id"],
@@ -508,8 +647,9 @@ def upsert_memory(memory: MissionMemory) -> None:
                 current_plan, next_step, last_decision, last_summary,
                 blocked_on, phase, confidence, source_kind, source_ref,
                 epic_ref, issue_ref, last_verified_at, claimed_paths, topic,
-                created_at, updated_at, archived_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                agent_kind, resume_ref, resume_command, resume_confidence,
+                last_tab_id, closed_at, created_at, updated_at, archived_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(mission_id) DO UPDATE SET
                 title               = excluded.title,
                 why                 = excluded.why,
@@ -529,6 +669,12 @@ def upsert_memory(memory: MissionMemory) -> None:
                 last_verified_at    = excluded.last_verified_at,
                 claimed_paths       = excluded.claimed_paths,
                 topic               = excluded.topic,
+                agent_kind          = excluded.agent_kind,
+                resume_ref          = excluded.resume_ref,
+                resume_command      = excluded.resume_command,
+                resume_confidence   = excluded.resume_confidence,
+                last_tab_id         = excluded.last_tab_id,
+                closed_at           = excluded.closed_at,
                 updated_at          = excluded.updated_at,
                 archived_at         = excluded.archived_at
             """,
@@ -552,6 +698,12 @@ def upsert_memory(memory: MissionMemory) -> None:
                 memory.last_verified_at,
                 memory.claimed_paths,
                 memory.topic,
+                memory.agent_kind,
+                memory.resume_ref,
+                memory.resume_command,
+                memory.resume_confidence,
+                memory.last_tab_id,
+                memory.closed_at,
                 memory.created_at,
                 memory.updated_at,
                 memory.archived_at,
@@ -1163,6 +1315,12 @@ def _row_to_memory(row: sqlite3.Row) -> MissionMemory:
         last_verified_at=row["last_verified_at"],
         claimed_paths=row["claimed_paths"],
         topic=row["topic"],
+        agent_kind=row["agent_kind"],
+        resume_ref=row["resume_ref"],
+        resume_command=row["resume_command"],
+        resume_confidence=row["resume_confidence"],
+        last_tab_id=row["last_tab_id"],
+        closed_at=row["closed_at"],
         created_at=row["created_at"],
         updated_at=row["updated_at"],
         archived_at=row["archived_at"],

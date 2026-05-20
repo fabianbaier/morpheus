@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| **Status** | v0.8.0a18 implemented (low-FPS rain repaint guard); next: 48-hour recall eval |
+| **Status** | v0.8.0a19 implemented (closed-session provider resume); next: 48-hour recall eval |
 | **Author** | Fabian Baier |
 | **Last updated** | 2026-05-20 |
 | **Target platform** | macOS + iTerm2 |
@@ -771,6 +771,7 @@ This table is the source of truth for where the product stands right now.
 | Rain performance path | Implemented in v0.8.0a16 | Animation uses cached mission rows instead of hitting SQLite every 120ms, updates live buffers without forcing a second render, and skips rain-column reconciliation when the mission signature has not changed |
 | Adaptive low-load rain | Implemented in v0.8.0a17 | Default rain cadence drops to 2 FPS, shard text parsing runs only when live buffers change, headline/tail scans are capped to recent terminal output, and slow render frames trigger short animation backoff so the cockpit remains usable |
 | Low-FPS rain repaint guard | Implemented in v0.8.0a18 | Rain now renders at 0.5 FPS by default and table refreshes update mission/card state without forcing rain repaint or shard parsing, removing the hidden duplicate render loop that made the cockpit unresponsive |
+| Closed-session provider resume | Implemented in v0.8.0a19 | Archived missions keep provider resume metadata; closed rows remain selectable and `r` opens a new iTerm tab with Codex/Claude resume commands or Gemini checkpoint handoff |
 | Robust self-tab exclusion | Implemented in v0.7.0a6 | Dashboard passes its own tab/session IDs into the watcher; core also recognizes the Morpheus screen by buffer if iTerm leaves the title as `Python"` |
 | Ready-response rabbit ticker | Implemented in v0.8.0a2 | `working → idle` now emits a `ready [...]` headline by extracting the latest assistant answer block, skipping Codex chrome/separators/source URLs, and compressing it to one sentence |
 | Newest-first rabbit ticker | Implemented in v0.8.0a3 | Bottom alert strip redraws from the newest-first alert deque so fresh session headlines stay at the top instead of appending chronologically |
@@ -959,6 +960,13 @@ Must ship:
 - **Resume fresh** — `r` snapshots the selected session and spawns a new
   session seeded with the snapshot + mission graph card, then links old and new
   attachments with a `spawned_from` edge.
+- **Closed-session provider resume** — when a tab disappears, persist
+  `agent_kind`, `resume_ref`, `resume_command`, `resume_confidence`,
+  `last_tab_id`, and `closed_at` on `mission_memory`. Closed resumable missions
+  stay visible as dashboard rows. Pressing `r` opens a new iTerm tab and runs
+  the provider-native resume path: Codex `codex resume`, Claude
+  `claude --resume` / `--continue`, and Gemini `gemini` plus `/chat resume`
+  when a checkpoint tag is known.
 - **Archive instead of forget** — closing a tab archives the mission; it does
   not delete the historical record unless explicitly purged.
 - **Topic threads** — group sessions by PR, feature, incident, or research

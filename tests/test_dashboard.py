@@ -1035,6 +1035,82 @@ class DashboardTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(captured["ledger"][0], "resume_fresh")
             self.assertTrue(captured["ledger"][2]["closed_old_tab"])
 
+    async def test_resume_closed_mission_spawns_provider_resume_and_reattaches_memory(self) -> None:
+        app = DashboardHarness()
+        done = asyncio.Event()
+        captured = {}
+        memory = dashboard.db.MissionMemory(
+            mission_id="m_closed",
+            title="Closed Codex mission",
+            why="tab disappeared",
+            current_plan="continue provider session",
+            next_step="run tests",
+            phase="archived",
+            agent_kind="codex",
+            resume_command="cd /tmp/work && codex resume --last",
+            resume_confidence="fallback",
+            last_tab_id="tab-old",
+            closed_at=10,
+            archived_at=10,
+        )
+
+        async def fake_spawn_tab(connection, *, command, goal):
+            captured["spawn"] = {"connection": connection, "command": command, "goal": goal}
+            return SimpleNamespace(tab_id="tab-new", session_id="session-new")
+
+        def fake_upsert(mission):
+            captured["mission"] = mission
+
+        def fake_upsert_memory(updated):
+            captured["memory"] = updated
+
+        def fake_add_event(mission_id, kind, summary, actor="user", source_ref="", metadata=None):
+            captured["event"] = {
+                "mission_id": mission_id,
+                "kind": kind,
+                "summary": summary,
+                "actor": actor,
+                "source_ref": source_ref,
+                "metadata": metadata,
+            }
+            done.set()
+            return 1
+
+        with isolated_dashboard_runtime(missions=[], memories=[memory]), patch.object(
+            dashboard.db, "get_memory", new=lambda mission_id: memory if mission_id == memory.mission_id else None
+        ), patch.object(
+            dashboard.iterm_client, "spawn_tab", new=fake_spawn_tab
+        ), patch.object(
+            dashboard.db, "upsert", new=fake_upsert
+        ), patch.object(
+            dashboard.db, "upsert_memory", new=fake_upsert_memory
+        ), patch.object(
+            dashboard.db, "add_event", new=fake_add_event
+        ), patch.object(
+            dashboard.ledger_mod, "log_action", new=lambda *args, **kwargs: captured.setdefault("ledger", (args, kwargs))
+        ), patch.object(
+            dashboard.ctx_mod, "write_context_file", new=lambda: None
+        ), patch.object(
+            dashboard.ctx_mod, "write_context_json", new=lambda: None
+        ):
+            async with app.run_test(size=(120, 40)) as pilot:
+                app._refresh_table()
+                await pilot.pause()
+                table = app.query_one(dashboard.MissionsTable)
+                self.assertEqual(table.selected_ref().role, "closed")
+                await pilot.press("r")
+                await asyncio.wait_for(done.wait(), timeout=1)
+
+        self.assertEqual(captured["spawn"]["goal"], "Closed Codex mission")
+        self.assertIn("codex resume --last", captured["spawn"]["command"])
+        self.assertIn("Resume this Morpheus mission", captured["spawn"]["command"])
+        self.assertEqual(captured["mission"].mission_id, "m_closed")
+        self.assertEqual(captured["mission"].tab_id, "tab-new")
+        self.assertIsNone(captured["memory"].archived_at)
+        self.assertEqual(captured["memory"].phase, "working")
+        self.assertEqual(captured["event"]["kind"], "resume")
+        self.assertEqual(captured["event"]["metadata"]["agent_kind"], "codex")
+
     async def test_new_session_submit_spawns_tab_and_records_mission(self) -> None:
         app = DashboardHarness()
         done = asyncio.Event()
