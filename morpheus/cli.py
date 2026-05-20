@@ -35,6 +35,13 @@ def _default(ctx: typer.Context):
         dashboard.run()
 
 
+@app.command()
+def dashboard():
+    """Launch the Matrix-rain dashboard (same as running `morpheus` with no args)."""
+    from morpheus import dashboard as dash_mod
+    dash_mod.run()
+
+
 # ───────── version ─────────
 
 @app.command()
@@ -360,6 +367,24 @@ def notes(
 
 # ───────── doctor ─────────
 
+def _iterm2_running() -> bool:
+    """Best-effort check whether the iTerm2 app is running on this machine."""
+    import subprocess
+    try:
+        out = subprocess.run(
+            ["pgrep", "-x", "iTerm2"],
+            capture_output=True, text=True, timeout=2,
+        )
+        return out.returncode == 0
+    except Exception:
+        return False
+
+
+def _running_in_iterm() -> bool:
+    """Are we *executing* inside an iTerm2 session? (vs Terminal.app, etc.)"""
+    return bool(os.environ.get("ITERM_SESSION_ID")) or os.environ.get("TERM_PROGRAM") == "iTerm.app"
+
+
 @app.command()
 def doctor():
     """Diagnose iTerm2 + Python API connectivity."""
@@ -371,6 +396,24 @@ def doctor():
     except Exception as e:
         console.print(f"  ✗ iterm2 import failed: {e}")
         raise typer.Exit(1)
+
+    # Up-front context: where is the user running this, and is iTerm2 alive?
+    if _running_in_iterm():
+        console.print("  ✓ running inside an iTerm2 session")
+    else:
+        term_prog = os.environ.get("TERM_PROGRAM") or "unknown"
+        console.print(
+            f"  [yellow]⚠ not running inside iTerm2 (TERM_PROGRAM={term_prog}) — "
+            f"morpheus can still connect to iTerm2 if it's running, but the dashboard "
+            f"will render in this terminal, not in an iTerm tab.[/yellow]"
+        )
+    if _iterm2_running():
+        console.print("  ✓ iTerm2 app appears to be running")
+    else:
+        console.print(
+            "  [red]✗ iTerm2 app is NOT running — launch iTerm2 first "
+            "(CMD+SPACE → 'iTerm' → enter, or open from /Applications/iTerm.app)[/red]"
+        )
 
     # iterm2's run_until_complete prints its own help on connection failure and
     # may sys.exit rather than raise — so we use a success flag and catch
@@ -402,12 +445,18 @@ def doctor():
         console.print("\n[green bold]✓ all checks passed.[/green bold] Run [bold]morpheus[/bold] to launch the dashboard.")
         return
 
-    console.print("\n[yellow bold]→ iTerm2 Python API setup needed:[/yellow bold]")
-    console.print("  1. Open iTerm2 → [bold]Settings[/bold] → [bold]General[/bold] → [bold]Magic[/bold]")
-    console.print("  2. Check [bold]'Enable Python API'[/bold]")
-    console.print("  3. Set [bold]Authentication[/bold] to [bold]'Allow all apps to connect'[/bold]")
-    console.print("  4. [yellow]Restart iTerm2[/yellow]  ← people miss this step")
-    console.print("  5. Re-run: [bold]morpheus doctor[/bold]")
+    console.print("\n[yellow bold]→ iTerm2 Python API setup needed (this lives INSIDE iTerm2, not in Terminal.app):[/yellow bold]")
+    console.print("  1. [bold]Switch to iTerm2[/bold] (CMD+TAB to it, or launch from /Applications/iTerm.app)")
+    console.print("  2. Top-left menubar: click [bold]\"iTerm2\"[/bold] → [bold]\"Settings…\"[/bold]  (shortcut: CMD+,)")
+    console.print("  3. In the Settings window: click the [bold]\"General\"[/bold] icon in the top toolbar")
+    console.print("  4. In General's sub-tabs, click [bold]\"Magic\"[/bold]")
+    console.print("  5. Check [bold]☑ Enable Python API[/bold]")
+    console.print("  6. Set [bold]Require Authentication[/bold] dropdown to [bold]\"Allow all apps to connect\"[/bold]")
+    console.print("  7. [yellow]Quit iTerm2 entirely (CMD+Q) and re-open[/yellow]  ← most people miss this")
+    console.print("  8. Re-run: [bold]morpheus doctor[/bold]")
+    console.print("\n  Note: morpheus can be launched from any terminal (Terminal.app, iTerm, etc.) —")
+    console.print("  it just needs iTerm2 to be running with the Python API enabled. For the dashboard")
+    console.print("  to appear inside an iTerm tab, run `morpheus` from a tab in iTerm2 itself.")
     console.print("\n  Alternative: set [bold]$ITERM2_COOKIE[/bold] env var to a valid cookie.")
     raise typer.Exit(1)
 
