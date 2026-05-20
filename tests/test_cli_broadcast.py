@@ -19,10 +19,6 @@ class BroadcastCliTest(unittest.TestCase):
             cli._broadcast_payload("check remote commits", submit=True),
             "[morpheus broadcast] check remote commits\n",
         )
-        self.assertEqual(
-            cli._broadcast_payload("raw message", submit=True, raw=True),
-            "raw message\n",
-        )
 
     def test_resolve_broadcast_targets_excludes_self_by_default(self) -> None:
         missions = [
@@ -40,7 +36,7 @@ class BroadcastCliTest(unittest.TestCase):
         self.assertEqual(errors, [])
         self.assertEqual([mission.tab_id for mission in targets], ["tab-other"])
 
-    def test_broadcast_command_sends_to_iterm_and_records_note(self) -> None:
+    def test_broadcast_note_sends_to_iterm_and_records_note(self) -> None:
         runner = CliRunner()
         missions = [
             db.Mission(tab_id="tab-self", session_id="session-self", mission_id="m_self", goal="self"),
@@ -77,7 +73,7 @@ class BroadcastCliTest(unittest.TestCase):
         ), patch.object(
             cli.ctx_mod, "write_context_json", new=lambda: None
         ):
-            result = runner.invoke(cli.app, ["broadcast", "verify commits", "--submit"])
+            result = runner.invoke(cli.app, ["note", "--kind", "broadcast", "verify commits"])
 
         self.assertEqual(result.exit_code, 0, result.output)
         self.assertEqual(captured["send"]["tab_ids"], ["tab-other"])
@@ -85,3 +81,28 @@ class BroadcastCliTest(unittest.TestCase):
         self.assertEqual(captured["note"]["text"], "verify commits")
         self.assertEqual(captured["note"]["tab_id"], "tab-self")
         self.assertEqual(captured["note"]["kind"], "broadcast")
+
+    def test_regular_note_does_not_send_to_iterm(self) -> None:
+        runner = CliRunner()
+        captured = {}
+
+        def fail_run(coro_factory):
+            raise AssertionError("regular notes should not touch iTerm")
+
+        def fake_add_note(**kwargs):
+            captured["note"] = kwargs
+            return 1
+
+        with patch.dict(os.environ, {}, clear=True), patch.object(
+            cli.iterm_client, "run", new=fail_run
+        ), patch.object(
+            cli.db, "add_note", new=fake_add_note
+        ), patch.object(
+            cli.ctx_mod, "write_context_file", new=lambda: None
+        ), patch.object(
+            cli.ctx_mod, "write_context_json", new=lambda: None
+        ):
+            result = runner.invoke(cli.app, ["note", "context only"])
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertEqual(captured["note"]["kind"], "note")

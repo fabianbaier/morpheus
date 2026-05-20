@@ -120,7 +120,6 @@ morpheus run find-prds .
 morpheus run start ./PRD.md --cmd "codex"
 morpheus loops add "market scan" "summarize tomorrow's market catalysts" --every 30m
 morpheus loops run-due
-morpheus broadcast "please verify remote commits before finishing" --submit
 morpheus mcp serve
 ```
 
@@ -130,14 +129,14 @@ Cross-session notes:
 morpheus context -f short
 morpheus note "touching src/auth/*, hold off"
 morpheus note --kind claim "claiming PR #224 worktree"
+morpheus note --kind broadcast "please verify remote commits before finishing"
 morpheus notes -n 20
 ```
 
-`morpheus note --kind broadcast` is passive: it writes the shared context that
-agents can read later. `morpheus broadcast "..."` is active: it types into live
-iTerm sessions. By default it stages the message without pressing Enter; add
-`--submit` to send it immediately, and `--target <tab-or-mission-prefix>` to
-limit delivery.
+`morpheus note --kind broadcast` does both kinds of delivery: it writes the
+shared context and types the message into live iTerm sessions. Use `--stage` to
+type without pressing Enter, `--target <tab-or-mission-prefix>` to limit
+delivery, or `--context-only` for a passive note.
 
 Suggested `AGENTS.md` / `CLAUDE.md` snippet for repos you work on in parallel:
 

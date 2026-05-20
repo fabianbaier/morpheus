@@ -843,9 +843,8 @@ def _tab_id_for_session(session_id: str) -> Optional[str]:
     return None
 
 
-def _broadcast_payload(text: str, *, submit: bool, raw: bool = False) -> str:
-    body = text if raw else f"[morpheus broadcast] {text}"
-    return body + ("\n" if submit else "")
+def _broadcast_payload(text: str, *, submit: bool) -> str:
+    return f"[morpheus broadcast] {text}" + ("\n" if submit else "")
 
 
 def _resolve_broadcast_targets(
@@ -894,6 +893,16 @@ def _resolve_broadcast_targets(
     return targets, errors
 
 
+def _print_broadcast_targets(selected: list[db.Mission]) -> None:
+    table = Table(title="Broadcast targets", header_style="bold green")
+    table.add_column("tab", style="cyan")
+    table.add_column("state")
+    table.add_column("goal")
+    for mission in selected:
+        table.add_row(mission.tab_id.split("-")[0], mission.state or "unknown", mission.goal or "(untitled)")
+    console.print(table)
+
+
 @app.command()
 def context(
     fmt: str = typer.Option("md", "--format", "-f", help="md | json | short"),
@@ -935,8 +944,37 @@ def note(
                                        help="Attach to this tab_id (default: current iTerm session)."),
     kind: str = typer.Option("note", "--kind", "-k",
                               help="note | claim | broadcast"),
+    targets: Optional[list[str]] = typer.Option(
+        None,
+        "--target",
+        help="For broadcasts: target live tab/mission id or prefix. Repeat for multiple. Default: all live sessions except this one.",
+    ),
+    submit: bool = typer.Option(
+        True,
+        "--submit/--stage",
+        help="For broadcasts: press Enter in target sessions. Use --stage to type without submitting.",
+    ),
+    direct: bool = typer.Option(
+        True,
+        "--direct/--context-only",
+        help="For broadcasts: also type into live iTerm sessions. Use --context-only for passive context only.",
+    ),
+    include_self: bool = typer.Option(
+        False,
+        "--include-self",
+        help="For broadcasts: also send to the iTerm session running this command.",
+    ),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="For broadcasts: show target sessions without typing anything.",
+    ),
 ):
-    """Post a cross-session note that every other session can read in their context."""
+    """Post a cross-session note.
+
+    `--kind broadcast` records the note and also types it into live sessions
+    by default. Use `--context-only` to keep it passive.
+    """
     session_id = _current_iterm_session_id()
     tab_id = tab or (_tab_id_for_session(session_id) if session_id else None)
 
@@ -958,68 +996,26 @@ def note(
     marker = {"note": "•", "claim": "⚑", "broadcast": "📡"}.get(kind, "•")
     where = tab_id.split("-")[0] if tab_id else "unattached"
     console.print(f"[green]{marker} note #{nid}[/green] [dim]({where})[/dim]: {text}")
+    if kind != "broadcast" or not direct:
+        return
 
-
-@app.command()
-def broadcast(
-    text: str = typer.Argument(..., help="Message to type into target iTerm sessions."),
-    targets: Optional[list[str]] = typer.Option(
-        None,
-        "--target",
-        "-t",
-        help="Target live tab/mission id or prefix. Repeat for multiple. Default: all live Morpheus sessions except this one.",
-    ),
-    submit: bool = typer.Option(
-        False,
-        "--submit",
-        help="Append Enter so target agents receive the message immediately.",
-    ),
-    include_self: bool = typer.Option(
-        False,
-        "--include-self",
-        help="Also send to the iTerm session running this command.",
-    ),
-    raw: bool = typer.Option(
-        False,
-        "--raw",
-        help="Send text exactly as provided instead of adding the Morpheus prefix.",
-    ),
-    dry_run: bool = typer.Option(
-        False,
-        "--dry-run",
-        help="Show target sessions without typing anything.",
-    ),
-    record_note: bool = typer.Option(
-        True,
-        "--note/--no-note",
-        help="Also record a passive broadcast note in Morpheus context.",
-    ),
-):
-    """Directly type a broadcast into live iTerm sessions.
-
-    By default this stages the message without pressing Enter. Add --submit
-    when you want target agents to receive it immediately.
-    """
-    selected, errors = _resolve_broadcast_targets(targets, include_self=include_self)
+    selected, errors = _resolve_broadcast_targets(
+        targets,
+        include_self=include_self,
+        self_session_id=session_id,
+    )
     for error in errors:
         console.print(f"[yellow]{error}[/yellow]")
     if not selected:
-        console.print("[red]no target sessions found[/red]")
-        raise typer.Exit(1)
-
-    payload = _broadcast_payload(text, submit=submit, raw=raw)
-    table = Table(title="Direct broadcast targets", header_style="bold green")
-    table.add_column("tab", style="cyan")
-    table.add_column("state")
-    table.add_column("goal")
-    for mission in selected:
-        table.add_row(mission.tab_id.split("-")[0], mission.state or "unknown", mission.goal or "(untitled)")
-    console.print(table)
-
-    if dry_run:
-        console.print("[yellow]dry run:[/yellow] no text sent")
+        console.print("[yellow]broadcast note recorded, but no live target sessions were found[/yellow]")
         return
 
+    _print_broadcast_targets(selected)
+    if dry_run:
+        console.print("[yellow]dry run:[/yellow] broadcast note recorded, no text sent")
+        return
+
+    payload = _broadcast_payload(text, submit=submit)
     tab_ids = [mission.tab_id for mission in selected]
 
     async def _do(connection):
@@ -1028,29 +1024,19 @@ def broadcast(
     results = iterm_client.run(_do)
     ok = [result for result in results if result.ok]
     failed = [result for result in results if not result.ok]
-
     for result in failed:
         console.print(f"[red]failed[/red] {result.tab_id.split('-')[0]}: {result.error}")
 
-    if record_note and ok:
-        session_id = _current_iterm_session_id()
-        tab_id = _tab_id_for_session(session_id) if session_id else None
-        db.add_note(text=text, tab_id=tab_id, session_id=session_id, kind="broadcast")
-        ledger_mod.log_action(
-            "broadcast_direct",
-            tab_id=tab_id,
-            details={
-                "targets": [result.tab_id for result in ok],
-                "submit": submit,
-                "text": text[:160],
-            },
-        )
-        try:
-            ctx_mod.write_context_file()
-            ctx_mod.write_context_json()
-        except Exception:
-            pass
-
+    ledger_mod.log_action(
+        "broadcast_direct",
+        tab_id=tab_id,
+        details={
+            "note_id": nid,
+            "targets": [result.tab_id for result in ok],
+            "submit": submit,
+            "text": text[:160],
+        },
+    )
     mode = "submitted" if submit else "staged"
     console.print(f"[green]{mode} broadcast[/green] to {len(ok)}/{len(results)} session(s)")
     if failed:
