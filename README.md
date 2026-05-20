@@ -76,35 +76,78 @@ on your `PATH`, the target prints the exact `export PATH=...` line to add.
 
 ## Daily Use
 
-Run the cockpit:
+Morpheus is meant to be your **home tab** while many agent tabs run around it.
+Start here, watch what is happening, then jump into a real iTerm tab only when a
+session needs your hands.
+
+![Morpheus cockpit mockup with multiple sessions and agents](docs/images/morpheus-cockpit.svg)
+
+Start the cockpit from any worktree:
 
 ```bash
 morpheus
 ```
 
-Inside the cockpit, the left panel is a dense Matrix rain field made from active
-sessions: recent terminal output appears as bright falling shards inside a
-constant dim glyph stream, with selected and urgent sessions rendered more
-prominently. The mission table controls selection, and the right card
-prioritizes the selected mission's latest terminal output. Press `space` to
-expand or collapse the graph metadata, events, and artifacts underneath it. Use
-`j`/`k` or arrows to move, then press `b` for a cited graph/transcript brief,
-`e` to correct mission memory, or `r` to snapshot and resume the mission in a
-fresh tab. Press `Enter` to jump
-into the real iTerm tab when you need to respond directly. Use `n` to spawn a
-new session without leaving Morpheus. The bottom white-rabbit
-strip acts like a ticker: blocked prompts, collisions, spawns, notes,
-completed-session headlines, and ready-response headlines roll in there.
-Ready/completed headlines summarize the latest assistant answer block instead
-of blindly using the last terminal line, so Codex prompt chrome and separator
-rules do not become ticker text. The ticker renders newest-first, with the
-freshest item at the top. Press `l` to create a recurring prompt loop; loop
-outputs appear as ticker items and, when targeted, as graph events/artifacts for
-the selected mission. For PRD runs, parent rows appear in the mission table and
-coordinator/worker tabs nest underneath; press `w` on a PRD parent/coordinator
-to spawn a manually scoped worker. PRD parent rows are virtual run records, not
-extra iTerm tabs; pressing `d` on one archives that run and closes any live child
-tabs, while `p` prunes orphan parent rows that no longer have live children.
+### What You See
+
+The cockpit has four main areas:
+
+- **Left: live Matrix stream** - A rain view made from recent terminal output
+  across active sessions. The selected session and urgent sessions show up more
+  brightly.
+- **Middle: mission table** - The list of live tabs, PRD runs, coordinators,
+  workers, and loops. PRD runs appear as parent rows with child sessions nested
+  underneath.
+- **Right: mission card** - The selected session's latest useful output first,
+  then optional mission metadata, events, and artifacts.
+- **Bottom: ticker** - Newest-first headlines for spawns, blocked prompts,
+  collisions, notes, loop results, and ready/completed session summaries.
+
+### Normal Flow
+
+1. Open Morpheus and keep it as the cockpit tab.
+2. Press `n` to start a new agent session. Give it a goal and command, such as
+   `codex`.
+3. Watch the mission table and ticker. The newest useful events appear first.
+4. Move with `j`/`k` or the arrow keys.
+5. Press `Enter` when you want to jump into the real iTerm tab and respond.
+6. Return to Morpheus when you want the overview again.
+
+### PRD Runs
+
+If you start a session from a Markdown source file, Morpheus creates a PRD run:
+
+- The PRD run is a virtual parent row, not an extra iTerm tab.
+- The coordinator tab owns the plan and status.
+- Worker tabs sit under that parent so the work stays grouped.
+- Press `w` on a PRD parent or coordinator to spawn a manually scoped worker.
+- Press `d` on a PRD parent to archive the run and close live child tabs.
+- Press `p` to prune orphan parent rows with no live children.
+
+### Loops
+
+Press `l` to create a recurring prompt loop. Loops are useful for repeated
+checks such as "scan for new blockers every 30 minutes" or "summarize market
+catalysts." Loop results show up in the ticker, and targeted loops also attach
+events/artifacts to the selected mission.
+
+### Key Shortcuts
+
+| Key | Action |
+|---|---|
+| `j` / `k` or arrows | Move selection |
+| `Enter` | Focus the selected real iTerm tab |
+| `n` | New session |
+| `w` | New worker under a PRD run |
+| `l` | New recurring prompt loop |
+| `Shift+l` | Manage loops |
+| `b` | Brief the selected mission from graph + transcript |
+| `e` | Edit mission memory |
+| `space` | Expand/collapse mission card details |
+| `r` | Snapshot and resume in a fresh tab |
+| `/` | Add a note |
+| `d` | Kill/archive selected session or PRD run |
+| `p` | Prune stale/orphan rows |
 
 Core commands:
 

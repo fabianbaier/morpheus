@@ -1,0 +1,134 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1440" height="840" viewBox="0 0 1440 840" role="img" aria-labelledby="title desc">
+  <title id="title">Morpheus cockpit mockup with multiple agent sessions</title>
+  <desc id="desc">A Matrix-style terminal dashboard with live rain, mission table, mission card, and bottom event ticker.</desc>
+  <defs>
+    <linearGradient id="screen" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#050a05"/>
+      <stop offset="1" stop-color="#000000"/>
+    </linearGradient>
+    <filter id="glow" x="-40%" y="-40%" width="180%" height="180%">
+      <feGaussianBlur stdDeviation="2.5" result="blur"/>
+      <feMerge>
+        <feMergeNode in="blur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+    <style>
+      .bg { fill: url(#screen); }
+      .chrome { fill: #111415; stroke: #2d3436; stroke-width: 2; }
+      .tab { fill: #202729; stroke: #3a4346; stroke-width: 1.5; }
+      .active-tab { fill: #354044; stroke: #7a8588; stroke-width: 1.5; }
+      .green { fill: #71ff00; }
+      .muted { fill: #8a8a8a; }
+      .cyan { fill: #00d7ff; }
+      .yellow { fill: #ffd21f; }
+      .red { fill: #ff2f78; }
+      .panel { fill: #020302; stroke: #00a020; stroke-width: 2; }
+      .subpanel { fill: #050805; stroke: #d8d33f; stroke-width: 2; }
+      .row { fill: #71ff00; }
+      .bar { fill: #06466d; }
+      .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace; }
+      .label { font-size: 20px; font-weight: 700; }
+      .small { font-size: 16px; }
+      .tiny { font-size: 13px; }
+      .title { font-size: 86px; font-weight: 900; letter-spacing: 0; }
+      .rain { font-size: 17px; fill: #13d813; opacity: 0.72; }
+      .rain-dim { font-size: 16px; fill: #0a7a1c; opacity: 0.62; }
+      .rain-hot { font-size: 17px; fill: #d8ffd1; opacity: 0.95; }
+      .stroke-text { paint-order: stroke; stroke: #001b00; stroke-width: 4px; }
+    </style>
+  </defs>
+
+  <rect class="bg" width="1440" height="840"/>
+  <rect class="chrome" x="18" y="18" width="1404" height="46" rx="9"/>
+  <circle cx="44" cy="41" r="7" fill="#ff5f57"/>
+  <circle cx="68" cy="41" r="7" fill="#ffbd2e"/>
+  <circle cx="92" cy="41" r="7" fill="#28c840"/>
+  <rect class="tab active-tab" x="210" y="25" width="430" height="30" rx="15"/>
+  <rect class="tab" x="660" y="25" width="330" height="30" rx="15"/>
+  <rect class="tab" x="1008" y="25" width="330" height="30" rx="15"/>
+  <text class="mono small" x="380" y="46" fill="#ffffff">MORPHEUS dashboard</text>
+  <text class="mono tiny muted" x="742" y="45">auth-worker (codex)</text>
+  <text class="mono tiny muted" x="1082" y="45">payments-review (codex)</text>
+
+  <text class="mono title green stroke-text" x="435" y="155" filter="url(#glow)">MORPHEUS</text>
+  <text class="mono small muted" x="552" y="185">mission control v0.8.x - follow the white rabbit</text>
+
+  <rect class="panel" x="22" y="218" width="394" height="356" rx="4"/>
+  <rect class="panel" x="432" y="218" width="590" height="356" rx="4"/>
+  <rect class="panel" x="1038" y="218" width="380" height="356" rx="4"/>
+
+  <text class="mono label green" x="40" y="247">LIVE MATRIX</text>
+  <text class="mono rain-dim" x="40" y="286">リ 7 # ヤ       パ   ミモ       2  }     フ</text>
+  <text class="mono rain" x="40" y="318">コザ セション   auth parser  :: tests pass...</text>
+  <text class="mono rain-dim" x="40" y="350">  ネ    9    ツ        &amp;     ロ   ゼヤシボ</text>
+  <text class="mono rain-hot" x="40" y="382">● checkout worker :: editing src/payments.py</text>
+  <text class="mono rain-dim" x="40" y="414">カ   メ  4    ^   ナ     ゴ  エ  8ゲ   マ</text>
+  <text class="mono rain" x="40" y="446">● PRD coordinator :: next split: docs + tests</text>
+  <text class="mono rain-dim" x="40" y="478">ツ   ョ  ヲ   1  ロ   セヤジボ    パラ#7</text>
+  <text class="mono rain-dim" x="40" y="510">ネプルエ      ヨ        ス  メクスファト</text>
+  <text class="mono rain" x="40" y="542">● market loop :: summarized new catalysts</text>
+
+  <text class="mono label green" x="452" y="247">ID</text>
+  <text class="mono label green" x="500" y="247">ST</text>
+  <text class="mono label green" x="555" y="247">GOAL</text>
+  <text class="mono label green" x="850" y="247">AGE</text>
+  <text class="mono label green" x="918" y="247">LAST EVENT</text>
+  <rect class="row" x="444" y="274" width="560" height="27"/>
+  <text class="mono small" x="454" y="293" fill="#001700">PRD</text>
+  <text class="mono small" x="555" y="293" fill="#001700">morpheus v0.9 run</text>
+  <text class="mono small" x="850" y="293" fill="#001700">18m</text>
+  <text class="mono small" x="918" y="293" fill="#001700">coordinating workers</text>
+  <text class="mono small green" x="454" y="330">12</text>
+  <text class="mono small green" x="500" y="330">●</text>
+  <text class="mono small green" x="555" y="330">  ├ coordinator: PRD run</text>
+  <text class="mono small green" x="850" y="330">16m</text>
+  <text class="mono small green" x="918" y="330">ready summary</text>
+  <text class="mono small cyan" x="454" y="363">13</text>
+  <text class="mono small cyan" x="500" y="363">●</text>
+  <text class="mono small cyan" x="555" y="363">  ├ worker: auth tests</text>
+  <text class="mono small cyan" x="850" y="363">3m</text>
+  <text class="mono small cyan" x="918" y="363">active output</text>
+  <text class="mono small yellow" x="454" y="396">14</text>
+  <text class="mono small yellow" x="500" y="396">●</text>
+  <text class="mono small yellow" x="555" y="396">  └ worker: billing edge cases</text>
+  <text class="mono small yellow" x="850" y="396">9m</text>
+  <text class="mono small yellow" x="918" y="396">needs input</text>
+  <text class="mono small green" x="454" y="429">15</text>
+  <text class="mono small green" x="500" y="429">●</text>
+  <text class="mono small green" x="555" y="429">market scan loop</text>
+  <text class="mono small green" x="850" y="429">30m</text>
+  <text class="mono small green" x="918" y="429">next run due</text>
+  <rect class="bar" x="444" y="542" width="318" height="22"/>
+
+  <text class="mono label green" x="1058" y="247">MISSION CARD</text>
+  <text class="mono small" x="1058" y="278" fill="#ffffff">worker: billing edge cases</text>
+  <text class="mono small green" x="1058" y="324">tab 14 - blocked - testing</text>
+  <text class="mono label green" x="1058" y="376">LATEST OUTPUT</text>
+  <text class="mono small" x="1058" y="409" fill="#dddddd">Found a failing checkout retry path.</text>
+  <text class="mono small" x="1058" y="438" fill="#dddddd">Needs product decision: retry 3x or</text>
+  <text class="mono small" x="1058" y="467" fill="#dddddd">surface the payment error immediately.</text>
+  <line x1="1058" y1="505" x2="1390" y2="505" stroke="#e6e14b" stroke-width="2"/>
+  <text class="mono tiny muted" x="1058" y="535">space expands graph fields, events, artifacts</text>
+
+  <rect class="subpanel" x="22" y="600" width="1396" height="178" rx="4"/>
+  <text class="mono small cyan" x="44" y="632">09:42:31  new session [auth tests] 13</text>
+  <text class="mono small green" x="44" y="664">09:44:02  ready [coordinator] - Workers split into tests, docs, and billing.</text>
+  <text class="mono small red" x="44" y="696">09:45:10  blocked [billing edge cases] - needs retry policy decision.</text>
+  <text class="mono small cyan" x="44" y="728">09:46:22  loop [market scan] - AI infra names moved on earnings guidance.</text>
+
+  <text class="mono small" x="40" y="812" fill="#ff9f1c">j/k</text>
+  <text class="mono small muted" x="82" y="812">move</text>
+  <text class="mono small" x="150" y="812" fill="#ff9f1c">enter</text>
+  <text class="mono small muted" x="214" y="812">focus tab</text>
+  <text class="mono small" x="320" y="812" fill="#ff9f1c">n</text>
+  <text class="mono small muted" x="345" y="812">new</text>
+  <text class="mono small" x="405" y="812" fill="#ff9f1c">b</text>
+  <text class="mono small muted" x="430" y="812">brief</text>
+  <text class="mono small" x="500" y="812" fill="#ff9f1c">w</text>
+  <text class="mono small muted" x="525" y="812">worker</text>
+  <text class="mono small" x="615" y="812" fill="#ff9f1c">l</text>
+  <text class="mono small muted" x="640" y="812">loop</text>
+  <text class="mono small" x="700" y="812" fill="#ff9f1c">space</text>
+  <text class="mono small muted" x="765" y="812">details</text>
+</svg>
