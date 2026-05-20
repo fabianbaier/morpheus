@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| **Status** | v0.8.0a24 implemented (ticker noise reduction); cwd project tenancy planned; implementation in progress |
+| **Status** | v0.8.0a24 implemented (ticker noise reduction); cwd project tenancy implemented; next: 48-hour recall eval |
 | **Author** | Fabian Baier |
 | **Last updated** | 2026-05-20 |
 | **Target platform** | macOS + iTerm2 |
@@ -461,6 +461,11 @@ Implementation status:
 - 2026-05-20: Design accepted. Planned implementation is one shared DB with
   `project_tenants`, `tenant_id`, and `project_root` metadata plus tenant-scoped
   default filters in the dashboard, list, context, and graph surfaces.
+- 2026-05-20: Implementation ~60% complete. Tenant resolver, shared DB schema,
+  tick-time cwd assignment, CLI/list/context graph scoping, dashboard row/buffer
+  scoping, and focused tenant tests are in progress locally.
+- 2026-05-20: Implementation 100% complete locally. `make test` passed with
+  compileall, 86 unit tests, and `git diff --check`.
 
 ### 6.7 Prompt Loops
 

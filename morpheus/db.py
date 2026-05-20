@@ -58,6 +58,8 @@ CLAUDE_VALUE_OPTIONS = {
 class Mission:
     tab_id: str
     mission_id: str = ""
+    tenant_id: str = ""
+    project_root: str = ""
     session_id: str = ""
     goal: str = ""
     state: str = "unknown"
@@ -75,6 +77,8 @@ class Mission:
 @dataclass
 class MissionMemory:
     mission_id: str
+    tenant_id: str = ""
+    project_root: str = ""
     title: str = ""
     why: str = ""
     done_definition: str = ""
@@ -128,6 +132,17 @@ class MissionArtifact:
 
 
 @dataclass
+class ProjectTenant:
+    tenant_id: str
+    name: str
+    root_path: str
+    root_kind: str = "cwd"
+    created_at: float = field(default_factory=time.time)
+    last_seen_at: float = field(default_factory=time.time)
+    archived_at: Optional[float] = None
+
+
+@dataclass
 class MissionEdge:
     id: int
     from_id: str
@@ -170,9 +185,24 @@ class PromptLoopRun:
 
 
 _SCHEMA = """
+CREATE TABLE IF NOT EXISTS project_tenants (
+    tenant_id    TEXT PRIMARY KEY,
+    name         TEXT NOT NULL DEFAULT '',
+    root_path    TEXT NOT NULL DEFAULT '',
+    root_kind    TEXT NOT NULL DEFAULT 'cwd',
+    created_at   REAL NOT NULL,
+    last_seen_at REAL NOT NULL,
+    archived_at  REAL
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS project_tenants_root_idx ON project_tenants(root_path);
+CREATE INDEX IF NOT EXISTS project_tenants_seen_idx ON project_tenants(last_seen_at DESC);
+
 CREATE TABLE IF NOT EXISTS missions (
     tab_id            TEXT PRIMARY KEY,
     mission_id        TEXT NOT NULL DEFAULT '',
+    tenant_id         TEXT NOT NULL DEFAULT '',
+    project_root      TEXT NOT NULL DEFAULT '',
     session_id        TEXT NOT NULL DEFAULT '',
     goal              TEXT NOT NULL DEFAULT '',
     state             TEXT NOT NULL DEFAULT 'unknown',
@@ -192,6 +222,8 @@ CREATE INDEX IF NOT EXISTS missions_updated_idx ON missions(updated_at);
 
 CREATE TABLE IF NOT EXISTS mission_memory (
     mission_id          TEXT PRIMARY KEY,
+    tenant_id           TEXT NOT NULL DEFAULT '',
+    project_root        TEXT NOT NULL DEFAULT '',
     title               TEXT NOT NULL DEFAULT '',
     why                 TEXT NOT NULL DEFAULT '',
     done_definition     TEXT NOT NULL DEFAULT '',
@@ -334,6 +366,10 @@ def _connect() -> Iterator[sqlite3.Connection]:
 def _ensure_schema(conn: sqlite3.Connection) -> None:
     conn.executescript(_SCHEMA)
     _ensure_column(conn, "missions", "mission_id", "TEXT NOT NULL DEFAULT ''")
+    _ensure_column(conn, "missions", "tenant_id", "TEXT NOT NULL DEFAULT ''")
+    _ensure_column(conn, "missions", "project_root", "TEXT NOT NULL DEFAULT ''")
+    _ensure_column(conn, "mission_memory", "tenant_id", "TEXT NOT NULL DEFAULT ''")
+    _ensure_column(conn, "mission_memory", "project_root", "TEXT NOT NULL DEFAULT ''")
     _ensure_column(conn, "mission_memory", "agent_kind", "TEXT NOT NULL DEFAULT ''")
     _ensure_column(conn, "mission_memory", "resume_ref", "TEXT NOT NULL DEFAULT ''")
     _ensure_column(conn, "mission_memory", "resume_command", "TEXT NOT NULL DEFAULT ''")
@@ -341,6 +377,10 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
     _ensure_column(conn, "mission_memory", "last_tab_id", "TEXT NOT NULL DEFAULT ''")
     _ensure_column(conn, "mission_memory", "closed_at", "REAL NOT NULL DEFAULT 0")
     conn.execute("CREATE INDEX IF NOT EXISTS missions_mission_id_idx ON missions(mission_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS missions_tenant_idx ON missions(tenant_id, updated_at DESC)")
+    conn.execute("CREATE INDEX IF NOT EXISTS missions_project_root_idx ON missions(project_root)")
+    conn.execute("CREATE INDEX IF NOT EXISTS mission_memory_tenant_idx ON mission_memory(tenant_id, updated_at DESC)")
+    conn.execute("CREATE INDEX IF NOT EXISTS mission_memory_project_root_idx ON mission_memory(project_root)")
 
 
 def _ensure_column(conn: sqlite3.Connection, table: str, column: str, ddl: str) -> None:
@@ -570,6 +610,60 @@ def new_mission_id(now: Optional[float] = None) -> str:
     return _new_mission_id(now)
 
 
+def upsert_project_tenant(tenant: ProjectTenant) -> ProjectTenant:
+    now = time.time()
+    if not tenant.created_at:
+        tenant.created_at = now
+    tenant.last_seen_at = now
+    with _connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO project_tenants (
+                tenant_id, name, root_path, root_kind, created_at, last_seen_at, archived_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(tenant_id) DO UPDATE SET
+                name         = excluded.name,
+                root_path    = excluded.root_path,
+                root_kind    = excluded.root_kind,
+                last_seen_at = excluded.last_seen_at,
+                archived_at  = excluded.archived_at
+            """,
+            (
+                tenant.tenant_id,
+                tenant.name,
+                tenant.root_path,
+                tenant.root_kind,
+                tenant.created_at,
+                tenant.last_seen_at,
+                tenant.archived_at,
+            ),
+        )
+        row = conn.execute(
+            "SELECT * FROM project_tenants WHERE tenant_id = ?",
+            (tenant.tenant_id,),
+        ).fetchone()
+    return _row_to_project_tenant(row)
+
+
+def get_project_tenant(tenant_id: str) -> Optional[ProjectTenant]:
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM project_tenants WHERE tenant_id = ?",
+            (tenant_id,),
+        ).fetchone()
+    return _row_to_project_tenant(row) if row else None
+
+
+def all_project_tenants(include_archived: bool = False) -> list[ProjectTenant]:
+    query = "SELECT * FROM project_tenants"
+    if not include_archived:
+        query += " WHERE archived_at IS NULL"
+    query += " ORDER BY last_seen_at DESC, name ASC"
+    with _connect() as conn:
+        rows = conn.execute(query).fetchall()
+    return [_row_to_project_tenant(row) for row in rows]
+
+
 def _ensure_mission_identity(conn: sqlite3.Connection, mission: Mission) -> None:
     if mission.mission_id:
         return
@@ -588,11 +682,14 @@ def _ensure_memory_row(conn: sqlite3.Connection, mission: Mission, now: float) -
     cur = conn.execute(
         """
         INSERT OR IGNORE INTO mission_memory (
-            mission_id, title, source_kind, source_ref, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?)
+            mission_id, tenant_id, project_root, title, source_kind, source_ref,
+            created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             mission.mission_id,
+            mission.tenant_id,
+            mission.project_root,
             title,
             "imported",
             f"tab:{mission.tab_id}",
@@ -614,10 +711,39 @@ def _ensure_memory_row(conn: sqlite3.Connection, mission: Mission, now: float) -
         conn.execute(
             """
             UPDATE mission_memory
-               SET title = ?, updated_at = ?
+               SET title = ?,
+                   tenant_id = CASE WHEN ? != '' AND tenant_id = '' THEN ? ELSE tenant_id END,
+                   project_root = CASE WHEN ? != '' AND project_root = '' THEN ? ELSE project_root END,
+                   updated_at = ?
              WHERE mission_id = ? AND title = ''
             """,
-            (title, now, mission.mission_id),
+            (
+                title,
+                mission.tenant_id,
+                mission.tenant_id,
+                mission.project_root,
+                mission.project_root,
+                now,
+                mission.mission_id,
+            ),
+        )
+    if mission.tenant_id or mission.project_root:
+        conn.execute(
+            """
+            UPDATE mission_memory
+               SET tenant_id = CASE WHEN ? != '' THEN ? ELSE tenant_id END,
+                   project_root = CASE WHEN ? != '' THEN ? ELSE project_root END,
+                   updated_at = ?
+             WHERE mission_id = ?
+            """,
+            (
+                mission.tenant_id,
+                mission.tenant_id,
+                mission.project_root,
+                mission.project_root,
+                now,
+                mission.mission_id,
+            ),
         )
 
 
@@ -628,15 +754,18 @@ def upsert(mission: Mission) -> None:
         conn.execute(
             """
             INSERT INTO missions (
-                tab_id, mission_id, session_id, goal, state, last_event,
-                last_event_at, buffer_hash, buffer_changed_at, cmd, linked_pr,
-                linked_worktree, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                tab_id, mission_id, tenant_id, project_root, session_id, goal,
+                state, last_event, last_event_at, buffer_hash,
+                buffer_changed_at, cmd, linked_pr, linked_worktree,
+                created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(tab_id) DO UPDATE SET
                 mission_id        = CASE
                                       WHEN missions.mission_id = '' THEN excluded.mission_id
                                       ELSE missions.mission_id
                                     END,
+                tenant_id         = COALESCE(NULLIF(excluded.tenant_id, ''), missions.tenant_id),
+                project_root      = COALESCE(NULLIF(excluded.project_root, ''), missions.project_root),
                 session_id        = excluded.session_id,
                 goal              = COALESCE(NULLIF(excluded.goal, ''), missions.goal),
                 state             = excluded.state,
@@ -652,6 +781,8 @@ def upsert(mission: Mission) -> None:
             (
                 mission.tab_id,
                 mission.mission_id,
+                mission.tenant_id,
+                mission.project_root,
                 mission.session_id,
                 mission.goal,
                 mission.state,
@@ -667,11 +798,13 @@ def upsert(mission: Mission) -> None:
             ),
         )
         row = conn.execute(
-            "SELECT mission_id FROM missions WHERE tab_id = ?",
+            "SELECT * FROM missions WHERE tab_id = ?",
             (mission.tab_id,),
         ).fetchone()
         if row and row["mission_id"]:
             mission.mission_id = row["mission_id"]
+            mission.tenant_id = row["tenant_id"]
+            mission.project_root = row["project_root"]
         _ensure_memory_row(conn, mission, mission.updated_at)
         _persist_resume_metadata(conn, mission)
 
@@ -688,6 +821,8 @@ def update_mission_details(
     goal: str,
     linked_pr: Optional[int],
     linked_worktree: str,
+    tenant_id: str = "",
+    project_root: str = "",
 ) -> bool:
     """Update user-editable live attachment fields exactly as supplied."""
     now = time.time()
@@ -698,20 +833,57 @@ def update_mission_details(
                SET goal = ?,
                    linked_pr = ?,
                    linked_worktree = ?,
+                   tenant_id = CASE WHEN ? != '' THEN ? ELSE tenant_id END,
+                   project_root = CASE WHEN ? != '' THEN ? ELSE project_root END,
                    updated_at = ?
              WHERE tab_id = ?
             """,
-            (goal, linked_pr, linked_worktree, now, tab_id),
+            (
+                goal,
+                linked_pr,
+                linked_worktree,
+                tenant_id,
+                tenant_id,
+                project_root,
+                project_root,
+                now,
+                tab_id,
+            ),
         )
         row = conn.execute("SELECT * FROM missions WHERE tab_id = ?", (tab_id,)).fetchone()
         if row is not None:
-            _persist_resume_metadata(conn, _row_to_mission(row))
+            mission = _row_to_mission(row)
+            if mission.mission_id and (mission.tenant_id or mission.project_root):
+                conn.execute(
+                    """
+                    UPDATE mission_memory
+                       SET tenant_id = CASE WHEN ? != '' THEN ? ELSE tenant_id END,
+                           project_root = CASE WHEN ? != '' THEN ? ELSE project_root END,
+                           updated_at = ?
+                     WHERE mission_id = ?
+                    """,
+                    (
+                        mission.tenant_id,
+                        mission.tenant_id,
+                        mission.project_root,
+                        mission.project_root,
+                        now,
+                        mission.mission_id,
+                    ),
+                )
+            _persist_resume_metadata(conn, mission)
     return cur.rowcount > 0
 
 
-def all_missions() -> list[Mission]:
+def all_missions(tenant_id: Optional[str] = None) -> list[Mission]:
+    query = "SELECT * FROM missions"
+    params: list[Any] = []
+    if tenant_id:
+        query += " WHERE tenant_id = ?"
+        params.append(tenant_id)
+    query += " ORDER BY updated_at DESC"
     with _connect() as conn:
-        rows = conn.execute("SELECT * FROM missions ORDER BY updated_at DESC").fetchall()
+        rows = conn.execute(query, params).fetchall()
     return [_row_to_mission(r) for r in rows]
 
 
@@ -778,14 +950,17 @@ def upsert_memory(memory: MissionMemory) -> None:
         conn.execute(
             """
             INSERT INTO mission_memory (
-                mission_id, title, why, done_definition, acceptance_criteria,
-                current_plan, next_step, last_decision, last_summary,
-                blocked_on, phase, confidence, source_kind, source_ref,
-                epic_ref, issue_ref, last_verified_at, claimed_paths, topic,
-                agent_kind, resume_ref, resume_command, resume_confidence,
-                last_tab_id, closed_at, created_at, updated_at, archived_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                mission_id, tenant_id, project_root, title, why,
+                done_definition, acceptance_criteria, current_plan, next_step,
+                last_decision, last_summary, blocked_on, phase, confidence,
+                source_kind, source_ref, epic_ref, issue_ref, last_verified_at,
+                claimed_paths, topic, agent_kind, resume_ref, resume_command,
+                resume_confidence, last_tab_id, closed_at, created_at,
+                updated_at, archived_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(mission_id) DO UPDATE SET
+                tenant_id           = CASE WHEN excluded.tenant_id != '' THEN excluded.tenant_id ELSE mission_memory.tenant_id END,
+                project_root        = CASE WHEN excluded.project_root != '' THEN excluded.project_root ELSE mission_memory.project_root END,
                 title               = excluded.title,
                 why                 = excluded.why,
                 done_definition     = excluded.done_definition,
@@ -815,6 +990,8 @@ def upsert_memory(memory: MissionMemory) -> None:
             """,
             (
                 memory.mission_id,
+                memory.tenant_id,
+                memory.project_root,
                 memory.title,
                 memory.why,
                 memory.done_definition,
@@ -869,13 +1046,23 @@ def memory_for_tab(tab_id: str) -> Optional[MissionMemory]:
     return _row_to_memory(row) if row else None
 
 
-def all_memory(include_archived: bool = False) -> list[MissionMemory]:
+def all_memory(
+    include_archived: bool = False,
+    tenant_id: Optional[str] = None,
+) -> list[MissionMemory]:
     query = "SELECT * FROM mission_memory"
+    clauses: list[str] = []
+    params: list[Any] = []
     if not include_archived:
-        query += " WHERE archived_at IS NULL"
+        clauses.append("archived_at IS NULL")
+    if tenant_id:
+        clauses.append("tenant_id = ?")
+        params.append(tenant_id)
+    if clauses:
+        query += " WHERE " + " AND ".join(clauses)
     query += " ORDER BY updated_at DESC"
     with _connect() as conn:
-        rows = conn.execute(query).fetchall()
+        rows = conn.execute(query, params).fetchall()
     return [_row_to_memory(r) for r in rows]
 
 
@@ -1050,16 +1237,32 @@ def edges_to_id(node_id: str, relation: str = "", limit: int = 50) -> list[Missi
     return [_row_to_edge(r) for r in rows]
 
 
-def graph_counts() -> dict[str, int]:
+def graph_counts(tenant_id: Optional[str] = None) -> dict[str, int]:
+    mission_filter = " WHERE tenant_id = ?" if tenant_id else ""
+    memory_filter = " WHERE tenant_id = ?" if tenant_id else ""
+    active_filter = " WHERE archived_at IS NULL"
+    archived_filter = " WHERE archived_at IS NOT NULL"
+    if tenant_id:
+        active_filter += " AND tenant_id = ?"
+        archived_filter += " AND tenant_id = ?"
+    mission_params: tuple[Any, ...] = (tenant_id,) if tenant_id else ()
     with _connect() as conn:
         return {
-            "live_sessions": conn.execute("SELECT COUNT(*) AS n FROM missions").fetchone()["n"],
-            "missions": conn.execute("SELECT COUNT(*) AS n FROM mission_memory").fetchone()["n"],
+            "live_sessions": conn.execute(
+                f"SELECT COUNT(*) AS n FROM missions{mission_filter}",
+                mission_params,
+            ).fetchone()["n"],
+            "missions": conn.execute(
+                f"SELECT COUNT(*) AS n FROM mission_memory{memory_filter}",
+                mission_params,
+            ).fetchone()["n"],
             "active_missions": conn.execute(
-                "SELECT COUNT(*) AS n FROM mission_memory WHERE archived_at IS NULL"
+                f"SELECT COUNT(*) AS n FROM mission_memory{active_filter}",
+                mission_params,
             ).fetchone()["n"],
             "archived_missions": conn.execute(
-                "SELECT COUNT(*) AS n FROM mission_memory WHERE archived_at IS NOT NULL"
+                f"SELECT COUNT(*) AS n FROM mission_memory{archived_filter}",
+                mission_params,
             ).fetchone()["n"],
             "events": conn.execute("SELECT COUNT(*) AS n FROM mission_events").fetchone()["n"],
             "artifacts": conn.execute("SELECT COUNT(*) AS n FROM mission_artifacts").fetchone()["n"],
@@ -1093,11 +1296,24 @@ def add_note(
         return cur.lastrowid
 
 
-def recent_notes(limit: int = 20) -> list[Note]:
+def recent_notes(limit: int = 20, tenant_id: Optional[str] = None) -> list[Note]:
     with _connect() as conn:
-        rows = conn.execute(
-            "SELECT * FROM notes ORDER BY created_at DESC LIMIT ?", (limit,)
-        ).fetchall()
+        if tenant_id:
+            rows = conn.execute(
+                """
+                SELECT n.*
+                  FROM notes n
+                  LEFT JOIN missions m ON m.tab_id = n.tab_id
+                 WHERE n.tab_id IS NULL OR m.tenant_id = ?
+                 ORDER BY n.created_at DESC
+                 LIMIT ?
+                """,
+                (tenant_id, limit),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM notes ORDER BY created_at DESC LIMIT ?", (limit,)
+            ).fetchall()
     return [_row_to_note(r) for r in rows]
 
 
@@ -1441,10 +1657,24 @@ def _row_to_prompt_loop_run(row: sqlite3.Row) -> PromptLoopRun:
     )
 
 
+def _row_to_project_tenant(row: sqlite3.Row) -> ProjectTenant:
+    return ProjectTenant(
+        tenant_id=row["tenant_id"],
+        name=row["name"],
+        root_path=row["root_path"],
+        root_kind=row["root_kind"],
+        created_at=row["created_at"],
+        last_seen_at=row["last_seen_at"],
+        archived_at=row["archived_at"],
+    )
+
+
 def _row_to_mission(row: sqlite3.Row) -> Mission:
     return Mission(
         tab_id=row["tab_id"],
         mission_id=row["mission_id"],
+        tenant_id=row["tenant_id"],
+        project_root=row["project_root"],
         session_id=row["session_id"],
         goal=row["goal"],
         state=row["state"],
@@ -1463,6 +1693,8 @@ def _row_to_mission(row: sqlite3.Row) -> Mission:
 def _row_to_memory(row: sqlite3.Row) -> MissionMemory:
     return MissionMemory(
         mission_id=row["mission_id"],
+        tenant_id=row["tenant_id"],
+        project_root=row["project_root"],
         title=row["title"],
         why=row["why"],
         done_definition=row["done_definition"],

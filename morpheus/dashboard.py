@@ -41,6 +41,7 @@ from morpheus import core, db, iterm_client, mission_brief, naming, rain as rain
 from morpheus import ledger as ledger_mod
 from morpheus import loops as loops_mod
 from morpheus import prd_runs
+from morpheus import tenant as tenant_mod
 from morpheus import __version__
 
 # ── content / palette ─────────────────────────────────────────────────────
@@ -2120,8 +2121,11 @@ class MorpheusApp(App):
     }
     """
 
-    def __init__(self):
+    def __init__(self, project: Optional[db.ProjectTenant] = None, show_all: bool = False):
         super().__init__()
+        self.project = project
+        self.show_all = show_all
+        self.tenant_id = "" if show_all or project is None else project.tenant_id
         self.iterm_conn = None
         self.alerts: deque = deque(maxlen=12)
         self.flashing: dict[str, tuple[float, str]] = {}
@@ -2135,6 +2139,31 @@ class MorpheusApp(App):
         self._rain_backoff_until = 0.0
         self.log_handle = None
 
+    def _tenant_filter(self) -> Optional[str]:
+        return self.tenant_id or None
+
+    def _all_missions(self) -> list[db.Mission]:
+        tenant_id = self._tenant_filter()
+        if tenant_id:
+            return db.all_missions(tenant_id=tenant_id)
+        return db.all_missions()
+
+    def _all_memory(self, include_archived: bool = False) -> list[db.MissionMemory]:
+        tenant_id = self._tenant_filter()
+        if tenant_id:
+            return db.all_memory(include_archived=include_archived, tenant_id=tenant_id)
+        return db.all_memory(include_archived=include_archived)
+
+    def _recent_notes(self, limit: int) -> list[db.Note]:
+        tenant_id = self._tenant_filter()
+        if tenant_id:
+            return db.recent_notes(limit=limit, tenant_id=tenant_id)
+        return db.recent_notes(limit=limit)
+
+    def _mission_in_scope(self, mission: db.Mission) -> bool:
+        tenant_id = self._tenant_filter()
+        return not tenant_id or mission.tenant_id == tenant_id
+
     # ── compose ────────────────────────────────────────────────────────────
 
     def compose(self) -> ComposeResult:
@@ -2147,17 +2176,18 @@ class MorpheusApp(App):
         yield Footer()
 
     def _header_text(self, *, compact: bool) -> Text:
+        scope = "global" if self.show_all or self.project is None else self.project.name
         if compact:
             title = Text("MORPHEUS", style="bold bright_green", justify="center")
             sub = Text(
-                f"\nmission control v{__version__}  •  {RABBIT} follow the white rabbit",
+                f"\n{scope}  •  mission control v{__version__}  •  {RABBIT} follow the white rabbit",
                 style=COL_MUTED,
                 justify="center",
             )
             return title + sub
         banner = Text(BANNER, style="bold bright_green", justify="center")
         sub = Text(
-            f"\nmission control v{__version__}  •  {RABBIT} follow the white rabbit",
+            f"\n{scope}  •  mission control v{__version__}  •  {RABBIT} follow the white rabbit",
             style=COL_MUTED,
             justify="center",
         )
@@ -2186,12 +2216,12 @@ class MorpheusApp(App):
 
         # Watermarks so we don't replay existing notes/sessions as fresh alerts.
         try:
-            recent = db.recent_notes(limit=1)
+            recent = self._recent_notes(limit=1)
             self.last_seen_note_id = recent[0].id if recent else 0
         except Exception:
             pass
         try:
-            self.last_seen_tabs = {m.tab_id for m in db.all_missions()}
+            self.last_seen_tabs = {m.tab_id for m in self._all_missions()}
         except Exception:
             pass
 
@@ -2247,7 +2277,7 @@ class MorpheusApp(App):
                 ignored_tab_ids={self.self_tab_id} if self.self_tab_id else set(),
                 ignored_session_ids={self.self_session_id} if self.self_session_id else set(),
             )
-            missions = db.all_missions()
+            missions = self._all_missions()
             self.current_missions = missions
             self._scan_new_missions(missions)
             self._scan_new_notes()
@@ -2256,10 +2286,15 @@ class MorpheusApp(App):
 
     async def _on_alert(self, kind: str, mission, text: str) -> None:
         """v0.4 derived alerts (token guard, worktree collision)."""
+        if isinstance(mission, db.Mission) and not self._mission_in_scope(mission):
+            return
         alert_kind = "state" if kind.startswith("token") else "error"
         self._push_alert(Alert(time.time(), alert_kind, text))
 
     async def _on_tab_observed(self, tab: iterm_client.TabInfo, mission: db.Mission, detection) -> None:
+        if not self._mission_in_scope(mission):
+            self.live_buffers.pop(tab.tab_id, None)
+            return
         self.live_buffers[tab.tab_id] = LiveBuffer(
             tab_id=tab.tab_id,
             goal=mission.goal,
@@ -2307,7 +2342,7 @@ class MorpheusApp(App):
 
     def _refresh_table(self) -> None:
         try:
-            missions = db.all_missions()
+            missions = self._all_missions()
             prd_parents, prd_edges = self._prd_tree_context()
             closed_memories = self._closed_resumable_memories(missions)
         except Exception:
@@ -2326,7 +2361,7 @@ class MorpheusApp(App):
 
     def _closed_resumable_memories(self, missions: list[db.Mission]) -> list[db.MissionMemory]:
         live_ids = {mission.mission_id for mission in missions if mission.mission_id}
-        memories = db.all_memory(include_archived=True)
+        memories = self._all_memory(include_archived=True)
         return [
             memory for memory in memories
             if memory.archived_at is not None
@@ -2338,7 +2373,7 @@ class MorpheusApp(App):
 
     def _prd_tree_context(self) -> tuple[list[db.MissionMemory], list[db.MissionEdge]]:
         parents = [
-            mem for mem in db.all_memory()
+            mem for mem in self._all_memory()
             if mem.topic == "prd-run" or mem.source_kind == "prd"
         ]
         edges: list[db.MissionEdge] = []
@@ -2399,6 +2434,8 @@ class MorpheusApp(App):
     # ── change detection / alerts ──────────────────────────────────────────
 
     async def _on_state_change(self, mission: db.Mission, old: str, new: str) -> None:
+        if not self._mission_in_scope(mission):
+            return
         # Start a flash for this row.
         self.flashing[mission.tab_id] = (time.time() + FLASH_DURATION, new)
         if new == "finished":
@@ -2502,11 +2539,11 @@ class MorpheusApp(App):
         return bool(self.self_tab_id and tab_id == self.self_tab_id)
 
     def _scan_new_notes(self) -> None:
-        recent = db.recent_notes(limit=12)
+        recent = self._recent_notes(limit=12)
         fresh = [n for n in recent if n.id > self.last_seen_note_id]
         if not fresh:
             return
-        goals = {m.tab_id: (m.goal or "(untitled)") for m in db.all_missions()}
+        goals = {m.tab_id: (m.goal or "(untitled)") for m in self._all_missions()}
         for n in sorted(fresh, key=lambda n: n.created_at):
             goal = goals.get(n.tab_id or "", "unknown")
             marker = {"note": "•", "claim": "⚑", "broadcast": "📡", "loop": "↻"}.get(n.kind, "•")
@@ -2678,7 +2715,7 @@ class MorpheusApp(App):
         try:
             card = self.query_one(MissionCardWidget)
             card.toggle_details()
-            self._refresh_mission_card(db.all_missions())
+            self._refresh_mission_card(self._all_missions())
         except Exception:
             return
 
@@ -2850,6 +2887,7 @@ class MorpheusApp(App):
             return
         try:
             run = prd_runs.run_from_parent(result.parent_id)
+            project = tenant_mod.ensure_project_tenant(run.prd_path)
             cmd = prd_runs.worker_command(
                 result.command,
                 run,
@@ -2857,6 +2895,7 @@ class MorpheusApp(App):
                 scope=result.scope,
                 verification=result.verification,
             )
+            cmd = tenant_mod.command_in_project(cmd, project.root_path)
         except Exception as e:
             self._push_alert(Alert(time.time(), "error", f"worker spawn failed: {e}"))
             return
@@ -2873,10 +2912,12 @@ class MorpheusApp(App):
         mission = db.Mission(
             tab_id=info.tab_id,
             session_id=info.session_id,
+            tenant_id=project.tenant_id,
+            project_root=project.root_path,
             goal=result.goal,
             state="working",
             cmd=cmd,
-            linked_worktree=str(run.prd_path.parent) if run.prd_path else "",
+            linked_worktree=project.root_path,
             buffer_changed_at=now,
             last_event_at=now,
             created_at=now,
@@ -2919,14 +2960,17 @@ class MorpheusApp(App):
         if self.iterm_conn is None:
             return
         run = None
+        project = self.project or tenant_mod.ensure_project_tenant(Path.cwd())
         if result.prd_path:
             try:
                 run = prd_runs.create_prd_run(result.prd_path, title=goal or None)
+                project = tenant_mod.ensure_project_tenant(run.prd_path)
                 goal = f"{run.title} coordinator"
                 cmd = prd_runs.coordinator_command(cmd, run)
             except Exception as e:
                 self._push_alert(Alert(time.time(), "error", f"PRD run failed: {e}"))
                 return
+        cmd = tenant_mod.command_in_project(cmd, project.root_path)
         try:
             info = await iterm_client.spawn_tab(self.iterm_conn, command=cmd, goal=goal)
         except Exception as e:
@@ -2938,8 +2982,11 @@ class MorpheusApp(App):
         now = time.time()
         m = db.Mission(
             tab_id=info.tab_id, session_id=info.session_id,
+            tenant_id=project.tenant_id,
+            project_root=project.root_path,
             goal=goal or naming.infer_goal_from_cmd(cmd) or "(untitled)",
             state="working", cmd=cmd,
+            linked_worktree=project.root_path,
             buffer_changed_at=now, last_event_at=now, created_at=now,
         )
         db.upsert(m)
@@ -2950,7 +2997,7 @@ class MorpheusApp(App):
                 f"PRD run [{run.title}] coordinator spawned {info.tab_id.split('-')[0]}",
             ))
         try:
-            missions = db.all_missions()
+            missions = self._all_missions()
             self.current_missions = missions
             self._scan_new_missions(missions)
             self._refresh_table()
@@ -3019,12 +3066,22 @@ class MorpheusApp(App):
         memory.issue_ref = result.issue_ref
         memory.claimed_paths = result.claimed_paths
         memory.topic = result.topic
+        project = None
+        if result.linked_worktree:
+            try:
+                project = tenant_mod.ensure_project_tenant(result.linked_worktree)
+                memory.tenant_id = project.tenant_id
+                memory.project_root = project.root_path
+            except Exception:
+                project = None
         db.upsert_memory(memory)
         db.update_mission_details(
             result.tab_id,
             goal=result.goal,
             linked_pr=result.linked_pr,
             linked_worktree=result.linked_worktree,
+            tenant_id=project.tenant_id if project else "",
+            project_root=project.root_path if project else "",
         )
         db.add_event(
             result.mission_id,
@@ -3053,7 +3110,7 @@ class MorpheusApp(App):
             if edge.relation in {"coordinator", "worker"}
         }
         live_children = [
-            mission for mission in db.all_missions()
+            mission for mission in self._all_missions()
             if mission.mission_id and mission.mission_id in child_ids
         ]
         closed = 0
@@ -3074,7 +3131,7 @@ class MorpheusApp(App):
     def _prune_orphan_prd_runs(self, live_missions: list[db.Mission], now: float) -> int:
         live_mission_ids = {mission.mission_id for mission in live_missions if mission.mission_id}
         parents = [
-            memory for memory in db.all_memory()
+            memory for memory in self._all_memory()
             if memory.topic == "prd-run" or memory.source_kind == "prd"
         ]
         archived = 0
@@ -3139,7 +3196,7 @@ class MorpheusApp(App):
         stale_threshold = 4 * 3600
         live = await iterm_client.enumerate_tabs(self.iterm_conn)
         live_ids = {t.tab_id for t in live}
-        missions = db.all_missions()
+        missions = self._all_missions()
         candidates = []
         for m in missions:
             if m.tab_id not in live_ids:
@@ -3426,5 +3483,7 @@ class MorpheusApp(App):
 
 # ── public entry ──────────────────────────────────────────────────────────
 
-def run() -> None:
-    MorpheusApp().run()
+def run(show_all: bool = False) -> None:
+    tenant_mod.backfill_known_tenants()
+    project = None if show_all else tenant_mod.ensure_project_tenant(Path.cwd())
+    MorpheusApp(project=project, show_all=show_all).run()

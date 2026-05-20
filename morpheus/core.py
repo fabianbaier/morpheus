@@ -10,7 +10,7 @@ from pathlib import Path
 from morpheus import config as cfg_mod
 from morpheus import context as ctx_mod
 from morpheus import daemon as daemon_mod
-from morpheus import db, detect, iterm_client, naming
+from morpheus import db, detect, iterm_client, naming, tenant as tenant_mod
 
 LOG_DIR = Path.home() / ".morpheus"
 LOG_PATH = LOG_DIR / "morpheus.log"
@@ -94,6 +94,10 @@ async def _tick(connection, log: logging.Logger,
         # Worktree tracking from iTerm shell-integration `path` variable.
         if tab.cwd:
             prev.linked_worktree = tab.cwd
+            try:
+                tenant_mod.apply_to_mission(prev, tab.cwd)
+            except Exception:
+                log.debug("tenant resolution failed for %s cwd=%s", tab.tab_id, tab.cwd, exc_info=True)
             cwd_by_tab[tab.tab_id] = tab.cwd
 
         prev.state = new_state

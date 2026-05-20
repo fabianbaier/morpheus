@@ -130,9 +130,15 @@ class CoreTickTest(unittest.IsolatedAsyncioTestCase):
                 db.upsert(mission)
 
                 count = await core._tick(object(), FakeLogger())
+                live = db.get(mission.tab_id)
                 memory = db.get_memory(mission.mission_id)
 
         self.assertEqual(count, 1)
+        expected_root = str(Path("/tmp/work").resolve())
+        self.assertEqual(live.project_root, expected_root)
+        self.assertTrue(live.tenant_id.startswith("p_"))
+        self.assertEqual(memory.project_root, expected_root)
+        self.assertEqual(memory.tenant_id, live.tenant_id)
         self.assertEqual(memory.resume_ref, resume_id)
         self.assertEqual(memory.resume_confidence, "exact")
         self.assertIn(f"cd /tmp/work && codex --yolo resume {resume_id}", memory.resume_command)
