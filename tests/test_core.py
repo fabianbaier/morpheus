@@ -50,7 +50,7 @@ class CoreTest(unittest.TestCase):
                 "MORPHEUS\n"
                 "mission control v0.7.0a5 - follow the white rabbit\n"
                 "MISSION CARD\n"
-                "j k n new d kill p prune s snapshot / note r refresh q quit\n"
+                "j k n new d kill p prune s snapshot / note r resume q quit\n"
             ),
         )
 

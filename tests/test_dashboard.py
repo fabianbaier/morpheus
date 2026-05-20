@@ -1,6 +1,8 @@
 import asyncio
+import tempfile
 import unittest
 from contextlib import contextmanager
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -221,6 +223,10 @@ class DashboardTest(unittest.IsolatedAsyncioTestCase):
             '["src/a.py", "tests/test_a.py"]',
         )
         self.assertEqual(dashboard._display_claimed_paths(memory.claimed_paths), "src/old.py")
+
+    def test_resume_command_uses_agent_command_or_codex_fallback(self) -> None:
+        self.assertTrue(dashboard._resume_command("codex --yolo", "hello").startswith("codex --yolo "))
+        self.assertTrue(dashboard._resume_command("npm test", "hello").startswith("codex "))
 
     def test_session_headline_prefers_final_substantive_line(self) -> None:
         rendered = _session_headline(
@@ -669,6 +675,140 @@ class DashboardTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(captured["event"]["kind"], "mission_edit")
         self.assertEqual(captured["event"]["actor"], "user")
         self.assertEqual(captured["event"]["metadata"]["phase"], "planning")
+
+    async def test_resume_fresh_snapshots_spawns_links_and_archives_old(self) -> None:
+        app = DashboardHarness()
+        done = asyncio.Event()
+        captured = {"events": [], "edges": []}
+        mission = dashboard.db.Mission(
+            tab_id="tab-old",
+            session_id="session-old",
+            mission_id="m_old",
+            goal="resume this mission",
+            state="working",
+            cmd="codex",
+            linked_pr=224,
+            linked_worktree="/tmp/work",
+            last_event="needs fresh context",
+            buffer_changed_at=1,
+        )
+        memory = dashboard.db.MissionMemory(
+            mission_id=mission.mission_id,
+            title="Resume this mission",
+            why="avoid token blowup",
+            current_plan="snapshot then continue",
+            next_step="spawn fresh",
+            phase="testing",
+            source_kind="user",
+            source_ref="tab:tab-old",
+        )
+
+        async def fake_enumerate_tabs(connection):
+            return [SimpleNamespace(tab_id=mission.tab_id, buffer="old terminal buffer")]
+
+        async def fake_spawn_tab(connection, *, command, goal):
+            captured["spawn"] = {"connection": connection, "command": command, "goal": goal}
+            return SimpleNamespace(tab_id="tab-new", session_id="session-new")
+
+        async def fake_close_tab(connection, tab_id):
+            captured["closed"] = tab_id
+            return True
+
+        def fake_upsert(updated):
+            if updated.tab_id == "tab-new":
+                updated.mission_id = "m_new"
+                captured["new_mission"] = updated
+
+        def fake_upsert_memory(updated):
+            captured["new_memory"] = updated
+
+        def fake_add_artifact(mission_id, kind, path_or_url, status="unknown", summary=""):
+            captured["artifact"] = {
+                "mission_id": mission_id,
+                "kind": kind,
+                "path": path_or_url,
+                "summary": summary,
+            }
+            return 7
+
+        def fake_add_edge(from_id, to_id, relation, reason=""):
+            captured["edges"].append((from_id, to_id, relation, reason))
+            return 1
+
+        def fake_add_event(mission_id, kind, summary, actor="user", source_ref="", metadata=None):
+            captured["events"].append(
+                {
+                    "mission_id": mission_id,
+                    "kind": kind,
+                    "summary": summary,
+                    "actor": actor,
+                    "source_ref": source_ref,
+                    "metadata": metadata,
+                }
+            )
+            return len(captured["events"])
+
+        def fake_delete(tab_id):
+            captured["deleted"] = tab_id
+            done.set()
+
+        with tempfile.TemporaryDirectory() as tmpdir, isolated_dashboard_runtime([mission]), patch.object(
+            dashboard, "SNAPSHOT_DIR", new=Path(tmpdir)
+        ), patch.object(
+            dashboard.iterm_client, "enumerate_tabs", new=fake_enumerate_tabs
+        ), patch.object(
+            dashboard.iterm_client, "spawn_tab", new=fake_spawn_tab
+        ), patch.object(
+            dashboard.iterm_client, "close_tab", new=fake_close_tab
+        ), patch.object(
+            dashboard.db, "get", new=lambda tab_id: mission if tab_id == mission.tab_id else None
+        ), patch.object(
+            dashboard.db, "get_memory", new=lambda mission_id: memory if mission_id == memory.mission_id else None
+        ), patch.object(
+            dashboard.db, "recent_events", new=lambda mission_id, limit=5: []
+        ), patch.object(
+            dashboard.db, "artifacts_for_mission", new=lambda mission_id, limit=5: []
+        ), patch.object(
+            dashboard.db, "upsert", new=fake_upsert
+        ), patch.object(
+            dashboard.db, "upsert_memory", new=fake_upsert_memory
+        ), patch.object(
+            dashboard.db, "add_artifact", new=fake_add_artifact
+        ), patch.object(
+            dashboard.db, "add_edge", new=fake_add_edge
+        ), patch.object(
+            dashboard.db, "add_event", new=fake_add_event
+        ), patch.object(
+            dashboard.db, "delete", new=fake_delete
+        ), patch.object(
+            dashboard.ledger_mod, "log_action", new=lambda action, tab_id, details: captured.setdefault("ledger", (action, tab_id, details))
+        ), patch.object(
+            dashboard.ctx_mod, "write_context_file", new=lambda: None
+        ), patch.object(
+            dashboard.ctx_mod, "write_context_json", new=lambda: None
+        ):
+            async with app.run_test(size=(120, 40)) as pilot:
+                app._refresh_table()
+                await pilot.pause()
+                await pilot.press("r")
+                await asyncio.wait_for(done.wait(), timeout=1)
+
+            snapshot_path = Path(captured["artifact"]["path"])
+            self.assertTrue(snapshot_path.exists())
+            self.assertIn("old terminal buffer", snapshot_path.read_text())
+            self.assertIn("Snapshot file:", captured["spawn"]["command"])
+            self.assertIn(str(snapshot_path), captured["spawn"]["command"])
+            self.assertEqual(captured["spawn"]["goal"], "resume this mission")
+            self.assertEqual(captured["new_mission"].linked_pr, 224)
+            self.assertEqual(captured["new_mission"].linked_worktree, "/tmp/work")
+            self.assertEqual(captured["new_memory"].mission_id, "m_new")
+            self.assertEqual(captured["new_memory"].source_kind, "snapshot")
+            self.assertEqual(captured["new_memory"].source_ref, str(snapshot_path))
+            self.assertEqual(captured["edges"][0][0:3], ("m_new", "m_old", "spawned_from"))
+            self.assertEqual(captured["closed"], "tab-old")
+            self.assertEqual(captured["deleted"], "tab-old")
+            self.assertEqual(captured["ledger"][0], "resume_fresh")
+            self.assertTrue(captured["ledger"][2]["closed_old_tab"])
 
     async def test_new_session_submit_spawns_tab_and_records_mission(self) -> None:
         app = DashboardHarness()

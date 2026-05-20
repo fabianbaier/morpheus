@@ -75,8 +75,9 @@ rain, with selected and urgent sessions rendered more prominently. The mission
 table controls selection, and the right card shows the selected mission's graph
 memory plus the latest terminal tail. Use `j`/`k` or arrows to move, then press
 `b` for a cited graph/transcript brief, `e` to correct mission memory, or
-`Enter` to jump into the real iTerm tab when you need to respond directly. Use
-`n` to spawn a new session without leaving Morpheus. The bottom white-rabbit
+`r` to snapshot and resume the mission in a fresh tab. Press `Enter` to jump
+into the real iTerm tab when you need to respond directly. Use `n` to spawn a
+new session without leaving Morpheus. The bottom white-rabbit
 strip acts like a ticker: blocked prompts, collisions, spawns, notes,
 completed-session headlines, and ready-response headlines roll in there.
 Ready/completed headlines summarize the latest assistant answer block instead
@@ -268,9 +269,9 @@ make daemon
 
 ## Roadmap
 
-Current status: v0.8.0a8 has PRD Runs foundation, PRD tree/manual workers,
+Current status: v0.8.0a9 has PRD Runs foundation, PRD tree/manual workers,
 newest-first ready tickers, prompt loops foundation, nonblocking/Markdown PRD
-picker, edit mission flow, and selected mission briefs.
+picker, edit mission flow, selected mission briefs, and resume-fresh.
 
 Next implementation phases:
 
@@ -291,6 +292,7 @@ Next implementation phases:
 15. Edit mission flow for why/plan/next/provenance/proof fields. Done in `0.8.0a8`.
 16. `b` brief-selected using mission graph plus transcript tail. Done in `0.8.0a8`.
 17. Resume-fresh flow that snapshots, archives old attachment, and spawns a new
-   session linked by a `spawned_from` edge.
+   session linked by a `spawned_from` edge. Done in `0.8.0a9`.
+18. MCP mission graph update tools.
 
 > "I can only show you the door. You're the one that has to walk through it."

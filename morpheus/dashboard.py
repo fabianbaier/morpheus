@@ -21,6 +21,7 @@ import asyncio
 import json
 import random
 import re
+import shlex
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -98,6 +99,7 @@ FLASH_BG = {
     "unknown":  "color(238)",
 }
 FLASH_DURATION = 3.0  # seconds
+SNAPSHOT_DIR = Path.home() / ".morpheus" / "snapshots"
 
 # Sort order for the missions table when there are no flashes pulling
 # things up — newest activity first.
@@ -876,6 +878,134 @@ def _join_nonempty(*parts: str) -> str:
     return " ".join(part for part in parts if part).strip() or "unset"
 
 
+def _snapshot_markdown(
+    mission: db.Mission,
+    *,
+    buffer: str,
+    ts: str,
+    memory: Optional[db.MissionMemory] = None,
+) -> str:
+    lines = [
+        f"# Morpheus snapshot - {ts}",
+        "",
+        f"- **Tab**: `{mission.tab_id}`",
+        f"- **Mission**: `{mission.mission_id or 'unset'}`",
+        f"- **Goal**: {mission.goal or '(untitled)'}",
+        f"- **State**: {mission.state}",
+        f"- **Last event**: {mission.last_event}",
+        f"- **Cmd**: `{mission.cmd or '?'}`",
+    ]
+    if mission.linked_worktree:
+        lines.append(f"- **Worktree**: `{mission.linked_worktree}`")
+    if mission.linked_pr:
+        lines.append(f"- **PR**: #{mission.linked_pr}")
+    if memory is not None:
+        lines.extend(
+            [
+                "",
+                "## Mission Card",
+                "",
+                f"- **Title**: {memory.title or mission.goal or '(untitled)'}",
+                f"- **Why**: {memory.why or 'unset'}",
+                f"- **Done**: {memory.done_definition or 'unset'}",
+                f"- **Criteria**: {memory.acceptance_criteria or 'unset'}",
+                f"- **Plan**: {memory.current_plan or 'unset'}",
+                f"- **Next**: {memory.next_step or 'unset'}",
+                f"- **Blocked**: {memory.blocked_on or 'unset'}",
+                f"- **Phase**: {memory.phase or 'unset'}",
+                f"- **Source**: {_join_nonempty(memory.source_kind, memory.source_ref)}",
+            ]
+        )
+    lines.extend(["", "## Buffer", "", "```", buffer, "```", ""])
+    return "\n".join(lines)
+
+
+def _write_snapshot_file(
+    mission: db.Mission,
+    *,
+    buffer: str,
+    memory: Optional[db.MissionMemory] = None,
+) -> Path:
+    ts = time.strftime("%Y-%m-%dT%H-%M-%S")
+    SNAPSHOT_DIR.mkdir(parents=True, exist_ok=True)
+    out_path = SNAPSHOT_DIR / f"{ts}-{mission.tab_id.split('-')[0]}.md"
+    out_path.write_text(
+        _snapshot_markdown(mission, buffer=buffer, ts=ts, memory=memory)
+    )
+    return out_path
+
+
+def _resume_base_command(cmd: str) -> str:
+    try:
+        parts = shlex.split(cmd or "")
+    except ValueError:
+        parts = []
+    if parts and Path(parts[0]).name in {"codex", "claude", "opencode", "aider"}:
+        return " ".join(shlex.quote(part) for part in parts)
+    return "codex"
+
+
+def _resume_command(base_cmd: str, prompt: str) -> str:
+    return f"{_resume_base_command(base_cmd)} {shlex.quote(prompt)}"
+
+
+def _resume_prompt(
+    mission: db.Mission,
+    *,
+    snapshot_path: Path,
+    brief: str,
+) -> str:
+    return (
+        "You are resuming a Morpheus mission in a fresh terminal session.\n\n"
+        f"Original mission id: {mission.mission_id or 'unset'}\n"
+        f"Original tab id: {mission.tab_id}\n"
+        f"Goal: {mission.goal or '(untitled)'}\n"
+        f"Snapshot file: {snapshot_path}\n\n"
+        "Mission brief:\n"
+        f"{brief}\n"
+        "First read the snapshot file, then restate the current plan and next "
+        "step before editing. Preserve unrelated changes and coordinate through "
+        "Morpheus events/artifacts when you discover new proof or blockers."
+    )
+
+
+def _memory_for_resumed_mission(
+    old_mission: db.Mission,
+    *,
+    new_mission_id: str,
+    snapshot_path: Path,
+    old_memory: Optional[db.MissionMemory],
+) -> db.MissionMemory:
+    if old_memory is None:
+        return db.MissionMemory(
+            mission_id=new_mission_id,
+            title=old_mission.goal,
+            source_kind="snapshot",
+            source_ref=str(snapshot_path),
+        )
+    return db.MissionMemory(
+        mission_id=new_mission_id,
+        title=old_memory.title,
+        why=old_memory.why,
+        done_definition=old_memory.done_definition,
+        acceptance_criteria=old_memory.acceptance_criteria,
+        current_plan=old_memory.current_plan,
+        next_step=old_memory.next_step,
+        last_decision=old_memory.last_decision,
+        last_summary=old_memory.last_summary,
+        blocked_on=old_memory.blocked_on,
+        phase=old_memory.phase if old_memory.phase != "archived" else "planning",
+        confidence=old_memory.confidence,
+        source_kind="snapshot",
+        source_ref=str(snapshot_path),
+        epic_ref=old_memory.epic_ref,
+        issue_ref=old_memory.issue_ref,
+        last_verified_at=old_memory.last_verified_at,
+        claimed_paths=old_memory.claimed_paths,
+        topic=old_memory.topic,
+    )
+
+
 # ── modal: spawn new session ──────────────────────────────────────────────
 
 class NewSessionScreen(ModalScreen[Optional[NewSessionRequest]]):
@@ -1518,7 +1648,8 @@ FOOTER_BINDINGS = [
     Binding("slash", "post_note", "note"),
     Binding("l", "new_loop", "loop"),
     Binding("w", "new_worker", "worker"),
-    Binding("r", "refresh_now", "refresh"),
+    Binding("r", "resume_fresh", "resume"),
+    Binding("ctrl+r", "refresh_now", "refresh", show=False),
     Binding("q", "quit", "quit"),
     Binding("ctrl+c", "quit", "quit", show=False),
 ]
@@ -2377,7 +2508,6 @@ class MorpheusApp(App):
     async def action_snapshot_session(self) -> None:
         if self.iterm_conn is None:
             return
-        from pathlib import Path
         table = self.query_one(MissionsTable)
         tab_id = table.selected_tab_id()
         if not tab_id:
@@ -2387,20 +2517,8 @@ class MorpheusApp(App):
         if tab is None:
             return
         m = db.get(tab_id) or db.Mission(tab_id=tab_id)
-        ts = time.strftime("%Y-%m-%dT%H-%M-%S")
-        snap_dir = Path.home() / ".morpheus" / "snapshots"
-        snap_dir.mkdir(parents=True, exist_ok=True)
-        out_path = snap_dir / f"{ts}-{tab_id.split('-')[0]}.md"
-        body = (
-            f"# Morpheus snapshot — {ts}\n\n"
-            f"- **Tab**: `{tab_id}`\n"
-            f"- **Goal**: {m.goal or '(untitled)'}\n"
-            f"- **State**: {m.state}\n"
-            f"- **Last event**: {m.last_event}\n"
-            f"- **Cmd**: `{m.cmd or '?'}`\n\n"
-            f"## Buffer\n\n```\n{tab.buffer}\n```\n"
-        )
-        out_path.write_text(body)
+        memory = db.get_memory(m.mission_id) if m.mission_id else None
+        out_path = _write_snapshot_file(m, buffer=tab.buffer, memory=memory)
         if m.mission_id:
             db.add_artifact(
                 m.mission_id,
@@ -2413,6 +2531,126 @@ class MorpheusApp(App):
             time.time(), "spawn",
             f"snapshot → {out_path.name}",
         ))
+
+    async def action_resume_fresh(self) -> None:
+        if self.iterm_conn is None:
+            return
+        table = self.query_one(MissionsTable)
+        old_tab_id = table.selected_tab_id()
+        if not old_tab_id:
+            self._push_alert(Alert(time.time(), "error", "no live mission selected to resume"))
+            return
+        live = await iterm_client.enumerate_tabs(self.iterm_conn)
+        old_tab = next((t for t in live if t.tab_id == old_tab_id), None)
+        if old_tab is None:
+            self._push_alert(Alert(time.time(), "error", f"tab [{old_tab_id.split('-')[0]}] not found"))
+            return
+
+        old_mission = db.get(old_tab_id) or db.Mission(tab_id=old_tab_id)
+        if not old_mission.mission_id:
+            db.upsert(old_mission)
+            old_mission = db.get(old_tab_id) or old_mission
+        old_memory = db.get_memory(old_mission.mission_id) if old_mission.mission_id else None
+        snapshot_path = _write_snapshot_file(old_mission, buffer=old_tab.buffer, memory=old_memory)
+        if old_mission.mission_id:
+            db.add_artifact(
+                old_mission.mission_id,
+                kind="snapshot",
+                path_or_url=str(snapshot_path),
+                status="unknown",
+                summary=f"Resume snapshot for {old_mission.goal or old_tab_id}",
+            )
+
+        brief = mission_brief.build_selected_brief(
+            old_mission,
+            memory=old_memory,
+            events=db.recent_events(old_mission.mission_id, limit=5) if old_mission.mission_id else [],
+            artifacts=db.artifacts_for_mission(old_mission.mission_id, limit=5) if old_mission.mission_id else [],
+            transcript=old_tab.buffer,
+        )
+        prompt = _resume_prompt(old_mission, snapshot_path=snapshot_path, brief=brief.body)
+        cmd = _resume_command(old_mission.cmd, prompt)
+        goal = old_mission.goal or naming.infer_goal_from_cmd(old_mission.cmd) or "resumed mission"
+        try:
+            info = await iterm_client.spawn_tab(self.iterm_conn, command=cmd, goal=goal)
+        except Exception as e:
+            self._push_alert(Alert(time.time(), "error", f"resume failed: {e}"))
+            return
+        if info is None:
+            self._push_alert(Alert(time.time(), "error", "resume failed — is iTerm focused?"))
+            return
+
+        now = time.time()
+        new_mission = db.Mission(
+            tab_id=info.tab_id,
+            session_id=info.session_id,
+            goal=goal,
+            state="working",
+            cmd=cmd,
+            linked_pr=old_mission.linked_pr,
+            linked_worktree=old_mission.linked_worktree,
+            buffer_changed_at=now,
+            last_event_at=now,
+            created_at=now,
+        )
+        db.upsert(new_mission)
+        new_memory = _memory_for_resumed_mission(
+            old_mission,
+            new_mission_id=new_mission.mission_id,
+            snapshot_path=snapshot_path,
+            old_memory=old_memory,
+        )
+        db.upsert_memory(new_memory)
+        if old_mission.mission_id and new_mission.mission_id:
+            db.add_edge(
+                new_mission.mission_id,
+                old_mission.mission_id,
+                relation="spawned_from",
+                reason=f"Fresh resume from {snapshot_path}",
+            )
+            db.add_event(
+                old_mission.mission_id,
+                kind="resume",
+                actor="morpheus",
+                summary=f"Fresh session spawned: {info.tab_id.split('-')[0]}",
+                source_ref=str(snapshot_path),
+                metadata={"new_mission_id": new_mission.mission_id, "new_tab_id": info.tab_id},
+            )
+            db.add_event(
+                new_mission.mission_id,
+                kind="resume",
+                actor="morpheus",
+                summary=f"Resumed from {old_mission.mission_id}",
+                source_ref=str(snapshot_path),
+                metadata={"old_mission_id": old_mission.mission_id, "old_tab_id": old_tab_id},
+            )
+
+        closed_old = await iterm_client.close_tab(self.iterm_conn, old_tab_id)
+        if closed_old:
+            db.delete(old_tab_id)
+        ledger_mod.log_action(
+            "resume_fresh",
+            tab_id=old_tab_id,
+            details={
+                "old_mission_id": old_mission.mission_id,
+                "new_mission_id": new_mission.mission_id,
+                "new_tab_id": info.tab_id,
+                "snapshot_path": str(snapshot_path),
+                "closed_old_tab": closed_old,
+            },
+        )
+        try:
+            ctx_mod.write_context_file()
+            ctx_mod.write_context_json()
+        except Exception:
+            pass
+        status = "resumed" if closed_old else "resumed; old tab still open"
+        self._push_alert(Alert(
+            time.time(),
+            "spawn",
+            f"{status} [{goal}] → {info.tab_id.split('-')[0]}",
+        ))
+        self._refresh_table()
 
     def action_post_note(self) -> None:
         table = self.query_one(MissionsTable)
