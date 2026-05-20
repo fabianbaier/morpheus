@@ -256,6 +256,41 @@ The cockpit answers three questions faster than tab switching can:
   age, and snapshot location.
 - **What can I do next?** Every common action is a keybinding, not a ceremony.
 
+### 6.1.1 Live cockpit stream requirements
+
+Morpheus must behave like the place the user stays while many agents run, not a
+static mission registry. The Matrix visual language is only successful when it
+carries operational signal.
+
+Required live-stream behavior:
+
+- The Matrix rain surface shows **real terminal output tails** from active
+  sessions, not only decorative rain or metadata.
+- The stream mix is relevance-ranked: selected session first, then blocked /
+  crashed / working / recently active sessions.
+- Matrix texture appears **between** session streams so the UI feels like a
+  unified live field while still exposing actual agent activity.
+- Web searches, tool progress, intermediate summaries, final responses, build
+  output, prompts, and errors must appear in Morpheus quickly enough that the
+  user can understand what is happening without switching tabs.
+- The mission card and selected live stream must stay coupled: moving selection
+  updates the card and the visible transcript tail for that same session.
+- The right-side mission card may summarize or overlay durable intent, but it
+  must never replace the raw recent terminal tail. If the card is stale or
+  unset, the transcript tail still gives the user immediate situational
+  awareness.
+- The expected flow is: stay in the Morpheus tab, watch live streams, move with
+  `j`/`k` or arrows, press `Enter` only when direct interaction with the real
+  iTerm tab is needed, then return to Morpheus.
+- Future owned-PTY support must preserve the same contract: Morpheus is the
+  live observation and control surface; per-session shells remain instantly
+  attachable.
+
+Acceptance test: start a Codex session that performs a web search, keep focus
+in Morpheus, and verify the cockpit shows the search/tool progress and latest
+response tail in the live stream or selected card before pressing `Enter` to
+attach.
+
 ### 6.2 Keyboard and function map
 
 | Key | Function | Required behavior |
@@ -604,7 +639,7 @@ This table is the source of truth for where the product stands right now.
 | Provenance model | Foundation implemented | Graph fields store source kind/ref and confidence; UI trust treatment still pending |
 | Loop phase / proof tracking | Foundation implemented | `phase`, `last_verified_at`, events, artifacts exist; selected cockpit card now displays phase/events/artifacts |
 | Mission card panel | Implemented in v0.7.0a2 | Right-side Textual card shows selected mission graph fields, events, artifacts, unset memory gaps |
-| Live session streams | Implemented in v0.7.0a3 | Left panel now renders real terminal tails from selected/recent sessions with Matrix separators |
+| Live session streams | Implemented in v0.7.0a3 | Left panel now renders real terminal tails from selected/relevant sessions with Matrix separators; PRD now requires live tool/search progress and latest response tails to be visible from Morpheus before attaching |
 | Edit mission flow | Not implemented | `e` opens goal/why/plan/next/criteria/source/proof editor |
 | Brief selected | Not implemented | `b` renders a cited why/status/next card from graph + transcript tail |
 | Resume fresh | Not implemented | `r` snapshots, archives old attachment, spawns replacement with mission context |
