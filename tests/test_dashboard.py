@@ -690,10 +690,14 @@ class DashboardTest(unittest.IsolatedAsyncioTestCase):
                 await pilot.pause()
 
                 legend = app.screen.query_one("#project_legend", dashboard.Static).content
+                actions = app.screen.query_one("#project_actions", dashboard.Static).content
 
         self.assertIn("p prune empty", str(legend))
         self.assertIn("d delete stored graph", str(legend))
         self.assertIn("n nuke active", str(legend))
+        self.assertIn("Enter select", str(actions))
+        self.assertIn("d delete graph", str(actions))
+        self.assertIn("n nuke active", str(actions))
 
     async def test_project_nuke_closes_live_tabs_and_purges_project(self) -> None:
         project = dashboard.db.ProjectTenant(
@@ -2230,9 +2234,12 @@ class DashboardTest(unittest.IsolatedAsyncioTestCase):
 
                 self.assertIsInstance(app.screen, LoopManagerScreen)
                 detail = app.screen._detail(loop)
+                actions = app.screen.query_one("#loop_actions", dashboard.Static).content
                 self.assertIn("market scan", str(detail))
                 self.assertIn("recent runs (1 total", str(detail))
                 self.assertIn("WMT disciplined zone", str(detail))
+                self.assertIn("r run now", str(actions))
+                self.assertIn("d delete", str(actions))
 
     async def test_uppercase_loop_key_opens_manager(self) -> None:
         app = DashboardHarness()

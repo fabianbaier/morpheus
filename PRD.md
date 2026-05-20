@@ -379,7 +379,8 @@ The CLI remains the scriptable surface for the same mission model:
 | `morpheus ledger costs/actions` | Inspect cost and action ledgers |
 | `morpheus run find-prds [root]` | List Markdown source candidates in a worktree |
 | `morpheus run start <prd> [--cmd codex]` | Create a PRD parent mission, spawn one coordinator tab, and link it |
-| `morpheus loops add/list/run/run-due/pause/resume` | Configure recurring prompt loops and execute due loops from cron/launchd |
+| `morpheus loops add/list/run/run-due/pause/resume` | Configure recurring prompt loops and execute due loops |
+| `morpheus install-loop-runner / uninstall-loop-runner / loop-runner-status` | Install, remove, and inspect the launchd runner that wakes to execute due loops |
 | `morpheus mcp serve` | Expose Morpheus state to agent tools |
 | `morpheus doctor` | Diagnose iTerm2 + Python API connectivity |
 
@@ -504,10 +505,11 @@ Implementation status:
 
 ### 6.7 Prompt Loops
 
-Prompt loops are recurring prompts that behave like small cron-fed sensors or
+Prompt loops are recurring prompts that behave like small launchd-fed sensors or
 workers. They are not always-on agents. Morpheus stores their schedule, target,
-run history, output artifacts, and ticker summaries; launchd/cron should call
-`morpheus loops run-due` to execute due loops.
+run history, output artifacts, and ticker summaries; the loop runner LaunchAgent
+or another cron/launchd entry should call `morpheus loops run-due` to execute
+due loops.
 
 Required behavior:
 
@@ -535,8 +537,16 @@ Required behavior:
   `context.md`/`context.json`, linked to the target mission, and summarized in
   the rabbit ticker newest-first.
 - The dashboard must not synchronously execute due loops. Long-running Codex or
-  Claude calls belong in `morpheus loops run-due` invoked by launchd/cron or run
-  manually, or in the cockpit's nonblocking one-shot runner.
+  Claude calls belong in `morpheus loops run-due` invoked by the loop runner,
+  launchd/cron, or run manually, or in the cockpit's nonblocking one-shot
+  runner.
+- `morpheus install-loop-runner` writes a separate LaunchAgent from the watcher:
+  `com.morpheus.loop-runner` runs `morpheus loops run-due` on a fixed interval,
+  logs to `~/.morpheus/loop-runner.log`, and records a wake beacon used by
+  `morpheus loop-runner-status`.
+- The built-in Codex loop command includes `--skip-git-repo-check` because
+  launchd runs without an interactive trust prompt; legacy loops stored as plain
+  `codex exec` are normalized at execution time.
 - Minimum interval is 60 seconds to avoid accidental runaway spend.
 
 Implemented cockpit controls:
@@ -790,7 +800,7 @@ untrusted hints, not as durable truth.
 | `name` | TEXT | Human-readable loop label |
 | `prompt` | TEXT | Prompt passed to command |
 | `interval_seconds` | REAL | Stored interval; minimum 60s |
-| `command` | TEXT | Command prefix/template, e.g. `codex exec` or `claude -p {prompt}` |
+| `command` | TEXT | Command prefix/template, e.g. `codex exec --skip-git-repo-check` or `claude -p {prompt}` |
 | `tenant_id` | TEXT | Owning project tenant for dashboard visibility and cleanup |
 | `project_root` | TEXT | Owning project root path |
 | `target_mission_id` | TEXT | Optional mission to receive events/artifacts |
@@ -899,6 +909,7 @@ This table is the source of truth for where the product stands right now.
 | Prompt loop cockpit editing/history | Implemented in v0.8.0a28 | The loop manager shows run counts and recent run history, explains when no runner has executed yet, edits name/prompt/interval/command in-cockpit, and backfills legacy targeted loops into their project tenant |
 | Loop row inspect/edit UX | Implemented in v0.8.0a29 | Selecting a `LOOP` row renders a loop card with prompt/config/history; `Enter` opens the loop manager preselected to that loop, and `e` edits the loop instead of falling into mission-edit errors |
 | Immediate loop first run | Implemented in v0.8.0a30 | New loops are due at creation and the cockpit starts the first run in a background task; the loop manager also exposes `r`/run-now for existing loops while recurring execution remains cron/launchd-friendly |
+| Loop runner LaunchAgent | Implemented in v0.8.0a31 | `morpheus install-loop-runner` installs `com.morpheus.loop-runner`, a separate launchd job that wakes every interval to run due loops without blocking the watcher; status/log/beacon commands mirror the watcher daemon |
 | PRD Runs foundation | Implemented in v0.8.0a1 | PRD finder, new-session PRD selector, parent mission creation, coordinator prompt/status files, `morpheus run start`, and coordinator graph edge shipped |
 | PRD run tree UI | Partially implemented in v0.8.0a5 | Shows virtual PRD parent rows with coordinator/worker sessions rendered underneath them; collapse/expand remains future polish |
 | PRD child worker spawn | Implemented in v0.8.0a5 | `w` spawns a manual child worker under the selected PRD parent/coordinator/worker with scope and verification prompts |
@@ -1436,6 +1447,9 @@ claim, defers.
 | `morpheus install-daemon [--poll 5]` | Install + start the launchd background watcher |
 | `morpheus uninstall-daemon` | Stop and remove the launchd agent |
 | `morpheus daemon-status` | Report daemon health (running? last beacon? log size?) |
+| `morpheus install-loop-runner [--interval 60]` | Install + start the launchd prompt-loop runner |
+| `morpheus uninstall-loop-runner` | Stop and remove the loop runner LaunchAgent |
+| `morpheus loop-runner-status` | Report loop runner health (loaded? last wake? log size?) |
 | `morpheus mcp serve` | Start MCP stdio server for Claude Code / Codex |
 | `morpheus doctor` | Diagnose iTerm2 + Python API connectivity |
 | `morpheus version` | Print morpheus version |

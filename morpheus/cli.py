@@ -406,7 +406,7 @@ def loops_list(
     table.add_column("RUNS", justify="right", no_wrap=True)
     table.add_column("LAST", overflow="fold")
     for loop in rows:
-        run_count = len(db.loop_runs(loop.id, limit=1000))
+        run_count = db.loop_run_count(loop.id)
         last = loop.last_summary or "—"
         table.add_row(
             str(loop.id),
@@ -462,7 +462,9 @@ def loops_run_due(
         for loop in due:
             console.print(f"#{loop.id} {loop.name} due now")
         return
+    daemon_mod.write_loop_runner_beacon()
     runs = loops_mod.run_due(limit=limit, timeout=timeout)
+    daemon_mod.write_loop_runner_beacon()
     if not runs:
         console.print("[dim]no loops due[/dim]")
         return
@@ -1922,6 +1924,36 @@ def uninstall_daemon():
         raise typer.Exit(1)
 
 
+@app.command("install-loop-runner")
+def install_loop_runner(
+    interval: int = typer.Option(60, "--interval", "-i", help="Seconds between loop runner wakeups."),
+    limit: int = typer.Option(5, "--limit", "-n", help="Maximum due loops per wakeup."),
+    timeout: int = typer.Option(loops_mod.DEFAULT_TIMEOUT_SECONDS, "--timeout", help="Seconds before one loop run times out."),
+):
+    """Install the launchd LaunchAgent that executes due prompt loops."""
+    ok, msg = daemon_mod.install_loop_runner(
+        interval=interval,
+        limit=limit,
+        timeout=timeout,
+    )
+    if ok:
+        console.print(f"[green]✓ {msg}[/green]")
+    else:
+        console.print(f"[red]✗ {msg}[/red]")
+        raise typer.Exit(1)
+
+
+@app.command("uninstall-loop-runner")
+def uninstall_loop_runner():
+    """Stop and remove the loop runner LaunchAgent."""
+    ok, msg = daemon_mod.uninstall_loop_runner()
+    if ok:
+        console.print(f"[green]✓ {msg}[/green]")
+    else:
+        console.print(f"[red]✗ {msg}[/red]")
+        raise typer.Exit(1)
+
+
 mcp_app = typer.Typer(help="MCP server (Model Context Protocol) for Claude Code / Codex.")
 app.add_typer(mcp_app, name="mcp")
 
@@ -1972,6 +2004,41 @@ def daemon_status():
     elif s.beacon_age_secs is None or s.beacon_age_secs > 120:
         console.print("\n  [yellow]Daemon looks unhealthy — check the log:[/yellow]")
         console.print(f"    tail -f {daemon_mod.DAEMON_LOG}")
+
+
+@app.command("loop-runner-status")
+def loop_runner_status():
+    """Show launchd loop runner status (loaded? last wake? log size?)."""
+    s = daemon_mod.loop_runner_status()
+
+    def yes(b: bool) -> str:
+        return "[green]✓[/green]" if b else "[red]✗[/red]"
+
+    console.print(f"[bold]morpheus loop runner[/bold]")
+    console.print(f"  plist installed:   {yes(s.plist_installed)}  {daemon_mod.LOOP_RUNNER_PATH}")
+    console.print(f"  launchctl loaded:  {yes(s.launchctl_loaded)}")
+    console.print(f"  PID:               {s.pid if s.pid else '[dim]—[/dim]'}")
+    if s.program_path:
+        console.print(f"  program:           {s.program_path}")
+    if s.interval_secs:
+        console.print(f"  interval:          {s.interval_secs}s")
+    if s.limit is not None:
+        console.print(f"  limit:             {s.limit}")
+    if s.timeout_secs is not None:
+        console.print(f"  timeout:           {s.timeout_secs}s")
+    if s.beacon_exists:
+        age = s.beacon_age_secs or 0.0
+        healthy_window = max((s.interval_secs or 60) * 3, 180)
+        color = "green" if age < healthy_window else "yellow"
+        console.print(f"  last wake:         [{color}]{naming.format_age(age)} ago[/{color}]  "
+                       f"({daemon_mod.LOOP_RUNNER_BEACON_PATH})")
+    else:
+        console.print("  last wake:         [yellow]never[/yellow]")
+    console.print(f"  log size:          {s.log_size_bytes:,} bytes  ({daemon_mod.LOOP_RUNNER_LOG})")
+    if not s.launchctl_loaded:
+        console.print("\n  [yellow]Install:[/yellow] morpheus install-loop-runner")
+    elif not s.beacon_exists:
+        console.print("\n  [yellow]Runner is loaded but has not reported a wake yet; wait one interval or check the log.[/yellow]")
 
 
 # ───────── doctor ─────────

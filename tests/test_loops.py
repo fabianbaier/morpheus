@@ -1,6 +1,7 @@
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from morpheus import db, loops
@@ -19,7 +20,12 @@ class LoopsTest(unittest.TestCase):
     def test_build_command_quotes_prompt_by_default(self) -> None:
         command = loops.build_command("codex exec", "what's new & why?")
 
-        self.assertEqual(command, "codex exec 'what'\"'\"'s new & why?'")
+        self.assertEqual(command, "codex exec --skip-git-repo-check 'what'\"'\"'s new & why?'")
+
+    def test_build_command_preserves_existing_codex_skip_flag(self) -> None:
+        command = loops.build_command("codex exec --skip-git-repo-check", "ok")
+
+        self.assertEqual(command, "codex exec --skip-git-repo-check ok")
 
     def test_create_loop_defaults_first_run_due_immediately(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -84,6 +90,39 @@ class LoopsTest(unittest.TestCase):
                 refreshed = db.get_loop(loop.id)
                 self.assertIsNotNone(refreshed)
                 self.assertGreater(refreshed.next_run_at, run.finished_at)
+
+    def test_run_loop_uses_loop_project_root_when_available(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            project = tmp_path / "project"
+            project.mkdir()
+            captured = {}
+
+            def fake_run(*args, **kwargs):
+                captured["cwd"] = kwargs.get("cwd")
+                return SimpleNamespace(returncode=0, stdout="Summary: ok\n", stderr="")
+
+            with patch.object(db, "DB_DIR", tmp_path), patch.object(
+                db, "DB_PATH", tmp_path / "morpheus.db"
+            ), patch.object(
+                loops.subprocess, "run", new=fake_run
+            ), patch.object(
+                loops.ctx_mod, "write_context_file", new=lambda: None
+            ), patch.object(
+                loops.ctx_mod, "write_context_json", new=lambda: None
+            ):
+                loop = db.create_loop(
+                    name="project loop",
+                    prompt="ignored prompt",
+                    interval_seconds=300,
+                    command="printf ok",
+                    project_root=str(project),
+                )
+
+                run = loops.run_loop(loop, timeout=5)
+
+            self.assertEqual(run.status, "success")
+            self.assertEqual(captured["cwd"], str(project))
 
     def test_loop_lifecycle_helpers_update_target_history_and_delete(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

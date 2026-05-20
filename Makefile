@@ -1,13 +1,15 @@
 PYTHON ?= python3
 VENV ?= .venv
 POLL ?= 5
+LOOP_INTERVAL ?= 60
+LOOP_LIMIT ?= 5
 LOCAL_BIN ?= $(HOME)/.local/bin
 
 VENV_PY := $(VENV)/bin/python
 MORPHEUS := $(VENV)/bin/morpheus
 LOCAL_MORPHEUS := $(LOCAL_BIN)/morpheus
 
-.PHONY: help bootstrap install install-cli uninstall-cli start up dashboard daemon daemon-start daemon-stop daemon-status status watch doctor logs graph-status test clean
+.PHONY: help bootstrap install install-cli uninstall-cli start up dashboard daemon daemon-start daemon-stop daemon-status status loop-runner loop-runner-stop loop-runner-status watch doctor logs loop-logs graph-status test clean
 
 help:
 	@printf "Morpheus dev commands\n\n"
@@ -15,11 +17,13 @@ help:
 	@printf "  make dashboard     Open the Morpheus cockpit without touching daemon state\n"
 	@printf "  make install-cli   Put a morpheus shim on your user PATH (default: ~/.local/bin)\n"
 	@printf "  make daemon        Install/reload the launchd daemon from this repo venv\n"
-	@printf "  make status        Show daemon health\n"
+	@printf "  make loop-runner   Install/reload launchd loop runner for due prompt loops\n"
+	@printf "  make status        Show watcher + loop-runner health\n"
 	@printf "  make watch         Run foreground watcher instead of launchd\n"
 	@printf "  make graph-status  Show v0.7 mission graph table counts\n"
 	@printf "  make doctor        Diagnose iTerm2 Python API setup\n"
 	@printf "  make logs          Tail ~/.morpheus/daemon.log\n"
+	@printf "  make loop-logs     Tail ~/.morpheus/loop-runner.log\n"
 	@printf "  make test          Run lightweight local checks\n"
 	@printf "\nOverride polling with POLL=2, e.g. make start POLL=2\n"
 
@@ -62,6 +66,9 @@ uninstall-cli:
 daemon daemon-start: bootstrap
 	$(MORPHEUS) install-daemon --poll $(POLL)
 
+loop-runner: bootstrap
+	$(MORPHEUS) install-loop-runner --interval $(LOOP_INTERVAL) --limit $(LOOP_LIMIT)
+
 start up: daemon
 	$(MORPHEUS)
 
@@ -74,8 +81,15 @@ watch: bootstrap
 daemon-stop: bootstrap
 	$(MORPHEUS) uninstall-daemon
 
+loop-runner-stop: bootstrap
+	$(MORPHEUS) uninstall-loop-runner
+
 daemon-status status: bootstrap
 	$(MORPHEUS) daemon-status
+	$(MORPHEUS) loop-runner-status
+
+loop-runner-status: bootstrap
+	$(MORPHEUS) loop-runner-status
 
 doctor: bootstrap
 	$(MORPHEUS) doctor
@@ -85,6 +99,9 @@ graph-status: bootstrap
 
 logs:
 	tail -f $(HOME)/.morpheus/daemon.log
+
+loop-logs:
+	tail -f $(HOME)/.morpheus/loop-runner.log
 
 test: bootstrap
 	$(VENV_PY) -m compileall morpheus

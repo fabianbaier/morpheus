@@ -48,11 +48,13 @@ make start          # reload daemon, then open the cockpit
 make dashboard      # open cockpit only
 make install-cli    # install a user PATH shim for running morpheus anywhere
 make daemon         # install/reload launchd watcher from this checkout
-make status         # daemon health, PID, last beacon, log path
+make loop-runner    # install/reload launchd runner for due prompt loops
+make status         # watcher + loop-runner health, PID/wake, log paths
 make watch          # foreground watcher instead of launchd
 make graph-status   # mission graph table counts and health checks
 make doctor         # iTerm2 Python API diagnostic
 make logs           # tail ~/.morpheus/daemon.log
+make loop-logs      # tail ~/.morpheus/loop-runner.log
 make test           # install editable, compileall, unit tests, whitespace check
 ```
 
@@ -176,6 +178,8 @@ morpheus run find-prds .
 morpheus run start ./PRD.md --cmd "codex"
 morpheus loops add "market scan" "summarize tomorrow's market catalysts" --every 30m
 morpheus loops run-due
+morpheus install-loop-runner
+morpheus loop-runner-status
 morpheus mcp serve
 ```
 
@@ -323,8 +327,8 @@ press `p` to clean up orphan parent rows left behind after their tabs disappear.
 
 ## Prompt Loops
 
-Loops are recurring prompts for periodic checks or status feeds. They are
-cron-friendly: Morpheus stores the interval and routing, and launchd/cron calls
+Loops are recurring prompts for periodic checks or status feeds. Morpheus stores
+the interval and routing, while the optional loop runner LaunchAgent calls
 `morpheus loops run-due` often enough to execute due loops.
 
 ```bash
@@ -332,6 +336,8 @@ morpheus loops add "market scan" "summarize tomorrow's market catalysts" --every
 morpheus loops add "repo pulse" "what changed in this repo since last run?" --every 2h --target <mission-or-tab-prefix>
 morpheus loops list
 morpheus loops run-due
+morpheus install-loop-runner --interval 60
+morpheus loop-runner-status
 ```
 
 From the cockpit, press `l` to create a loop. If a mission is selected, loop
@@ -343,8 +349,11 @@ edit/pause/resume/delete/join controls plus recent run history. Selecting a
 opens the manager on that loop, `e` opens its editor, and `r` runs it once
 immediately. The dashboard does not run long loop commands inline; first-run and
 run-now actions happen in a background task, while recurring runs should still
-come from launchd/cron or `morpheus loops run-due`. Loop runs are captured
-command executions today, not reusable live tab sessions.
+come from the loop runner LaunchAgent, another launchd/cron entry, or
+`morpheus loops run-due`. Loop runs are captured command executions today, not
+reusable live tab sessions. The default Codex loop command includes
+`--skip-git-repo-check` so launchd can run loops without an interactive trust
+prompt; older loops saved as plain `codex exec` are adjusted when they execute.
 
 ## State Files
 
@@ -356,6 +365,8 @@ Morpheus keeps local state under `~/.morpheus/`:
 - `morpheus.log` - foreground watcher log
 - `daemon.log` - launchd daemon log
 - `daemon.beacon` - heartbeat used by `morpheus daemon-status`
+- `loop-runner.log` - launchd loop runner log
+- `loop-runner.beacon` - wake heartbeat used by `morpheus loop-runner-status`
 - `snapshots/` - transcript snapshots
 - `loops/` - captured stdout/stderr from prompt loop runs
 

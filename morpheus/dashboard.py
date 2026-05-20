@@ -1939,7 +1939,7 @@ class LoopScreen(ModalScreen[Optional[LoopRequest]]):
             yield Input(placeholder="name, e.g. morning market scan", id="loop_name")
             yield Input(placeholder="prompt to run on every loop tick", id="loop_prompt")
             yield Input(value="30m", placeholder="interval, e.g. 15m, 2h, daily", id="loop_interval")
-            yield Input(value=loops_mod.DEFAULT_COMMAND, placeholder="command, e.g. codex exec", id="loop_command")
+            yield Input(value=loops_mod.DEFAULT_COMMAND, placeholder="command, e.g. codex exec --skip-git-repo-check", id="loop_command")
             with Horizontal():
                 yield Button("create", variant="primary", id="loop_create")
                 yield Button("cancel", id="loop_cancel")
@@ -2035,7 +2035,7 @@ class LoopEditScreen(ModalScreen[Optional[LoopActionRequest]]):
                 placeholder="interval, e.g. 15m, 2h, daily",
                 id="loop_interval",
             )
-            yield Input(value=self.loop.command, placeholder="command, e.g. codex exec", id="loop_command")
+            yield Input(value=self.loop.command, placeholder="command, e.g. codex exec --skip-git-repo-check", id="loop_command")
             with Horizontal():
                 yield Button("save", variant="primary", id="loop_save")
                 yield Button("cancel", id="loop_cancel")
@@ -2088,7 +2088,7 @@ class ProjectSwitchScreen(ModalScreen[Optional[ProjectSwitchRequest]]):
     ProjectSwitchScreen { align: center middle; }
     #project-dialog {
         width: 106;
-        height: 34;
+        height: 36;
         border: round ansi_bright_green;
         background: black;
         padding: 1 2;
@@ -2118,7 +2118,16 @@ class ProjectSwitchScreen(ModalScreen[Optional[ProjectSwitchRequest]]):
         color: ansi_bright_green;
         margin-bottom: 1;
     }
-    Button { margin-right: 2; }
+    #project_actions {
+        height: 2;
+        color: ansi_bright_green;
+        margin-bottom: 1;
+    }
+    Button {
+        margin-right: 2;
+        color: white;
+        text-style: bold;
+    }
     """
 
     BINDINGS = [
@@ -2165,6 +2174,10 @@ class ProjectSwitchScreen(ModalScreen[Optional[ProjectSwitchRequest]]):
             )
             yield DataTable(id="project_table")
             yield Static("", id="project_detail")
+            yield Static(
+                "Enter select · p prune empty · d delete graph · n nuke active tabs · q/Esc close",
+                id="project_actions",
+            )
             with Horizontal():
                 yield Button("select", variant="primary", id="project_select")
                 yield Button("prune empty", id="project_prune")
@@ -2361,7 +2374,7 @@ class LoopManagerScreen(ModalScreen[Optional[LoopActionRequest]]):
     LoopManagerScreen { align: center middle; }
     #loop-dialog {
         width: 104;
-        height: 34;
+        height: 36;
         border: round ansi_bright_yellow;
         background: black;
         padding: 1 2;
@@ -2386,7 +2399,16 @@ class LoopManagerScreen(ModalScreen[Optional[LoopActionRequest]]):
         color: ansi_bright_yellow;
         margin-bottom: 1;
     }
-    Button { margin-right: 2; }
+    #loop_actions {
+        height: 2;
+        color: ansi_bright_yellow;
+        margin-bottom: 1;
+    }
+    Button {
+        margin-right: 2;
+        color: white;
+        text-style: bold;
+    }
     """
 
     BINDINGS = [
@@ -2436,6 +2458,10 @@ class LoopManagerScreen(ModalScreen[Optional[LoopActionRequest]]):
             )
             yield DataTable(id="loops_table")
             yield Static("", id="loop_detail")
+            yield Static(
+                "Enter/e edit · r run now · p pause/resume · t join selected mission · d delete · q/Esc close",
+                id="loop_actions",
+            )
             with Horizontal():
                 yield Button("edit", variant="primary", id="loop_edit")
                 yield Button("run now", variant="primary", id="loop_run")

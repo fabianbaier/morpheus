@@ -18,7 +18,7 @@ from typing import Optional
 from morpheus import context as ctx_mod
 from morpheus import db, ledger
 
-DEFAULT_COMMAND = "codex exec"
+DEFAULT_COMMAND = "codex exec --skip-git-repo-check"
 DEFAULT_TIMEOUT_SECONDS = 20 * 60
 MIN_INTERVAL_SECONDS = 60
 
@@ -42,6 +42,7 @@ NOISE_PREFIXES = (
     "› use /skills to list",
     "> use /skills to list",
 )
+CODEX_EXEC_RE = re.compile(r"^codex\s+exec(?=\s|$)")
 
 
 def parse_interval(value: str) -> float:
@@ -97,11 +98,18 @@ def format_due(ts: float, now: Optional[float] = None) -> str:
 
 def build_command(command: str, prompt: str) -> str:
     """Build a shell command. `{prompt}` opt-in lets users place the prompt."""
-    command = command.strip() or DEFAULT_COMMAND
+    command = normalize_command(command)
     quoted = shlex.quote(prompt)
     if "{prompt}" in command:
         return command.replace("{prompt}", quoted)
     return f"{command} {quoted}"
+
+
+def normalize_command(command: str) -> str:
+    command = command.strip() or DEFAULT_COMMAND
+    if CODEX_EXEC_RE.search(command) and "--skip-git-repo-check" not in command:
+        return CODEX_EXEC_RE.sub(DEFAULT_COMMAND, command, count=1)
+    return command
 
 
 def summarize_output(stdout: str, stderr: str = "", width: int = 160) -> str:
@@ -150,6 +158,7 @@ def run_loop(
         next_run_at=started + loop.interval_seconds,
     )
     command = build_command(loop.command, loop.prompt)
+    run_cwd = cwd or _loop_cwd(loop)
     output_path = _output_path(loop.id, started)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -159,7 +168,7 @@ def run_loop(
         completed = subprocess.run(
             command,
             shell=True,
-            cwd=str(cwd) if cwd else None,
+            cwd=str(run_cwd) if run_cwd else None,
             text=True,
             capture_output=True,
             timeout=timeout,
@@ -253,6 +262,13 @@ def publish_run(loop: db.PromptLoop, run: db.PromptLoopRun) -> None:
 def _output_path(loop_id: int, ts: float) -> Path:
     stamp = time.strftime("%Y%m%dT%H%M%S", time.localtime(ts))
     return db.DB_DIR / "loops" / str(loop_id) / f"{stamp}.txt"
+
+
+def _loop_cwd(loop: db.PromptLoop) -> Optional[Path]:
+    if not loop.project_root:
+        return None
+    path = Path(loop.project_root).expanduser()
+    return path if path.exists() else None
 
 
 def _format_output(
