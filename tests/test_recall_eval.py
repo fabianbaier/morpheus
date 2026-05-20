@@ -179,6 +179,37 @@ class RecallEvalLogicTest(unittest.TestCase):
         self.assertIn("recent check", result.missing_labels)
         self.assertIn("proof artifact", result.missing_labels)
 
+    def test_negated_success_words_do_not_pass_check_events(self) -> None:
+        for summary in (
+            "not verified",
+            "not ok",
+            "did not succeed",
+            "not successful",
+            "unverified",
+        ):
+            with self.subTest(summary=summary):
+                event = db.MissionEvent(
+                    id=1,
+                    mission_id="m_negated",
+                    ts=1,
+                    kind="check",
+                    actor="codex",
+                    summary=summary,
+                )
+                self.assertFalse(recall_eval._event_passed(event))
+
+        for summary in ("verified", "ok", "tests passed", "build succeeded"):
+            with self.subTest(summary=summary):
+                event = db.MissionEvent(
+                    id=1,
+                    mission_id="m_positive",
+                    ts=1,
+                    kind="check",
+                    actor="codex",
+                    summary=summary,
+                )
+                self.assertTrue(recall_eval._event_passed(event))
+
     def test_newer_failed_check_and_artifact_override_older_passes(self) -> None:
         now = 1_000_000.0
         memory = db.MissionMemory(

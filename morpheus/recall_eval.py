@@ -25,7 +25,9 @@ PROOF_ARTIFACT_KINDS = {"test", "build", "proof", "diff", "pr", "log", "screensh
 PASS_RE = re.compile(r"\b(pass(?:ed)?|success(?:ful)?|succeeded|ok|verified)\b")
 FAIL_RE = re.compile(
     r"\b(fail(?:ed|ure|ing)?|error(?:ed)?|timeout|timed out)\b"
-    r"|\b(?:did\s+not|does\s+not|not|never|no)\s+pass(?:ed)?\b"
+    r"|\b(?:did\s+not|does\s+not|do\s+not|is\s+not|are\s+not|was\s+not|were\s+not|not|never|no)\s+"
+    r"(?:pass(?:ed|ing)?|succeed(?:ed)?|success(?:ful)?|ok|verified)\b"
+    r"|\bunverified\b"
 )
 
 
