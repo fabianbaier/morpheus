@@ -14,9 +14,11 @@ from rich.console import Console
 from rich.markdown import Markdown
 from rich.table import Table
 
+from morpheus import ask as ask_mod
 from morpheus import brief as brief_mod
+from morpheus import config as cfg_mod
 from morpheus import context as ctx_mod
-from morpheus import core, daemon as daemon_mod, db, iterm_client, naming, notifier as notifier_mod, __version__
+from morpheus import core, daemon as daemon_mod, db, iterm_client, ledger as ledger_mod, naming, notifier as notifier_mod, trigger as trigger_mod, __version__
 
 app = typer.Typer(
     name="morpheus",
@@ -94,6 +96,9 @@ def watch(
                 sound=sound,
             ))
 
+    # GH-poll interval comes from config; 0 disables.
+    gh_poll = float(cfg_mod.load().get("trigger", {}).get("gh_poll_secs", 0) or 0)
+
     try:
         core.watch_loop(
             poll_interval=poll,
@@ -101,6 +106,7 @@ def watch(
             on_new_mission=on_spawn,
             on_new_note=on_note,
             on_alert=on_alert,
+            gh_poll_secs=gh_poll,
         )
     except KeyboardInterrupt:
         console.print("\n[bright_black]stopped.[/bright_black]")
@@ -431,6 +437,90 @@ def brief(
         ok = notifier_mod.notify_brief(summary)
         if not ok:
             console.print("[yellow]notification not delivered (terminal-notifier missing?)[/yellow]")
+
+
+# ───────── ask ─────────
+
+@app.command()
+def ask(
+    query: str = typer.Argument(..., help="Question to ask Morpheus about current state."),
+    no_llm: bool = typer.Option(False, "--no-llm",
+                                 help="Skip claude/codex — print state snapshot only."),
+):
+    """Ask morpheus a question about your current mission state."""
+    out = ask_mod.ask(query, use_llm=not no_llm)
+    console.print(Markdown(out))
+
+
+# ───────── trigger (one-shot GH poll) ─────────
+
+@app.command("poll-prs")
+def poll_prs():
+    """One-shot GH review-queue poll. Respects config.trigger.spawn_from_gh_pr.
+
+    Normally the watch daemon polls automatically on config.trigger.gh_poll_secs;
+    this command runs a single cycle on demand.
+    """
+    async def _do(connection):
+        async def _alert(kind, mission, text):
+            color = "yellow" if kind == "new_pr" else ("red" if "error" in kind else "green")
+            console.print(f"[{color}]🐇 {kind}:[/{color}] {text}")
+        n = await trigger_mod.poll_and_handle(connection, on_alert=_alert)
+        console.print(f"[green]{n} new PR(s) discovered[/green]")
+    iterm_client.run(_do)
+
+
+# ───────── ledger ─────────
+
+ledger_app = typer.Typer(help="Show recent costs / actions / today's spend.")
+app.add_typer(ledger_app, name="ledger")
+
+
+@ledger_app.command("costs")
+def ledger_costs(
+    limit: int = typer.Option(50, "--limit", "-n"),
+):
+    """Recent LLM cost ledger entries."""
+    rows = ledger_mod.recent_costs(limit=limit)
+    if not rows:
+        console.print("[dim]no cost entries yet.[/dim]")
+        return
+    table = Table(header_style="bold green", border_style="green")
+    table.add_column("when", style="bright_black", no_wrap=True)
+    table.add_column("kind", style="cyan")
+    table.add_column("description")
+    table.add_column("tokens", justify="right")
+    table.add_column("$", justify="right", style="bright_yellow")
+    total = 0.0
+    for r in rows:
+        when = time.strftime("%Y-%m-%d %H:%M", time.localtime(r.ts))
+        table.add_row(when, r.kind, r.description, f"{r.tokens_estimate:,}", f"{r.dollars:.4f}")
+        total += r.dollars
+    console.print(table)
+    console.print(f"\n[bold]today so far:[/bold] [bright_yellow]${ledger_mod.daily_dollar_total():.4f}[/bright_yellow]   "
+                   f"[dim]({len(rows)} most-recent entries totaled ${total:.4f})[/dim]")
+
+
+@ledger_app.command("actions")
+def ledger_actions(
+    limit: int = typer.Option(50, "--limit", "-n"),
+):
+    """Recent action ledger entries (every spawn/kill/note/etc)."""
+    rows = ledger_mod.recent_actions(limit=limit)
+    if not rows:
+        console.print("[dim]no action entries yet.[/dim]")
+        return
+    table = Table(header_style="bold green", border_style="green")
+    table.add_column("when", style="bright_black", no_wrap=True)
+    table.add_column("action", style="cyan")
+    table.add_column("tab", style="green")
+    table.add_column("details")
+    for r in rows:
+        when = time.strftime("%Y-%m-%d %H:%M", time.localtime(r.ts))
+        tab = (r.tab_id or "—").split("-")[0]
+        details = ", ".join(f"{k}={v}" for k, v in r.details.items())
+        table.add_row(when, r.action, tab, details[:80])
+    console.print(table)
 
 
 # ───────── daemon (launchd) ─────────

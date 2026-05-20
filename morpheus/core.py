@@ -201,6 +201,7 @@ def watch_loop(
     on_closed_mission=None,
     on_new_note=None,
     on_alert=None,
+    gh_poll_secs: float = 0.0,
 ) -> None:
     """Headless watch loop. Synchronous wrapper around an asyncio event loop.
 
@@ -222,14 +223,26 @@ def watch_loop(
         last_note_id = recent[0].id if recent else 0
     except Exception:
         last_note_id = 0
+    last_gh_poll = 0.0
 
     async def body(connection):
-        nonlocal last_seen_tabs, last_note_id
+        nonlocal last_seen_tabs, last_note_id, last_gh_poll
         while True:
             try:
                 n = await _tick(connection, log,
                                  on_state_change=on_state_change,
                                  on_alert=on_alert)
+
+                # Periodic GH poll → spawn-from-trigger.
+                if gh_poll_secs > 0:
+                    now_t = time.time()
+                    if now_t - last_gh_poll >= gh_poll_secs:
+                        last_gh_poll = now_t
+                        try:
+                            from morpheus import trigger as trigger_mod
+                            await trigger_mod.poll_and_handle(connection, on_alert)
+                        except Exception as e:
+                            log.exception("gh poll error: %s", e)
                 log.debug("tick: %d tabs", n)
 
                 # Detect new + closed missions for notification hooks.
