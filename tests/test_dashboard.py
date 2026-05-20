@@ -246,6 +246,25 @@ class DashboardTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(dashboard._resume_command("codex --yolo", "hello").startswith("codex --yolo "))
         self.assertTrue(dashboard._resume_command("npm test", "hello").startswith("codex "))
 
+    def test_prd_tree_state_helpers_round_trip_parent_ids(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = Path(tmpdir) / "tree-state.json"
+
+            self.assertTrue(dashboard._save_prd_collapsed_ids({"m_parent_b", "m_parent_a"}, state_path))
+
+            self.assertEqual(
+                dashboard._load_prd_collapsed_ids(state_path),
+                {"m_parent_a", "m_parent_b"},
+            )
+
+    def test_prd_tree_state_helper_rejects_corrupt_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = Path(tmpdir) / "tree-state.json"
+            state_path.write_text("{not json", encoding="utf-8")
+
+            with self.assertRaises(ValueError):
+                dashboard._load_prd_collapsed_ids(state_path)
+
     def test_session_headline_prefers_final_substantive_line(self) -> None:
         rendered = _session_headline(
             "\nSearching the web\nAssuming you mean X/Twitter: two debate clusters.\n› Use /skills to list available skills",
@@ -723,6 +742,100 @@ class DashboardTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(app.alerts[0].kind, "error")
         self.assertIn("no mission selected", app.alerts[0].text)
+
+    async def test_prd_parent_enter_and_space_toggle_children_and_persist_state(self) -> None:
+        app = DashboardHarness()
+        parent = dashboard.db.MissionMemory(
+            mission_id="m_parent",
+            title="PRD tree state",
+            topic="prd-run",
+            source_kind="prd",
+            updated_at=100,
+        )
+        child = dashboard.db.Mission(
+            tab_id="tab-child",
+            mission_id="m_child",
+            goal="coordinator",
+            state="working",
+            buffer_changed_at=90,
+        )
+        edge = dashboard.db.MissionEdge(
+            id=1,
+            from_id=parent.mission_id,
+            to_id=child.mission_id,
+            relation="coordinator",
+            reason="coordinator",
+            created_at=95,
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir, isolated_dashboard_runtime(
+            [child], [parent], [edge]
+        ), patch.object(
+            dashboard, "PRD_TREE_STATE_PATH", new=Path(tmpdir) / "tree-state.json"
+        ):
+            async with app.run_test(size=(120, 40)) as pilot:
+                app._refresh_table()
+                await pilot.pause()
+
+                table = app.query_one(dashboard.MissionsTable)
+                self.assertEqual([ref.role for ref in table.row_refs], ["prd", "coordinator"])
+                self.assertEqual(table.get_row_at(0)[1].plain, "▾")
+
+                await pilot.press("enter")
+                await pilot.pause()
+
+                self.assertEqual([ref.role for ref in table.row_refs], ["prd"])
+                self.assertEqual(table.get_row_at(0)[1].plain, "▸")
+                self.assertEqual(dashboard._load_prd_collapsed_ids(), {"m_parent"})
+                self.assertIn("collapsed PRD run", app.alerts[0].text)
+
+                await pilot.press("t")
+                await pilot.pause()
+
+                self.assertEqual([ref.role for ref in table.row_refs], ["prd", "coordinator"])
+                self.assertEqual(table.get_row_at(0)[1].plain, "▾")
+                self.assertEqual(dashboard._load_prd_collapsed_ids(), set())
+                self.assertIn("expanded PRD run", app.alerts[0].text)
+
+                await pilot.press("enter")
+                await pilot.pause()
+                self.assertEqual(dashboard._load_prd_collapsed_ids(), {"m_parent"})
+
+            restarted = DashboardHarness()
+            restarted.prd_collapsed_ids = dashboard._load_prd_collapsed_ids()
+            async with restarted.run_test(size=(120, 40)) as restart_pilot:
+                restarted._refresh_table()
+                await restart_pilot.pause()
+                restarted_table = restarted.query_one(dashboard.MissionsTable)
+                self.assertEqual([ref.role for ref in restarted_table.row_refs], ["prd"])
+
+    async def test_prd_tree_toggle_reports_persistence_failure_without_mutating_state(self) -> None:
+        app = DashboardHarness()
+        app.prd_collapsed_ids = set()
+        parent = dashboard.db.MissionMemory(
+            mission_id="m_parent",
+            title="PRD tree state",
+            topic="prd-run",
+            source_kind="prd",
+            updated_at=100,
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir, isolated_dashboard_runtime(
+            [], [parent], []
+        ), patch.object(
+            dashboard, "PRD_TREE_STATE_PATH", new=Path(tmpdir) / "tree-state.json"
+        ), patch.object(
+            dashboard, "_toggle_prd_collapsed_id", side_effect=OSError("disk full")
+        ):
+            async with app.run_test(size=(120, 40)) as pilot:
+                app._refresh_table()
+                await pilot.pause()
+
+                await pilot.press("enter")
+                await pilot.pause()
+
+                self.assertEqual(app.prd_collapsed_ids, set())
+                self.assertIn("PRD tree state save failed", app.alerts[0].text)
 
     async def test_kill_prd_parent_archives_run_and_closes_child_tabs(self) -> None:
         app = DashboardHarness()
