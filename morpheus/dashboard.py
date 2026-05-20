@@ -98,6 +98,7 @@ FLASH_BG = {
     "unknown":  "color(238)",
 }
 FLASH_DURATION = 3.0  # seconds
+ORPHAN_PRD_PRUNE_SECONDS = 60.0
 
 # Sort order for the missions table when there are no flashes pulling
 # things up — newest activity first.
@@ -2332,12 +2333,63 @@ class MorpheusApp(App):
         ))
         self._refresh_table()
 
+    async def _kill_prd_run(self, parent_id: str) -> None:
+        child_ids = {
+            edge.to_id
+            for edge in db.edges_from_id(parent_id, limit=100)
+            if edge.relation in {"coordinator", "worker"}
+        }
+        live_children = [
+            mission for mission in db.all_missions()
+            if mission.mission_id and mission.mission_id in child_ids
+        ]
+        closed = 0
+        for mission in live_children:
+            ok = await iterm_client.close_tab(self.iterm_conn, mission.tab_id)
+            if ok:
+                db.delete(mission.tab_id)
+                closed += 1
+
+        db.archive_memory(parent_id, "PRD run killed from dashboard")
+        self._push_alert(Alert(
+            time.time(),
+            "close",
+            f"killed PRD run [{parent_id.split('_')[-1]}] and {closed}/{len(live_children)} child tabs",
+        ))
+        self._refresh_table()
+
+    def _prune_orphan_prd_runs(self, live_missions: list[db.Mission], now: float) -> int:
+        live_mission_ids = {mission.mission_id for mission in live_missions if mission.mission_id}
+        parents = [
+            memory for memory in db.all_memory()
+            if memory.topic == "prd-run" or memory.source_kind == "prd"
+        ]
+        archived = 0
+        for parent in parents:
+            if (now - parent.updated_at) < ORPHAN_PRD_PRUNE_SECONDS:
+                continue
+            child_ids = {
+                edge.to_id
+                for edge in db.edges_from_id(parent.mission_id, limit=100)
+                if edge.relation in {"coordinator", "worker"}
+            }
+            if child_ids & live_mission_ids:
+                continue
+            db.archive_memory(parent.mission_id, "orphan PRD run pruned from dashboard")
+            archived += 1
+        return archived
+
     async def action_kill_session(self) -> None:
         if self.iterm_conn is None:
             return
         table = self.query_one(MissionsTable)
-        tab_id = table.selected_tab_id()
+        ref = table.selected_ref()
+        if ref and ref.virtual and ref.role == "prd" and ref.mission_id:
+            await self._kill_prd_run(ref.mission_id)
+            return
+        tab_id = ref.tab_id if ref and ref.tab_id else None
         if not tab_id:
+            self._push_alert(Alert(time.time(), "error", "selected row has no live tab to kill"))
             return
         ok = await iterm_client.close_tab(self.iterm_conn, tab_id)
         if ok:
@@ -2354,8 +2406,9 @@ class MorpheusApp(App):
         stale_threshold = 4 * 3600
         live = await iterm_client.enumerate_tabs(self.iterm_conn)
         live_ids = {t.tab_id for t in live}
+        missions = db.all_missions()
         candidates = []
-        for m in db.all_missions():
+        for m in missions:
             if m.tab_id not in live_ids:
                 continue
             if m.state not in ("idle", "finished"):
@@ -2369,10 +2422,16 @@ class MorpheusApp(App):
             if ok:
                 db.delete(m.tab_id)
                 closed += 1
+        archived_prd = self._prune_orphan_prd_runs(
+            [m for m in missions if m.tab_id in live_ids],
+            now,
+        )
         self._push_alert(Alert(
             time.time(), "close",
-            f"pruned {closed}/{len(candidates)} stale tabs",
+            f"pruned {closed}/{len(candidates)} stale tabs, archived {archived_prd} orphan PRD runs",
         ))
+        if closed or archived_prd:
+            self._refresh_table()
 
     async def action_snapshot_session(self) -> None:
         if self.iterm_conn is None:

@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| **Status** | v0.8.0a8 implemented (edit mission + selected brief); next: resume fresh |
+| **Status** | v0.8.0a9 implemented (PRD parent cleanup); next: resume fresh |
 | **Author** | Fabian Baier |
 | **Last updated** | 2026-05-20 |
 | **Target platform** | macOS + iTerm2 |
@@ -404,10 +404,12 @@ Remaining v0.8 work:
 - Add a run status updater that writes mission events and keeps the status file
   aligned with the graph.
 
-Implemented v0.8.0a5 behavior: PRD parent rows render as virtual rows in the
-mission table, coordinator/worker sessions render underneath them, and `w`
-spawns a manually scoped worker linked to the same parent mission with a
-`worker` edge plus assignment events.
+Implemented behavior: PRD parent rows render as virtual rows in the mission
+table, coordinator/worker sessions render underneath them, and `w` spawns a
+manually scoped worker linked to the same parent mission with a `worker` edge
+plus assignment events. In v0.8.0a9, `d` on a virtual parent row archives the
+run and closes live child tabs; `p` archives orphan parent rows that no longer
+have live children.
 
 ### 6.6 Prompt Loops
 
@@ -774,6 +776,7 @@ This table is the source of truth for where the product stands right now.
 | Markdown source picker | Implemented in v0.8.0a7 | The `n` picker shows all discovered `.md`/`.markdown` files rather than only PRD-named files, while sorting PRD/spec candidates first |
 | Edit mission flow | Implemented in v0.8.0a8 | `e` opens a dashboard editor for goal/title/why/done/criteria/plan/next/phase/blocker/source/issue/PR/worktree/claimed paths/topic, saves graph memory + live fields, and records a `mission_edit` event |
 | Brief selected | Implemented in v0.8.0a8 | `b` opens a cited local brief for the selected mission using graph memory, recent events, artifacts, and transcript tail |
+| PRD parent cleanup | Implemented in v0.8.0a9 | `d` on a virtual PRD parent archives the run and closes live coordinator/worker tabs; `p` archives orphan PRD parent rows with no live child tabs |
 | Resume fresh | Not implemented | `r` snapshots, archives old attachment, spawns replacement with mission context |
 | MCP mission tools | Partially shipped | Read-only session tools exist; graph read/update tools remain v0.7 |
 | 48-hour recall eval | Not implemented | Add fixture or dogfood checklist: stale mission → press `b` → know next action in <10s |

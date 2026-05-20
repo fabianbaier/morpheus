@@ -86,7 +86,9 @@ freshest item at the top. Press `l` to create a recurring prompt loop; loop
 outputs appear as ticker items and, when targeted, as graph events/artifacts for
 the selected mission. For PRD runs, parent rows appear in the mission table and
 coordinator/worker tabs nest underneath; press `w` on a PRD parent/coordinator
-to spawn a manually scoped worker.
+to spawn a manually scoped worker. PRD parent rows are virtual run records, not
+extra iTerm tabs; pressing `d` on one archives that run and closes any live child
+tabs, while `p` prunes orphan parent rows that no longer have live children.
 
 Core commands:
 
@@ -211,7 +213,8 @@ intentionally not enabled yet.
 In the cockpit, PRD runs render as a small tree: the virtual parent row first,
 then the coordinator and worker tabs underneath. Select the parent/coordinator
 and press `w` to spawn a manual child worker with explicit scope and
-verification.
+verification. Select a virtual parent row and press `d` to kill the whole run;
+press `p` to clean up orphan parent rows left behind after their tabs disappear.
 
 ## Prompt Loops
 
@@ -268,9 +271,9 @@ make daemon
 
 ## Roadmap
 
-Current status: v0.8.0a8 has PRD Runs foundation, PRD tree/manual workers,
+Current status: v0.8.0a9 has PRD Runs foundation, PRD tree/manual workers,
 newest-first ready tickers, prompt loops foundation, nonblocking/Markdown PRD
-picker, edit mission flow, and selected mission briefs.
+picker, edit mission flow, selected mission briefs, and PRD parent cleanup.
 
 Next implementation phases:
 
@@ -290,7 +293,8 @@ Next implementation phases:
 14. Markdown source picker. Done in `0.8.0a7`.
 15. Edit mission flow for why/plan/next/provenance/proof fields. Done in `0.8.0a8`.
 16. `b` brief-selected using mission graph plus transcript tail. Done in `0.8.0a8`.
-17. Resume-fresh flow that snapshots, archives old attachment, and spawns a new
+17. PRD parent row kill/prune cleanup. Done in `0.8.0a9`.
+18. Resume-fresh flow that snapshots, archives old attachment, and spawns a new
    session linked by a `spawned_from` edge.
 
 > "I can only show you the door. You're the one that has to walk through it."
