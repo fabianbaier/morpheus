@@ -42,6 +42,7 @@ from textual.widgets import Button, DataTable, Footer, Input, Label, RichLog, Se
 
 from morpheus import context as ctx_mod
 from morpheus import core, db, iterm_client, mission_brief, naming, rain as rain_mod
+from morpheus import goals as goals_mod
 from morpheus import ledger as ledger_mod
 from morpheus import loops as loops_mod
 from morpheus import prd_runs
@@ -327,6 +328,16 @@ class WorkerRequest:
     command: str
     scope: str = ""
     verification: str = ""
+
+
+@dataclass
+class GoalRequest:
+    source_id: str
+    objective: str
+    command: str
+    workers: str = "auto"
+    max_turns: str = "20"
+    autonomy_level: str = "ask_to_spawn"
 
 
 @dataclass
@@ -926,14 +937,21 @@ class MissionsTable(DataTable):
         )
         edges = prd_edges or []
         children_by_parent: dict[str, list[db.MissionEdge]] = {}
+        child_relations = {"coordinator", "goal_controller", "worker", "goal_worker"}
+        relation_order = {
+            "coordinator": 0,
+            "goal_controller": 1,
+            "worker": 2,
+            "goal_worker": 3,
+        }
         for edge in edges:
-            if edge.relation in {"coordinator", "worker"}:
+            if edge.relation in child_relations:
                 children_by_parent.setdefault(edge.from_id, []).append(edge)
 
         for parent in parents:
             children = sorted(
                 children_by_parent.get(parent.mission_id, []),
-                key=lambda edge: (0 if edge.relation == "coordinator" else 1, edge.created_at),
+                key=lambda edge: (relation_order.get(edge.relation, 9), edge.created_at),
             )
             live_children: list[tuple[db.MissionEdge, db.Mission]] = []
             for edge in children:
@@ -1177,6 +1195,10 @@ class MissionCardWidget(Static):
         text.append(" · ".join(compact), style=STATE_TEXT_STYLE.get(mission.state, COL_DIMMER))
         text.append("\n")
 
+        goal = db.goal_run_for_mission(mission.mission_id) if mission.mission_id else None
+        if goal is not None:
+            self._render_goal_summary(text, goal)
+
         self._render_latest_output(text, live)
 
         if not self.details_expanded:
@@ -1237,6 +1259,32 @@ class MissionCardWidget(Static):
             text.append("unset\n", style=COL_DIMMER)
 
         return text
+
+    def _render_goal_summary(self, text: Text, goal: db.GoalRun) -> None:
+        text.append("\nGOAL RUN\n", style="bold bright_green")
+        status_style = "bright_green" if goal.status == "active" else "bright_yellow"
+        text.append(
+            (
+                f"{goal.status} · turns {goal.turns_used}/{goal.max_turns} · "
+                f"workers {goal.active_workers}/{goal.max_workers}\n"
+            ),
+            style=status_style,
+        )
+        text.append(_single_line(goal.objective or goal.parent_mission_id), style=COL_BODY)
+        text.append("\n")
+        if not self.details_expanded:
+            return
+        tasks = db.goal_tasks(goal.goal_id)
+        if tasks:
+            text.append("tasks:\n", style=COL_ACCENT)
+            for task in tasks[:6]:
+                worker = f" -> {task.worker_mission_id[:12]}" if task.worker_mission_id else ""
+                result = f" · {task.result_summary}" if task.result_summary else ""
+                text.append(f"  {task.status} {task.title}{worker}{result}\n", style=COL_BODY)
+        else:
+            text.append("tasks: none yet\n", style=COL_DIMMER)
+        if goal.last_judge_reason:
+            self._section_field(text, "judge", goal.last_judge_reason)
 
     def _render_loop_card(self, loop: db.PromptLoop, runs: list[db.PromptLoopRun]) -> Text:
         text = Text()
@@ -3036,6 +3084,100 @@ class WorkerScreen(ModalScreen[Optional[WorkerRequest]]):
         self.dismiss(None)
 
 
+class GoalScreen(ModalScreen[Optional[GoalRequest]]):
+    """Start an autonomous goal controller for a selected PRD/mission."""
+
+    CSS = """
+    GoalScreen { align: center middle; }
+    #dialog {
+        width: 88;
+        height: 20;
+        border: round ansi_bright_green;
+        background: black;
+        padding: 1 2;
+    }
+    #dialog Label.title {
+        color: ansi_bright_green;
+        text-style: bold;
+        margin-bottom: 1;
+    }
+    #dialog Label.hint {
+        color: grey;
+        margin-bottom: 1;
+    }
+    Input {
+        background: black;
+        color: ansi_bright_green;
+        border: round green;
+        margin-bottom: 1;
+    }
+    Input:focus { border: round ansi_bright_green; }
+    Button { margin-right: 2; }
+    """
+
+    BINDINGS = [
+        Binding("escape", "cancel", "cancel"),
+    ]
+
+    def __init__(self, *, source_id: str, title: str, objective: str):
+        super().__init__()
+        self.source_id = source_id
+        self.title = title
+        self.objective = objective
+
+    def compose(self) -> ComposeResult:
+        with Container(id="dialog"):
+            yield Label(f"{RABBIT}  AUTONOMOUS GOAL RUN", classes="title")
+            yield Label(f"source: {self.title}", classes="hint")
+            yield Input(value=self.objective, placeholder="objective", id="goal_objective")
+            yield Input(value="codex", placeholder="controller command", id="goal_command")
+            yield Input(value="auto", placeholder="workers: auto or number", id="goal_workers")
+            yield Input(value=str(goals_mod.DEFAULT_MAX_TURNS), placeholder="max controller turns", id="goal_turns")
+            yield Input(value="ask_to_spawn", placeholder="autonomy level", id="goal_autonomy")
+            with Horizontal():
+                yield Button("start", variant="primary", id="goal_start")
+                yield Button("cancel", id="goal_cancel")
+
+    def on_mount(self) -> None:
+        self.query_one("#goal_objective", Input).focus()
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        order = ["goal_objective", "goal_command", "goal_workers", "goal_turns", "goal_autonomy"]
+        if event.input.id in order:
+            idx = order.index(event.input.id)
+            if idx < len(order) - 1:
+                self.query_one(f"#{order[idx + 1]}", Input).focus()
+            else:
+                self.action_submit()
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "goal_start":
+            self.action_submit()
+        else:
+            self.action_cancel()
+
+    def action_submit(self) -> None:
+        objective = self.query_one("#goal_objective", Input).value.strip()
+        command = self.query_one("#goal_command", Input).value.strip() or "codex"
+        workers = self.query_one("#goal_workers", Input).value.strip() or "auto"
+        turns = self.query_one("#goal_turns", Input).value.strip() or str(goals_mod.DEFAULT_MAX_TURNS)
+        autonomy = self.query_one("#goal_autonomy", Input).value.strip() or "ask_to_spawn"
+        if not objective:
+            self.query_one("#goal_objective", Input).focus()
+            return
+        self.dismiss(GoalRequest(
+            source_id=self.source_id,
+            objective=objective,
+            command=command,
+            workers=workers,
+            max_turns=turns,
+            autonomy_level=autonomy,
+        ))
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
 # ── main app ──────────────────────────────────────────────────────────────
 
 FOOTER_BINDINGS = [
@@ -3055,6 +3197,8 @@ FOOTER_BINDINGS = [
     Binding("l", "new_loop", "loop"),
     Binding("shift+l", "manage_loops", "loops"),
     Binding("upper_l", "manage_loops", "loops", show=False),
+    Binding("shift+g", "new_goal", "goal"),
+    Binding("upper_g", "new_goal", "goal", show=False),
     Binding("t", "switch_project", "project"),
     Binding("o", "toggle_prd_tree", "tree"),
     Binding("w", "new_worker", "worker"),
@@ -3343,7 +3487,7 @@ class MorpheusApp(App):
         """v0.4 derived alerts (token guard, worktree collision)."""
         if isinstance(mission, db.Mission) and not self._mission_in_scope(mission):
             return
-        alert_kind = "state" if kind.startswith("token") else "error"
+        alert_kind = "state" if kind.startswith("token") else "summary" if kind.startswith("goal") else "error"
         self._push_alert(Alert(time.time(), alert_kind, text))
 
     async def _on_tab_observed(self, tab: iterm_client.TabInfo, mission: db.Mission, detection) -> None:
@@ -4084,6 +4228,47 @@ class MorpheusApp(App):
             self._handle_worker_result,
         )
 
+    def action_new_goal(self) -> None:
+        if self.iterm_conn is None:
+            return
+        source_id, title, objective = self._selected_goal_source()
+        if not source_id:
+            self._push_alert(Alert(
+                time.time(),
+                "error",
+                "select a PRD run or mission before starting a goal",
+            ))
+            return
+        self.push_screen(
+            GoalScreen(source_id=source_id, title=title, objective=objective),
+            self._handle_goal_result,
+        )
+
+    def _selected_goal_source(self) -> tuple[str, str, str]:
+        try:
+            ref = self.query_one(MissionsTable).selected_ref()
+        except Exception:
+            return "", "", ""
+        if ref is None:
+            return "", "", ""
+        source_id = ""
+        if ref.virtual and ref.role == "prd" and ref.mission_id:
+            source_id = ref.mission_id
+        elif ref.parent_id:
+            source_id = ref.parent_id
+        elif ref.mission_id:
+            source_id = ref.mission_id
+        if not source_id:
+            return "", "", ""
+        memory = db.get_memory(source_id)
+        if memory is None:
+            return source_id, source_id, f"Complete mission {source_id}"
+        return (
+            source_id,
+            memory.title or memory.mission_id,
+            goals_mod.default_objective(memory),
+        )
+
     def _selected_prd_parent_id(self) -> Optional[str]:
         try:
             ref = self.query_one(MissionsTable).selected_ref()
@@ -4606,6 +4791,83 @@ class MorpheusApp(App):
             "spawn",
             f"worker [{result.goal}] spawned under {run.title} {info.tab_id.split('-')[0]}",
         ))
+
+    async def _handle_goal_result(self, result: Optional[GoalRequest]) -> None:
+        if result is None:
+            return
+        if self.iterm_conn is None:
+            return
+        try:
+            workers = goals_mod.DEFAULT_MAX_WORKERS if result.workers.lower() == "auto" else int(result.workers)
+            turns = int(result.max_turns)
+            if workers < 1 or turns < 1:
+                raise ValueError("workers and max turns must be at least 1")
+            project = self.project or tenant_mod.ensure_project_tenant(Path.cwd())
+            bundle = goals_mod.create_goal_run(
+                result.source_id,
+                objective=result.objective,
+                project=project,
+                autonomy_level=result.autonomy_level,
+                max_turns=turns,
+                max_workers=workers,
+            )
+            owner = db.get_project_tenant(bundle.goal.tenant_id) if bundle.goal.tenant_id else None
+            if owner is None:
+                owner = tenant_mod.ensure_project_tenant(bundle.goal.project_root or Path.cwd())
+            goal_label = f"{bundle.parent.title or bundle.goal.goal_id} goal controller"
+            cmd = goals_mod.controller_command(result.command, bundle)
+            cmd = tenant_mod.command_in_project(cmd, owner.root_path)
+        except Exception as e:
+            self._push_alert(Alert(time.time(), "error", f"goal start failed: {e}"))
+            return
+        try:
+            info = await iterm_client.spawn_tab(self.iterm_conn, command=cmd, goal=goal_label)
+        except Exception as e:
+            self._push_alert(Alert(time.time(), "error", f"goal controller spawn failed: {e}"))
+            return
+        if info is None:
+            self._push_alert(Alert(time.time(), "error", "goal controller spawn failed — is iTerm focused?"))
+            return
+
+        now = time.time()
+        mission = db.Mission(
+            tab_id=info.tab_id,
+            session_id=info.session_id,
+            tenant_id=owner.tenant_id,
+            project_root=owner.root_path,
+            goal=goal_label,
+            state="working",
+            cmd=cmd,
+            linked_worktree=owner.root_path,
+            buffer_changed_at=now,
+            last_event_at=now,
+            created_at=now,
+        )
+        db.upsert(mission)
+        goal = goals_mod.attach_controller(bundle, mission)
+        ledger_mod.log_action(
+            "goal_start",
+            tab_id=mission.tab_id,
+            details={
+                "goal_id": goal.goal_id,
+                "parent_mission_id": goal.parent_mission_id,
+                "controller_mission_id": mission.mission_id,
+                "max_turns": goal.max_turns,
+                "max_workers": goal.max_workers,
+                "autonomy_level": goal.autonomy_level,
+            },
+        )
+        try:
+            ctx_mod.write_context_file()
+            ctx_mod.write_context_json()
+        except Exception:
+            pass
+        self._push_alert(Alert(
+            time.time(),
+            "spawn",
+            f"goal [{bundle.parent.title or goal.goal_id}] controller spawned {info.tab_id.split('-')[0]}",
+        ))
+        self._refresh_table()
 
     async def _handle_new_session_result(self, result: Optional[NewSessionRequest]) -> None:
         if not result:

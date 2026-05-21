@@ -31,8 +31,12 @@ def _format_note_line(n: db.Note, missions_by_tab: dict[str, db.Mission]) -> str
     ts = time.strftime("%H:%M", time.localtime(n.created_at))
     tab_short = (n.tab_id or "?").split("-")[0]
     goal = missions_by_tab.get(n.tab_id, db.Mission(tab_id="")).goal or "?"
-    kind_marker = {"note": "•", "claim": "⚑", "broadcast": "📡", "loop": "↻"}.get(n.kind, "•")
+    kind_marker = {"note": "•", "claim": "⚑", "broadcast": "📡", "loop": "↻", "goal": "◎"}.get(n.kind, "•")
     return f"- [{ts}] {kind_marker} **{tab_short}** ({goal}): {n.text}"
+
+
+def _goal_rows(tenant_id: Optional[str] = None, include_finished: bool = False) -> list[db.GoalRun]:
+    return db.all_goal_runs(include_finished=include_finished, tenant_id=tenant_id)
 
 
 def build_markdown(
@@ -97,6 +101,28 @@ def build_markdown(
             f"| {emoji} {m.state} | `{tab_short}` | `{mission_short}` | "
             f"{goal} | {phase} | {age} | {last} | {you} |"
         )
+
+    goals = _goal_rows(tenant_id=tenant_id)
+    lines.append("")
+    lines.append("## Goal Runs")
+    lines.append("")
+    if goals:
+        lines.append("| Status | Goal | Turns | Workers | Objective |")
+        lines.append("|--------|------|-------|---------|-----------|")
+        for goal in goals:
+            objective = (goal.objective or goal.parent_mission_id).replace("|", "\\|")
+            lines.append(
+                f"| `{goal.status}` | `{goal.goal_id[:14]}` | "
+                f"`{goal.turns_used}/{goal.max_turns}` | "
+                f"`{goal.active_workers}/{goal.max_workers}` | {objective} |"
+            )
+            tasks = db.goal_tasks(goal.goal_id)
+            for task in tasks[:5]:
+                worker = f" -> `{task.worker_mission_id[:14]}`" if task.worker_mission_id else ""
+                result = f" - {task.result_summary}" if task.result_summary else ""
+                lines.append(f"| | task `{task.status}` | | | `{task.task_id[:14]}` {task.title}{worker}{result} |")
+    else:
+        lines.append("_no active goal runs_")
 
     lines.append("")
     lines.append("## Recent cross-session notes")
@@ -172,6 +198,40 @@ def build_json(
             }
             for m in missions
         ],
+        "goals": [
+            {
+                "goal_id": goal.goal_id,
+                "parent_mission_id": goal.parent_mission_id,
+                "controller_mission_id": goal.controller_mission_id,
+                "objective": goal.objective,
+                "done_definition": goal.done_definition,
+                "status": goal.status,
+                "autonomy_level": goal.autonomy_level,
+                "turns_used": goal.turns_used,
+                "max_turns": goal.max_turns,
+                "active_workers": goal.active_workers,
+                "max_workers": goal.max_workers,
+                "last_judge_reason": goal.last_judge_reason,
+                "last_continued_at": goal.last_continued_at,
+                "tenant_id": goal.tenant_id,
+                "project_root": goal.project_root,
+                "tasks": [
+                    {
+                        "task_id": task.task_id,
+                        "worker_mission_id": task.worker_mission_id,
+                        "title": task.title,
+                        "scope": task.scope,
+                        "status": task.status,
+                        "claimed_paths": _decode_json_list(task.claimed_paths),
+                        "verification": task.verification,
+                        "last_heartbeat_at": task.last_heartbeat_at,
+                        "result_summary": task.result_summary,
+                    }
+                    for task in db.goal_tasks(goal.goal_id)
+                ],
+            }
+            for goal in _goal_rows(tenant_id=tenant_id)
+        ],
         "notes": [
             {
                 "id": n.id,
@@ -192,6 +252,7 @@ def build_short(
 ) -> str:
     """One-line summary suitable for an agent prompt."""
     missions = db.all_missions(tenant_id=tenant_id)
+    goals = _goal_rows(tenant_id=tenant_id)
     counts = _state_counts(missions)
     parts = [f"{len(missions)} sessions"]
     for emoji, key in [("🔴", "blocked"), ("🟢", "working"), ("🟡", "idle"), ("⚫", "finished")]:
@@ -200,10 +261,22 @@ def build_short(
             parts.append(f"{c} {key}")
     others = [m for m in missions if m.tab_id != self_tab_id and m.state == "blocked"]
     summary = " · ".join(parts)
+    if goals:
+        summary += f" · {len(goals)} active goals"
     if others:
         names = ", ".join(m.goal or m.tab_id.split("-")[0] for m in others[:3])
         summary += f" — others blocked: {names}"
     return summary
+
+
+def _decode_json_list(raw: str) -> list[str]:
+    try:
+        decoded = json.loads(raw or "[]")
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(decoded, list):
+        return []
+    return [str(item) for item in decoded if str(item)]
 
 
 def write_context_file() -> None:

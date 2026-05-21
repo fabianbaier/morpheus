@@ -23,6 +23,10 @@ iTerm spawn/kill from MCP yet; that lives behind the CLI for v0.6):
   - add_mission_event(ref, ...)
   - add_mission_artifact(ref, ...)
   - link_missions(from_ref, to_ref, ...)
+  - list_goal_runs(include_finished)
+  - get_goal_run(ref)
+  - create_goal_task(goal_ref, ...)
+  - update_goal_task(task_ref, ...)
   - get_context()
   - get_context_short()
   - post_note(text, tab_id, kind)
@@ -40,7 +44,7 @@ from typing import Any, Optional
 from mcp.server.fastmcp import FastMCP
 
 from morpheus import context as ctx_mod
-from morpheus import db, ledger, mission_graph as graph_mod, prd_runs
+from morpheus import db, goals, ledger, mission_graph as graph_mod, prd_runs
 
 mcp = FastMCP("morpheus")
 
@@ -380,6 +384,78 @@ def link_missions(
 
 
 @mcp.tool()
+def list_goal_runs(include_finished: bool = False) -> list[dict]:
+    """List autonomous goal runs and their visible controller/task state."""
+    return [_goal_dict(goal) for goal in db.all_goal_runs(include_finished=include_finished)]
+
+
+@mcp.tool()
+def get_goal_run(ref: str) -> dict:
+    """Inspect one autonomous goal run by goal/parent/controller/worker ref."""
+    goal = goals.resolve_goal(ref)
+    if goal is None:
+        return {"found": False, "error": f"no goal matching '{ref}'"}
+    bundle = goals.bundle_for_goal(goal.goal_id)
+    goals.write_status_file(bundle)
+    return {
+        "found": True,
+        "goal": _goal_dict(bundle.goal),
+        "parent": _memory_dict(bundle.parent),
+        "status_path": str(bundle.status_path),
+        "prompt_path": str(bundle.prompt_path),
+        "status_markdown": bundle.status_path.read_text(encoding="utf-8"),
+    }
+
+
+@mcp.tool()
+def create_goal_task(
+    goal_ref: str,
+    title: str,
+    scope: str = "",
+    verification: str = "",
+    claimed_paths_json: str = "",
+) -> dict:
+    """Create a bounded worker task for an autonomous goal run.
+
+    `claimed_paths_json` may be a JSON list of path strings.
+    """
+    try:
+        claimed_paths = json.loads(claimed_paths_json) if claimed_paths_json else []
+    except json.JSONDecodeError as e:
+        return {"ok": False, "error": f"claimed_paths_json is not JSON: {e}"}
+    if not isinstance(claimed_paths, list) or not all(isinstance(path, str) for path in claimed_paths):
+        return {"ok": False, "error": "claimed_paths_json must decode to a list of strings"}
+    try:
+        task = goals.create_task(
+            goal_ref,
+            title=title,
+            scope=scope,
+            verification=verification,
+            claimed_paths=claimed_paths,
+            metadata={"source": "mcp"},
+        )
+    except ValueError as e:
+        return {"ok": False, "error": str(e)}
+    _refresh_after_goal_write(task.goal_id)
+    return {"ok": True, "task": _goal_task_dict(task)}
+
+
+@mcp.tool()
+def update_goal_task(
+    task_ref: str,
+    status: str,
+    summary: str = "",
+) -> dict:
+    """Update a goal task heartbeat/status by task id or worker mission ref."""
+    try:
+        task = goals.set_task_status(task_ref, status, summary=summary, metadata={"source": "mcp"})
+    except ValueError as e:
+        return {"ok": False, "error": str(e)}
+    _refresh_after_goal_write(task.goal_id)
+    return {"ok": True, "task": _goal_task_dict(task)}
+
+
+@mcp.tool()
 def get_context() -> str:
     """Return the full human-readable markdown context snapshot of every
     morpheus session. This is what ~/.morpheus/context.md contains."""
@@ -524,6 +600,54 @@ def _edge_dict(edge: db.MissionEdge) -> dict:
     }
 
 
+def _goal_dict(goal: db.GoalRun) -> dict:
+    controller_live = [
+        _live_dict(mission) for mission in db.all_missions()
+        if mission.mission_id == goal.controller_mission_id
+    ]
+    tasks = db.goal_tasks(goal.goal_id)
+    return {
+        "goal_id": goal.goal_id,
+        "parent_mission_id": goal.parent_mission_id,
+        "controller_mission_id": goal.controller_mission_id,
+        "controller_live": controller_live,
+        "source_kind": goal.source_kind,
+        "source_ref": goal.source_ref,
+        "objective": goal.objective,
+        "done_definition": goal.done_definition,
+        "status": goal.status,
+        "autonomy_level": goal.autonomy_level,
+        "turns_used": goal.turns_used,
+        "max_turns": goal.max_turns,
+        "active_workers": goal.active_workers,
+        "max_workers": goal.max_workers,
+        "last_judge_reason": goal.last_judge_reason,
+        "last_continued_at": goal.last_continued_at,
+        "tasks": [_goal_task_dict(task) for task in tasks],
+        "created_at": goal.created_at,
+        "updated_at": goal.updated_at,
+        "finished_at": goal.finished_at,
+    }
+
+
+def _goal_task_dict(task: db.GoalTask) -> dict:
+    return {
+        "task_id": task.task_id,
+        "goal_id": task.goal_id,
+        "worker_mission_id": task.worker_mission_id,
+        "title": task.title,
+        "scope": task.scope,
+        "status": task.status,
+        "claimed_paths": _decode_claimed_paths(task.claimed_paths),
+        "verification": task.verification,
+        "last_heartbeat_at": task.last_heartbeat_at,
+        "result_summary": task.result_summary,
+        "metadata": task.metadata,
+        "created_at": task.created_at,
+        "updated_at": task.updated_at,
+    }
+
+
 def _decode_claimed_paths(raw: str) -> list[str]:
     try:
         decoded = json.loads(raw or "[]")
@@ -532,6 +656,14 @@ def _decode_claimed_paths(raw: str) -> list[str]:
     if isinstance(decoded, list):
         return [str(item) for item in decoded]
     return []
+
+
+def _refresh_after_goal_write(goal_id: str) -> None:
+    try:
+        goals.write_status_file(goals.bundle_for_goal(goal_id))
+    except Exception:
+        pass
+    _refresh_after_graph_write(goal_id)
 
 
 def _log_action(action: str, resolved: graph_mod.ResolvedMission, details: dict) -> None:

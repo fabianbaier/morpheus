@@ -73,6 +73,11 @@ DEFAULTS: dict[str, Any] = {
         "draft_prompt": "/adversarial-review",
         "gh_repos": [],
     },
+    "goal_loop": {
+        "enabled": True,
+        "cooldown_seconds": 120,
+        "max_per_tick": 2,
+    },
     "topic_watchers": {
         # List of {"name": "...", "query": "...", "interval_minutes": N}
         "watchers": [],
@@ -179,6 +184,14 @@ spawn_from_gh_pr = false
 gh_poll_secs = 300
 draft_prompt = "/adversarial-review"
 gh_repos = []
+
+[goal_loop]
+# When enabled, the watcher/cockpit nudges idle autonomous goal controllers.
+enabled = true
+# Minimum seconds between continuation turns per goal controller.
+cooldown_seconds = 120
+# Maximum goal controllers to nudge on one watcher tick.
+max_per_tick = 2
 
 [topic_watchers]
 # List of tables: each runs `claude -p` with web search on its interval.

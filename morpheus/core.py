@@ -11,7 +11,7 @@ from morpheus import activity as activity_mod
 from morpheus import config as cfg_mod
 from morpheus import context as ctx_mod
 from morpheus import daemon as daemon_mod
-from morpheus import db, detect, iterm_client, naming, tenant as tenant_mod
+from morpheus import db, detect, goals as goals_mod, iterm_client, naming, tenant as tenant_mod
 
 LOG_DIR = Path.home() / ".morpheus"
 LOG_PATH = LOG_DIR / "morpheus.log"
@@ -151,10 +151,91 @@ async def _tick(connection, log: logging.Logger,
     except Exception as e:
         log.exception("context write failed: %s", e)
 
+    await _nudge_due_goal_controllers(connection, cfg, log, on_alert)
+
     # Heartbeat so `morpheus daemon-status` can tell we're alive.
     daemon_mod.write_beacon()
 
     return len(seen_ids)
+
+
+async def _nudge_due_goal_controllers(connection, cfg: dict, log: logging.Logger, on_alert=None) -> None:
+    goal_cfg = cfg.get("goal_loop", {})
+    if not goal_cfg.get("enabled", True):
+        return
+    try:
+        cooldown = float(goal_cfg.get("cooldown_seconds", goals_mod.DEFAULT_CONTINUATION_COOLDOWN_SECONDS))
+        limit = int(goal_cfg.get("max_per_tick", 2))
+    except (TypeError, ValueError):
+        cooldown = goals_mod.DEFAULT_CONTINUATION_COOLDOWN_SECONDS
+        limit = 2
+    if limit < 1:
+        return
+
+    try:
+        paused = goals_mod.pause_budget_exhausted_goals()
+        if paused and on_alert is not None:
+            for goal in paused:
+                await on_alert(
+                    "goal_budget_pause",
+                    None,
+                    f"goal [{goal.goal_id}] paused: controller turn budget exhausted",
+                )
+        targets = goals_mod.due_continuation_targets(
+            cooldown_seconds=cooldown,
+            limit=limit,
+        )
+    except Exception:
+        log.exception("goal continuation target discovery failed")
+        return
+
+    for target in targets:
+        try:
+            bundle, outcome = goals_mod.reserve_continuation(
+                target.goal.goal_id,
+                reason=target.reason,
+                cooldown_seconds=cooldown,
+            )
+            if outcome != "reserved":
+                if outcome == "budget_exhausted" and on_alert is not None:
+                    await on_alert(
+                        "goal_budget_pause",
+                        target.controller,
+                        f"goal [{target.goal.goal_id}] paused: controller turn budget exhausted",
+                    )
+                continue
+            text = goals_mod.continuation_text(bundle, reason=target.reason)
+            results = await iterm_client.send_text_to_tabs(
+                connection,
+                [target.controller.tab_id],
+                iterm_client.text_with_enter(text),
+            )
+            result = results[0] if results else None
+            if result is None or not result.ok:
+                db.add_event(
+                    bundle.goal.parent_mission_id,
+                    kind="goal_continue_failed",
+                    actor="morpheus",
+                    summary=(result.error if result else "send returned no result"),
+                    source_ref=f"goal:{bundle.goal.goal_id}",
+                    metadata={"goal_id": bundle.goal.goal_id, "controller_tab_id": target.controller.tab_id},
+                )
+                log.warning("goal continuation failed for %s: %s", bundle.goal.goal_id, result.error if result else "no result")
+                continue
+            db.add_note(
+                text=f"goal {bundle.goal.goal_id} continuation {bundle.goal.turns_used}/{bundle.goal.max_turns} queued",
+                tab_id=target.controller.tab_id,
+                session_id=target.controller.session_id,
+                kind="goal",
+            )
+            if on_alert is not None:
+                await on_alert(
+                    "goal_continue",
+                    target.controller,
+                    f"goal [{bundle.goal.goal_id}] continuation {bundle.goal.turns_used}/{bundle.goal.max_turns} queued",
+                )
+        except Exception:
+            log.exception("goal continuation failed for %s", target.goal.goal_id)
 
 
 def _should_ignore_tab(

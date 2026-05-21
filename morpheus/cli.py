@@ -20,7 +20,7 @@ from morpheus import ask as ask_mod
 from morpheus import brief as brief_mod
 from morpheus import config as cfg_mod
 from morpheus import context as ctx_mod
-from morpheus import core, daemon as daemon_mod, db, iterm_client, ledger as ledger_mod, loops as loops_mod, mission_graph as graph_mod, naming, notifier as notifier_mod, prd_runs, recall_eval, tenant as tenant_mod, trigger as trigger_mod, __version__
+from morpheus import core, daemon as daemon_mod, db, goals as goals_mod, iterm_client, ledger as ledger_mod, loops as loops_mod, mission_graph as graph_mod, naming, notifier as notifier_mod, prd_runs, recall_eval, tenant as tenant_mod, trigger as trigger_mod, __version__
 
 app = typer.Typer(
     name="morpheus",
@@ -312,6 +312,381 @@ def run_status(
 
     console.print(Markdown(status_path.read_text(encoding="utf-8")))
     console.print(f"\n[green]status refreshed:[/green] {status_path}")
+
+
+# ───────── autonomous goal runs (v0.9 foundation) ─────────
+
+goal_app = typer.Typer(help="Start and control autonomous PRD/mission goal runs.")
+app.add_typer(goal_app, name="goal")
+
+
+@goal_app.command("start")
+def goal_start(
+    source: str = typer.Argument(..., help="PRD path or mission id/prefix to promote into a goal."),
+    command: str = typer.Option("codex", "--cmd", "-c", help="Controller command, e.g. 'codex' or 'claude'."),
+    workers: str = typer.Option("auto", "--workers", "-w", help="'auto' or maximum active worker count."),
+    title: Optional[str] = typer.Option(None, "--title", "-t", help="Title for a new PRD parent mission."),
+    objective: Optional[str] = typer.Option(None, "--objective", "-o", help="Override the standing objective."),
+    done_definition: Optional[str] = typer.Option(None, "--done", help="Override the completion condition."),
+    autonomy_level: str = typer.Option("ask_to_spawn", "--autonomy", help="observe_only, ask_to_spawn, or bounded_fanout."),
+    max_turns: int = typer.Option(goals_mod.DEFAULT_MAX_TURNS, "--max-turns", help="Controller continuation turn budget."),
+    max_spend_usd: float = typer.Option(0.0, "--max-spend-usd", help="Optional spend budget; 0 means unset."),
+    judge_model: str = typer.Option("", "--judge-model", help="Optional cheap evaluator model/provider label."),
+):
+    """Create a goal run, spawn one visible controller tab, and link it."""
+    try:
+        max_workers = _parse_goal_workers(workers)
+        project = tenant_mod.ensure_project_tenant(Path.cwd())
+        bundle = goals_mod.create_goal_run(
+            source,
+            title=title,
+            objective=objective,
+            done_definition=done_definition,
+            project=project,
+            autonomy_level=autonomy_level,
+            max_turns=max_turns,
+            max_workers=max_workers,
+            max_spend_usd=max_spend_usd,
+            judge_model=judge_model,
+        )
+        owner = _goal_project(bundle.goal) or project
+        controller_goal = f"{bundle.parent.title or bundle.goal.goal_id} goal controller"
+        controller_cmd = tenant_mod.command_in_project(
+            goals_mod.controller_command(command, bundle),
+            owner.root_path,
+        )
+    except Exception as e:
+        console.print(f"[red]goal start failed: {e}[/red]")
+        raise typer.Exit(1)
+
+    async def _do(connection):
+        info = await iterm_client.spawn_tab(
+            connection,
+            command=controller_cmd,
+            goal=controller_goal,
+        )
+        if info is None:
+            console.print("[red]failed to spawn goal controller tab — is iTerm focused?[/red]")
+            raise typer.Exit(1)
+
+        now = time.time()
+        mission = db.Mission(
+            tab_id=info.tab_id,
+            session_id=info.session_id,
+            tenant_id=owner.tenant_id,
+            project_root=owner.root_path,
+            goal=controller_goal,
+            state="working",
+            cmd=controller_cmd,
+            linked_worktree=owner.root_path,
+            buffer_changed_at=now,
+            last_event_at=now,
+            created_at=now,
+        )
+        db.upsert(mission)
+        goal = goals_mod.attach_controller(bundle, mission)
+        ledger_mod.log_action(
+            "goal_start",
+            tab_id=mission.tab_id,
+            details={
+                "goal_id": goal.goal_id,
+                "parent_mission_id": goal.parent_mission_id,
+                "controller_mission_id": mission.mission_id,
+                "max_turns": goal.max_turns,
+                "max_workers": goal.max_workers,
+                "autonomy_level": goal.autonomy_level,
+            },
+        )
+        _refresh_context_files()
+        console.print(f"[green]goal run created[/green] [bold]{bundle.parent.title or goal.goal_id}[/bold]")
+        console.print(f"  goal:       [cyan]{goal.goal_id}[/cyan]")
+        console.print(f"  parent:     [cyan]{goal.parent_mission_id}[/cyan]")
+        console.print(f"  controller: [cyan]{mission.mission_id}[/cyan] tab {info.tab_id}")
+        console.print(f"  status:     {goals_mod.bundle_for_goal(goal.goal_id).status_path}")
+        console.print(f"  prompt:     {goals_mod.bundle_for_goal(goal.goal_id).prompt_path}")
+
+    iterm_client.run(_do)
+
+
+@goal_app.command("status")
+def goal_status(
+    ref: str = typer.Argument(..., help="Goal id/prefix, parent mission, controller, or worker mission."),
+):
+    """Print the graph-rendered status for a goal run."""
+    goal = goals_mod.resolve_goal(ref)
+    if goal is None:
+        console.print(f"[red]no goal run matching '{ref}'[/red]")
+        raise typer.Exit(1)
+    bundle = goals_mod.bundle_for_goal(goal.goal_id)
+    goals_mod.write_status_file(bundle)
+    console.print(Markdown(bundle.status_path.read_text(encoding="utf-8")))
+    console.print(f"\n[green]status refreshed:[/green] {bundle.status_path}")
+
+
+@goal_app.command("list")
+def goal_list(
+    all_statuses: bool = typer.Option(False, "--all", "-a", help="Include done/failed/cleared goals."),
+):
+    """List autonomous goal runs."""
+    project = tenant_mod.ensure_project_tenant(Path.cwd())
+    rows = db.all_goal_runs(include_finished=all_statuses, tenant_id=project.tenant_id)
+    if not rows and not all_statuses:
+        rows = db.all_goal_runs(include_finished=False)
+    if not rows:
+        console.print("[dim]no goal runs yet[/dim]")
+        return
+    table = Table(title=f"MORPHEUS GOALS — {len(rows)}", header_style="bold green")
+    table.add_column("GOAL", style="cyan", no_wrap=True)
+    table.add_column("ST", no_wrap=True)
+    table.add_column("TURNS", no_wrap=True)
+    table.add_column("WORKERS", no_wrap=True)
+    table.add_column("OBJECTIVE")
+    for goal in rows:
+        table.add_row(
+            graph_mod.short_id(goal.goal_id),
+            goal.status,
+            f"{goal.turns_used}/{goal.max_turns}",
+            f"{goal.active_workers}/{goal.max_workers}",
+            goal.objective or goal.parent_mission_id,
+        )
+    console.print(table)
+
+
+@goal_app.command("continue")
+def goal_continue_cmd(
+    ref: str = typer.Argument(..., help="Goal id/prefix, parent, controller, or worker."),
+    reason: str = typer.Option("manual continuation", "--reason", "-r", help="Why this continuation is being queued."),
+    cooldown: float = typer.Option(0.0, "--cooldown", help="Minimum seconds since the last continuation."),
+    stage: bool = typer.Option(False, "--stage", help="Type the continuation without pressing Enter."),
+):
+    """Queue one bounded continuation turn into the live controller tab."""
+    goal = _resolve_goal_or_exit(ref)
+    controller = _goal_controller_or_exit(goal)
+
+    async def _do(connection):
+        return await _send_goal_continuation(
+            connection,
+            goal.goal_id,
+            controller,
+            reason=reason,
+            cooldown_seconds=cooldown,
+            submit=not stage,
+        )
+
+    sent = iterm_client.run(_do)
+    if not sent:
+        raise typer.Exit(1)
+
+
+@goal_app.command("run-due")
+def goal_run_due(
+    limit: int = typer.Option(2, "--limit", "-n", help="Maximum goal controllers to nudge."),
+    cooldown: float = typer.Option(goals_mod.DEFAULT_CONTINUATION_COOLDOWN_SECONDS, "--cooldown", help="Minimum seconds between continuation turns."),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Show due controllers without sending text."),
+):
+    """Nudge due idle goal controllers once. The watcher/cockpit also does this when enabled."""
+    paused = [] if dry_run else goals_mod.pause_budget_exhausted_goals()
+    targets = goals_mod.due_continuation_targets(cooldown_seconds=cooldown, limit=limit)
+    if dry_run:
+        for goal in paused:
+            console.print(f"{goal.goal_id} paused: controller turn budget exhausted")
+        if not targets:
+            console.print("[dim]no goal controllers due[/dim]")
+            return
+        for target in targets:
+            console.print(f"{target.goal.goal_id} → {target.controller.tab_id.split('-')[0]} ({target.reason})")
+        return
+    if not targets:
+        console.print("[dim]no goal controllers due[/dim]")
+        return
+
+    async def _do(connection):
+        sent = 0
+        for target in targets:
+            ok = await _send_goal_continuation(
+                connection,
+                target.goal.goal_id,
+                target.controller,
+                reason=target.reason,
+                cooldown_seconds=cooldown,
+                submit=True,
+            )
+            if ok:
+                sent += 1
+        return sent
+
+    sent = iterm_client.run(_do)
+    console.print(f"[green]queued[/green] {sent}/{len(targets)} goal continuation(s)")
+    if sent != len(targets):
+        raise typer.Exit(1)
+
+
+@goal_app.command("pause")
+def goal_pause(
+    ref: str = typer.Argument(..., help="Goal id/prefix to pause."),
+    reason: str = typer.Option("Paused by user", "--reason", "-r", help="Pause reason."),
+):
+    """Pause future goal continuation work without deleting history."""
+    _set_goal_status_from_cli(ref, "paused", reason=reason)
+
+
+@goal_app.command("resume")
+def goal_resume(
+    ref: str = typer.Argument(..., help="Goal id/prefix to resume."),
+    reason: str = typer.Option("Resumed by user", "--reason", "-r", help="Resume reason."),
+):
+    """Resume a goal run and reset the controller turn window."""
+    _set_goal_status_from_cli(ref, "active", reason=reason, reset_turns=True)
+
+
+@goal_app.command("done")
+def goal_done(
+    ref: str = typer.Argument(..., help="Goal id/prefix to mark done."),
+    reason: str = typer.Option("Goal done; proof recorded", "--reason", "-r", help="Completion summary."),
+):
+    """Mark a goal run done while preserving graph history."""
+    _set_goal_status_from_cli(ref, "done", reason=reason)
+
+
+@goal_app.command("clear")
+def goal_clear(
+    ref: str = typer.Argument(..., help="Goal id/prefix to clear."),
+    reason: str = typer.Option("Cleared by user", "--reason", "-r", help="Clear reason."),
+):
+    """Clear the active goal loop while preserving graph history."""
+    _set_goal_status_from_cli(ref, "cleared", reason=reason)
+
+
+@goal_app.command("task-add")
+def goal_task_add(
+    ref: str = typer.Argument(..., help="Goal id/prefix, parent, controller, or worker."),
+    title: str = typer.Argument(..., help="Short task title."),
+    scope: str = typer.Option("", "--scope", "-s", help="Owned scope/files for this task."),
+    verification: str = typer.Option("", "--verify", "-v", help="Verification required before done."),
+    path: Optional[list[str]] = typer.Option(None, "--path", "-p", help="Claimed path. Repeat for multiple paths."),
+):
+    """Create a bounded goal worker task without spawning it yet."""
+    try:
+        task = goals_mod.create_task(
+            ref,
+            title=title,
+            scope=scope,
+            verification=verification,
+            claimed_paths=path or (),
+        )
+    except ValueError as e:
+        console.print(f"[red]{e}[/red]")
+        raise typer.Exit(1)
+    ledger_mod.log_action("goal_task_add", details={"goal_id": task.goal_id, "task_id": task.task_id})
+    _refresh_context_files()
+    console.print(f"[green]task created[/green] {task.task_id}")
+
+
+@goal_app.command("tasks")
+def goal_tasks_cmd(
+    ref: str = typer.Argument(..., help="Goal id/prefix, parent, controller, or worker."),
+):
+    """List tasks for a goal run."""
+    goal = _resolve_goal_or_exit(ref)
+    tasks = db.goal_tasks(goal.goal_id)
+    if not tasks:
+        console.print("[dim]no tasks yet[/dim]")
+        return
+    table = Table(title=f"GOAL TASKS — {goal.goal_id}", header_style="bold green")
+    table.add_column("TASK", style="cyan", no_wrap=True)
+    table.add_column("ST", no_wrap=True)
+    table.add_column("WORKER", no_wrap=True)
+    table.add_column("TITLE")
+    table.add_column("SCOPE")
+    for task in tasks:
+        table.add_row(
+            graph_mod.short_id(task.task_id),
+            task.status,
+            graph_mod.short_id(task.worker_mission_id) if task.worker_mission_id else "—",
+            task.title,
+            task.scope or "—",
+        )
+    console.print(table)
+
+
+@goal_app.command("task-spawn")
+def goal_task_spawn(
+    task_ref: str = typer.Argument(..., help="Goal task id/prefix to spawn as a live worker."),
+    command: str = typer.Option("codex", "--cmd", "-c", help="Worker command, e.g. 'codex' or 'claude'."),
+    worker_goal: Optional[str] = typer.Option(None, "--goal", "-g", help="Override the iTerm tab goal label."),
+):
+    """Spawn a live worker tab for a planned goal task."""
+    task = goals_mod.resolve_task(task_ref)
+    if task is None:
+        console.print(f"[red]goal task not found: {task_ref}[/red]")
+        raise typer.Exit(1)
+    goal = db.get_goal_run(task.goal_id)
+    if goal is None:
+        console.print(f"[red]goal run not found: {task.goal_id}[/red]")
+        raise typer.Exit(1)
+    if goal.autonomy_level == "observe_only":
+        console.print("[red]goal autonomy is observe_only; worker spawn is disabled[/red]")
+        raise typer.Exit(1)
+    bundle = goals_mod.bundle_for_goal(goal.goal_id)
+    owner = _goal_project(goal) or tenant_mod.ensure_project_tenant(Path.cwd())
+    label = worker_goal or f"{task.title} goal worker"
+    worker_cmd = tenant_mod.command_in_project(
+        goals_mod.worker_command(command, bundle, task),
+        owner.root_path,
+    )
+
+    async def _do(connection):
+        info = await iterm_client.spawn_tab(connection, command=worker_cmd, goal=label)
+        if info is None:
+            console.print("[red]failed to spawn goal worker tab — is iTerm focused?[/red]")
+            raise typer.Exit(1)
+        now = time.time()
+        mission = db.Mission(
+            tab_id=info.tab_id,
+            session_id=info.session_id,
+            tenant_id=owner.tenant_id,
+            project_root=owner.root_path,
+            goal=label,
+            state="working",
+            cmd=worker_cmd,
+            linked_worktree=owner.root_path,
+            buffer_changed_at=now,
+            last_event_at=now,
+            created_at=now,
+        )
+        db.upsert(mission)
+        updated = goals_mod.attach_worker(task.task_id, mission)
+        ledger_mod.log_action(
+            "goal_worker_spawn",
+            tab_id=mission.tab_id,
+            details={"goal_id": goal.goal_id, "task_id": updated.task_id, "worker_mission_id": mission.mission_id},
+        )
+        _refresh_context_files()
+        console.print(f"[green]worker spawned[/green] {mission.mission_id} tab {info.tab_id}")
+        console.print(f"  task:   {updated.task_id}")
+        console.print(f"  status: {goals_mod.bundle_for_goal(goal.goal_id).status_path}")
+
+    iterm_client.run(_do)
+
+
+@goal_app.command("task-status")
+def goal_task_status_cmd(
+    task_ref: str = typer.Argument(..., help="Goal task id/prefix or worker mission id/prefix."),
+    status: str = typer.Argument(..., help="planned | running | blocked | done | failed | ready_for_retry | cancelled"),
+    summary: str = typer.Option("", "--summary", "-s", help="Heartbeat, blocker, or completion summary."),
+):
+    """Update a goal task heartbeat/status and roll it up to the goal status file."""
+    try:
+        task = goals_mod.set_task_status(task_ref, status, summary=summary)
+    except ValueError as e:
+        console.print(f"[red]{e}[/red]")
+        raise typer.Exit(1)
+    ledger_mod.log_action(
+        f"goal_task_{status}",
+        details={"goal_id": task.goal_id, "task_id": task.task_id, "summary": summary[:160]},
+    )
+    _refresh_context_files()
+    console.print(f"[green]{status}[/green] task {task.task_id}")
 
 
 # ───────── prompt loops ─────────
@@ -683,6 +1058,143 @@ def _refresh_context_files() -> None:
         ctx_mod.write_context_json()
     except Exception:
         pass
+
+
+def _parse_goal_workers(value: str) -> int:
+    raw = (value or "auto").strip().lower()
+    if raw == "auto":
+        return goals_mod.DEFAULT_MAX_WORKERS
+    try:
+        parsed = int(raw)
+    except ValueError:
+        console.print(f"[red]invalid --workers value '{value}'; use 'auto' or an integer[/red]")
+        raise typer.Exit(1)
+    if parsed < 1:
+        console.print("[red]--workers must be at least 1[/red]")
+        raise typer.Exit(1)
+    return parsed
+
+
+def _resolve_goal_or_exit(ref: str) -> db.GoalRun:
+    goal = goals_mod.resolve_goal(ref)
+    if goal is None:
+        console.print(f"[red]no goal run matching '{ref}'[/red]")
+        raise typer.Exit(1)
+    return goal
+
+
+def _goal_controller_or_exit(goal: db.GoalRun) -> db.Mission:
+    if not goal.controller_mission_id:
+        console.print(f"[red]goal has no controller session: {goal.goal_id}[/red]")
+        raise typer.Exit(1)
+    live = [
+        mission for mission in db.all_missions()
+        if mission.mission_id == goal.controller_mission_id
+    ]
+    if not live:
+        console.print(f"[red]goal controller is not live: {goal.controller_mission_id}[/red]")
+        raise typer.Exit(1)
+    return live[0]
+
+
+async def _send_goal_continuation(
+    connection,
+    goal_ref: str,
+    controller: db.Mission,
+    *,
+    reason: str,
+    cooldown_seconds: float,
+    submit: bool,
+) -> bool:
+    try:
+        bundle, outcome = goals_mod.reserve_continuation(
+            goal_ref,
+            reason=reason,
+            cooldown_seconds=cooldown_seconds,
+        )
+    except ValueError as e:
+        console.print(f"[red]{e}[/red]")
+        return False
+    if outcome != "reserved":
+        style = "yellow" if outcome in {"too_soon", "inactive", "budget_exhausted"} else "red"
+        console.print(f"[{style}]not queued[/{style}] goal {bundle.goal.goal_id}: {outcome}")
+        console.print(f"  status: {bundle.status_path}")
+        return False
+
+    payload = goals_mod.continuation_text(bundle, reason=reason)
+    text = iterm_client.text_with_enter(payload) if submit else payload
+    results = await iterm_client.send_text_to_tabs(connection, [controller.tab_id], text)
+    result = results[0] if results else None
+    if result is None or not result.ok:
+        error = result.error if result else "send returned no result"
+        db.add_event(
+            bundle.goal.parent_mission_id,
+            kind="goal_continue_failed",
+            actor="morpheus",
+            summary=error,
+            source_ref=f"goal:{bundle.goal.goal_id}",
+            metadata={"goal_id": bundle.goal.goal_id, "controller_tab_id": controller.tab_id},
+        )
+        console.print(f"[red]send failed[/red] {controller.tab_id.split('-')[0]}: {error}")
+        return False
+    db.add_note(
+        text=f"goal {bundle.goal.goal_id} continuation {bundle.goal.turns_used}/{bundle.goal.max_turns} queued",
+        tab_id=controller.tab_id,
+        session_id=controller.session_id,
+        kind="goal",
+    )
+    ledger_mod.log_action(
+        "goal_continue",
+        tab_id=controller.tab_id,
+        details={"goal_id": bundle.goal.goal_id, "turns_used": bundle.goal.turns_used, "submit": submit},
+    )
+    _refresh_context_files()
+    mode = "queued" if submit else "staged"
+    console.print(f"[green]{mode}[/green] goal {bundle.goal.goal_id} continuation {bundle.goal.turns_used}/{bundle.goal.max_turns}")
+    console.print(f"  controller: {controller.tab_id.split('-')[0]}")
+    console.print(f"  status:     {bundle.status_path}")
+    return True
+
+
+def _goal_project(goal: db.GoalRun) -> Optional[db.ProjectTenant]:
+    if goal.tenant_id:
+        project = db.get_project_tenant(goal.tenant_id)
+        if project is not None:
+            return project
+    if goal.project_root:
+        return tenant_mod.ensure_project_tenant(goal.project_root)
+    return None
+
+
+def _set_goal_status_from_cli(
+    ref: str,
+    status: str,
+    *,
+    reason: str,
+    reset_turns: bool = False,
+) -> None:
+    goal = goals_mod.resolve_goal(ref)
+    if goal is None:
+        console.print(f"[red]no goal run matching '{ref}'[/red]")
+        raise typer.Exit(1)
+    try:
+        bundle = goals_mod.set_status(
+            goal.goal_id,
+            status,
+            reason=reason,
+            reset_turns=reset_turns,
+        )
+    except ValueError as e:
+        console.print(f"[red]{e}[/red]")
+        raise typer.Exit(1)
+    ledger_mod.log_action(
+        f"goal_{status}",
+        details={"goal_id": bundle.goal.goal_id, "reason": reason},
+    )
+    _refresh_context_files()
+    style = "green" if status == "active" else "yellow" if status == "paused" else "red"
+    console.print(f"[{style}]{status}[/{style}] goal {bundle.goal.goal_id}")
+    console.print(f"  status: {bundle.status_path}")
 
 
 def _loop_target_label(loop: db.PromptLoop) -> str:

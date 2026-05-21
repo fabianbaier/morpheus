@@ -2,9 +2,9 @@
 
 | Field | Value |
 |---|---|
-| **Status** | v0.8.0a25 implemented (cwd project tenancy + cleanup + cached activity snapshot); next: 48-hour recall eval |
+| **Status** | v0.8.0a26 implemented (cwd project tenancy + cleanup + cached activity snapshot); autonomous PRD goal runs implemented locally |
 | **Author** | Fabian Baier |
-| **Last updated** | 2026-05-20 |
+| **Last updated** | 2026-05-21 |
 | **Target platform** | macOS + iTerm2 |
 | **Repo** | `~/github/fabianbaier/morpheus` |
 
@@ -99,6 +99,24 @@ Research inputs and takeaways:
   visible agent loop. Takeaway: Morpheus should not become a coding agent; it
   should be the cross-session layer that tracks loop phase, proof, permissions,
   cost, and resumability across Claude, Codex, OpenCode, and shell sessions.
+- **2026 goal-mode research** — Codex CLI exposes experimental
+  [`/goal`](https://developers.openai.com/codex/cli/slash-commands) to attach a
+  persistent target to a larger task; Codex
+  [subagents](https://developers.openai.com/codex/concepts/subagents) keep noisy
+  parallel exploration out of the main thread. Hermes
+  [`/goal`](https://hermes-agent.nousresearch.com/docs/user-guide/features/goals)
+  makes the Ralph-loop shape explicit: a standing objective, cheap judge after
+  every turn, continuation prompt, pause/resume/clear controls, mid-run
+  subgoals, persistence, and a turn budget. Claude Code
+  [`/goal`](https://code.claude.com/docs/en/goal) uses a separate evaluator
+  model after each turn, while
+  [Agent View](https://code.claude.com/docs/en/agent-view) adds the missing
+  operator surface: background sessions grouped by state, peek/reply, attach,
+  per-session worktree isolation, and durable supervisor state. Takeaway:
+  Morpheus should implement goal mode above provider CLIs: the goal belongs to
+  the mission graph, the controller is visible, workers are first-class mission
+  rows, and proof/status rollups reach the cockpit, white-rabbit ticker, MCP,
+  and `morpheus ask`.
 - **Karpathy LLM Wiki pattern** — raw sources stay immutable, the LLM maintains
   an interlinked markdown wiki, and an index/log/lint loop makes knowledge
   compound. Takeaway: transcripts are raw sources, mission cards are maintained
@@ -140,6 +158,10 @@ Research inputs and takeaways:
   and confidence.
 - G12: Mission knowledge compounds across sessions via a local graph of
   missions, topics, decisions, blockers, files, PRs, snapshots, and evidence.
+- G13: A durable PRD or mission can be promoted into an autonomous goal run:
+  one visible controller session keeps the end goal alive, fans out bounded
+  worker sessions in parallel, collects their status/proof, and stops, pauses,
+  or escalates based on explicit completion criteria and budgets.
 
 ### Non-Goals (forever)
 
@@ -194,6 +216,10 @@ Research inputs and takeaways:
 12. **Coordination must be active.** Passive "please check context first"
     conventions are useful but not enough; Morpheus should surface collisions
     and claims directly in the cockpit.
+13. **Autonomy needs a controller and a kill switch.** A goal run must always
+    have an inspectable controller session, explicit done criteria, turn/time/
+    spend/worker budgets, pause/resume/clear controls, and a rule that real user
+    input preempts queued continuation work.
 
 ### 4.1 Hard product stance
 
@@ -333,6 +359,7 @@ attach.
 | `l` | Loop control | Creates a recurring prompt loop routed to ticker/context or the selected mission |
 | `Shift+L` / `L` | Manage loops | Opens the current project's loop manager with edit and run-history controls |
 | `w` | Worker | Spawns a manual child worker under the selected PRD run/coordinator/worker |
+| `Shift+G` / `G` | Goal run | Starts or inspects an autonomous goal run for the selected PRD/mission; status/pause/resume/clear stay in-cockpit |
 | `p` | Prune | Archives stale/finished sessions after confirmation |
 | `d` | Dismiss / close | Closes selected live tab or archives an already-dead mission |
 | `g` | Go to alert | Cycles through current 🐇 alerts |
@@ -383,6 +410,9 @@ The CLI remains the scriptable surface for the same mission model:
 | `morpheus ledger costs/actions` | Inspect cost and action ledgers |
 | `morpheus run find-prds [root]` | List Markdown source candidates in a worktree |
 | `morpheus run start <prd> [--cmd codex]` | Create a PRD parent mission, spawn one coordinator tab, and link it |
+| `morpheus goal start <prd-or-mission> [--cmd codex] [--workers auto\|N]` | Promote a PRD or durable mission into an autonomous goal run with a controller and bounded worker fan-out |
+| `morpheus goal list/status/continue/run-due/pause/resume/done/clear` | Inspect, nudge, budget-pause, complete, or clear a goal run without attaching to the controller session |
+| `morpheus goal task-add/tasks/task-spawn/task-status` | Create bounded goal tasks, spawn visible workers, and roll up worker heartbeat/block/done status |
 | `morpheus loops add/list/run/run-due/pause/resume` | Configure recurring prompt loops and execute due loops |
 | `morpheus install-loop-runner / uninstall-loop-runner / loop-runner-status` | Install, remove, and inspect the launchd runner that wakes to execute due loops |
 | `morpheus mcp serve` | Expose Morpheus state to agent tools |
@@ -422,6 +452,141 @@ manually scoped worker linked to the same parent mission with a `worker` edge
 plus assignment events. In v0.8.0a9, `d` on a virtual parent row archives the
 run and closes live child tabs; `p` archives orphan parent rows that no longer
 have live children.
+
+### 6.5.1 Autonomous Goal Runs
+
+Autonomous Goal Runs are the v0.9 evolution of PRD Runs. A user can select a
+PRD, spec, or durable mission and say "make this the goal." By default the end
+goal is completion of the PRD's acceptance criteria, with passing verification
+and captured proof artifacts. The user can override the done definition, worker
+count, command/provider, model, and budgets before the run starts.
+
+Morpheus's goal mode is deliberately not just a provider CLI slash command. It
+is a mission-graph primitive that may use Codex `/goal`, Claude `/goal`, Hermes
+`/goal`, provider subagents, or plain `codex`/`claude` sessions underneath, but
+the source of truth remains Morpheus.
+
+Required behavior:
+
+- Starting a goal run creates a durable `goal_runs` row, a parent mission edge,
+  and exactly one visible controller session marked as `role=goal_controller`.
+- The controller prompt reads the PRD/source mission, current graph state,
+  acceptance criteria, claimed paths, existing workers, budget limits, and
+  allowed autonomy level before doing any work.
+- The controller decomposes the goal into bounded worker tasks, creates workers
+  with explicit ownership scopes and verification requirements, and records
+  edges from the goal run to each worker mission.
+- Worker sessions are first-class Morpheus rows, not hidden implementation
+  details. Each worker may use provider-native subagents internally for
+  exploration, tests, or local decomposition, but its externally visible
+  contract is still a Morpheus mission with owned paths, status, proof, and a
+  summary.
+- Worker write scopes must be disjoint by default. If the controller wants two
+  workers to touch the same path, it must surface the conflict in the cockpit
+  and wait for approval or serialize the work.
+- The controller runs an explicit observe/evaluate/continue loop:
+  1. observe current worker statuses, events, artifacts, and transcript
+     headlines;
+  2. reconcile results into the parent mission card and status file;
+  3. run deterministic checks when specified by the PRD or worker contract;
+  4. ask a cheap goal judge whether the done definition is satisfied by the
+     surfaced evidence;
+  5. continue, pause, escalate, or mark done.
+- The goal judge can only judge evidence the controller surfaced in the graph
+  and transcript. It should not silently inspect files or run tools itself.
+  Deterministic checks beat model judgment whenever both exist.
+- User messages and in-cockpit controls preempt queued continuation work.
+  `status`, `pause`, and `clear` are control-plane operations that must be safe
+  while the controller or workers are mid-turn.
+- Goal runs have hard budgets: max controller turns, max wall-clock age,
+  max active workers, max total workers, max spend, and optional max changed
+  files. Hitting a budget auto-pauses and tells the user exactly how to resume,
+  narrow, or clear the run.
+- The controller may ask before spawning the first live worker. After the user
+  approves the goal run's autonomy envelope, bounded worker fan-out inside that
+  envelope is allowed without repeated prompts. Pushing, merging, external
+  messaging, payments, and account actions remain outside the envelope forever.
+- Completion requires a final controller summary, worker closeout summaries,
+  proof artifacts, updated acceptance-criteria state, and a final judge/check
+  event linked to the parent goal.
+
+Cockpit and context requirements:
+
+- The selected goal card shows objective, status, budgets, controller state,
+  active workers, completed workers, blockers, latest judge reason, last proof,
+  changed paths, next controller action, and "why not done yet."
+- The PRD tree renders the goal controller directly under the PRD parent, with
+  workers nested under the controller unless the user switches to a flat
+  status-grouped view.
+- The white-rabbit ticker receives concise headlines for goal start, worker
+  spawn, worker heartbeat, worker block, worker completion, judge continue,
+  budget pause, and goal completion.
+- `morpheus ask "what is the status of the PRD goal?"` answers from the graph,
+  status file, activity cache, events, and artifacts without requiring the user
+  to attach to transcripts.
+- Context files and MCP expose goal run state so any live agent can ask what the
+  controller and sibling workers are doing before touching files.
+
+Failure handling:
+
+- False-negative judge decisions are bounded by the turn/spend budgets and can
+  be cleared manually once the user trusts the evidence.
+- False-positive judge decisions are mitigated by requiring explicit proof
+  artifacts and controller-reported checks before `done`.
+- A crashed worker returns to `blocked` or `ready_for_retry` with its last
+  heartbeat, changed paths, output path, and retry notes.
+- A blocked worker posts a durable blocker event and appears under the goal card
+  before the controller spawns replacement work.
+- If the controller exits or its tab closes while the goal is active, Morpheus
+  keeps the goal row visible and offers `resume` using the provider-native
+  resume path or a fresh controller seeded from the goal graph.
+
+Acceptance tests:
+
+- Selecting a PRD and pressing `Shift+G` creates a goal run, controller mission,
+  status file, graph edges, and a visible tree row without modifying the PRD
+  itself.
+- With a PRD that has three independent acceptance criteria, the controller
+  spawns bounded workers, each worker owns a disjoint scope, and their heartbeat
+  and completion events roll up to the goal card and white-rabbit ticker.
+- While workers are running, `morpheus goal status <goal_id>` and `morpheus ask`
+  can explain progress, blockers, budgets, and next action without reading raw
+  transcripts.
+- `morpheus goal pause <goal_id>` stops future continuation turns without
+  killing already-running worker commands; `resume` restarts the controller
+  loop with a fresh budget window; `clear` removes the active loop while leaving
+  historical mission graph records intact.
+- A run is not marked done until the PRD done definition, acceptance checklist,
+  worker summaries, and verification artifacts all agree.
+
+Non-goals:
+
+- No unbounded recursive worker fan-out. Nested provider subagents may happen
+  inside a worker, but Morpheus caps visible workers and treats the controller
+  as the only entity allowed to spawn new Morpheus workers.
+- No auto-merge, auto-push, auto-approve, or external side effects.
+- No hidden background swarm. If work is happening, it has a row, role, budget,
+  and inspectable status.
+
+Implementation status:
+
+- 2026-05-21: Autonomous goal runs implemented locally. Morpheus now stores
+  `goal_runs` and `goal_tasks`, creates goal controller prompts/status files,
+  renders goal state into the cockpit mission card, context files, MCP tools,
+  and `morpheus goal status`, and links visible controller/worker sessions into
+  the PRD tree with `goal_controller` and `goal_worker` edges.
+- 2026-05-21: The controller loop is graph-backed and bounded. The watcher and
+  cockpit can nudge idle controllers with a continuation prompt, `morpheus goal
+  continue` can queue one turn manually, and `morpheus goal run-due` can be used
+  as a one-shot runner. Turn budgets auto-pause exhausted goals; pause/resume/
+  done/clear remain explicit control-plane operations.
+- 2026-05-21: Worker fan-out is first-class. Controllers can create disjoint
+  tasks with `task-add`, spawn visible worker tabs with `task-spawn`, and roll
+  up heartbeat/block/done state with `task-status`. Overlapping claimed paths
+  are rejected by default and recorded as goal path conflicts.
+- 2026-05-21: Verification passed locally with focused goal-run tests,
+  full unittest discovery, py_compile, CLI help smoke checks, and
+  `git diff --check`.
 
 ### 6.6 Project Tenancy
 
@@ -705,6 +870,7 @@ mission graph memory, provenance, loop phase, and proof tracking.
 | `morpheus/mcp_server.py` | MCP tools exposing sessions, mission graph read/update, notes/claims, spend/actions |
 | `morpheus/mission_graph.py` | v0.7 graph helpers: provenance, edges, stale/lint checks |
 | `morpheus/prd_runs.py` | v0.8 PRD run helpers: PRD discovery, parent mission creation, coordinator prompt/status files |
+| `morpheus/goals.py` | v0.9 goal-run helpers: controller creation, worker fan-out planning, judge/check reconciliation, budgets, pause/resume/clear |
 | `morpheus/proof.py` | v0.7 proof artifact capture and last-check summaries |
 
 ### 7.3 State schema
@@ -760,7 +926,7 @@ mission graph memory, provenance, loop phase, and proof tracking.
 | `id` | INTEGER PK AUTO | |
 | `mission_id` | TEXT FK | |
 | `ts` | REAL | Unix timestamp |
-| `kind` | TEXT | state_change / decision / blocker / prompt / answer / check / summary / archive / resume / loop_output |
+| `kind` | TEXT | state_change / decision / blocker / prompt / answer / check / summary / archive / resume / loop_output / goal_start / goal_judge / goal_pause / goal_done / worker_heartbeat |
 | `actor` | TEXT | user / morpheus / codex / claude / shell / imported |
 | `summary` | TEXT | Short event summary |
 | `source_ref` | TEXT | Transcript span, snapshot path, command, or URL |
@@ -785,9 +951,49 @@ mission graph memory, provenance, loop phase, and proof tracking.
 | `id` | INTEGER PK AUTO | |
 | `from_id` | TEXT | Mission/topic/artifact/entity ID |
 | `to_id` | TEXT | Mission/topic/artifact/entity ID |
-| `relation` | TEXT | relates_to / blocks / supersedes / duplicates / touches / proves / spawned_from |
+| `relation` | TEXT | relates_to / blocks / supersedes / duplicates / touches / proves / spawned_from / goal_run / goal_controller / goal_worker |
 | `reason` | TEXT | Why the edge exists |
 | `created_at` | REAL | Unix timestamp |
+
+**`goal_runs` (v0.9 autonomous controller state)**
+
+| Column | Type | Notes |
+|---|---|---|
+| `goal_id` | TEXT PK | Stable goal-run ID |
+| `parent_mission_id` | TEXT | PRD/source mission the goal belongs to |
+| `controller_mission_id` | TEXT | Visible controller session mission |
+| `tenant_id` | TEXT | Owning project tenant |
+| `project_root` | TEXT | Worktree/root used for the controller session |
+| `source_kind` | TEXT | prd / mission / issue / user |
+| `source_ref` | TEXT | PRD path, mission ID, issue URL, or user text |
+| `objective` | TEXT | Standing end goal |
+| `done_definition` | TEXT | Explicit completion condition |
+| `status` | TEXT | active / paused / blocked / done / failed / cleared |
+| `autonomy_level` | TEXT | observe_only / ask_to_spawn / bounded_fanout |
+| `max_turns`, `turns_used` | INTEGER | Controller continuation budget |
+| `max_workers`, `active_workers` | INTEGER | Fan-out budget and live count |
+| `max_spend_usd`, `spent_usd` | REAL | Optional spend budget |
+| `judge_model` | TEXT | Cheap evaluator model/provider label |
+| `last_judge_reason` | TEXT | Most recent continue/done/pause rationale |
+| `last_continued_at` | REAL | Unix timestamp |
+| `created_at`, `updated_at`, `finished_at` | REAL | Lifecycle |
+
+**`goal_tasks` (v0.9 worker contracts under a goal)**
+
+| Column | Type | Notes |
+|---|---|---|
+| `task_id` | TEXT PK | Stable worker task ID |
+| `goal_id` | TEXT FK | Owning goal run |
+| `worker_mission_id` | TEXT | Linked worker mission, nullable until spawned |
+| `title` | TEXT | Human-readable worker assignment |
+| `scope` | TEXT | Owned files, modules, or responsibility boundary |
+| `status` | TEXT | planned / ready / running / blocked / done / failed |
+| `claimed_paths` | TEXT | JSON list of worker-owned paths |
+| `verification` | TEXT | Required checks/proof for this worker |
+| `last_heartbeat_at` | REAL | Unix timestamp |
+| `result_summary` | TEXT | Final handoff summary |
+| `metadata_json` | TEXT | Changed files, tests, blockers, retry notes |
+| `created_at`, `updated_at` | REAL | Lifecycle |
 
 Strong requirement: `mission_memory` and the graph tables are not nice-to-have.
 Without them, Morpheus still tells the user "something is happening" but cannot
@@ -932,6 +1138,7 @@ This table is the source of truth for where the product stands right now.
 | PRD Runs foundation | Implemented in v0.8.0a1 | PRD finder, new-session PRD selector, parent mission creation, coordinator prompt/status files, `morpheus run start`, and coordinator graph edge shipped |
 | PRD run tree UI | Partially implemented in v0.8.0a5 | Shows virtual PRD parent rows with coordinator/worker sessions rendered underneath them; collapse/expand remains future polish |
 | PRD child worker spawn | Implemented in v0.8.0a5 | `w` spawns a manual child worker under the selected PRD parent/coordinator/worker with scope and verification prompts |
+| Autonomous PRD goal runs | Foundation implemented | `goal_runs`/`goal_tasks`, `morpheus goal start/status/pause/resume/clear`, rendered controller prompt/status files, `Shift+G` dashboard start flow, controller graph edges, budgets, and status/proof rollups. Automatic continuation and worker fan-out execution remain v0.9 follow-up work |
 | Nonblocking PRD picker | Implemented in v0.8.0a6 | `n` uses a bounded PRD scan and refuses broad roots like `$HOME`, preventing the dashboard from freezing before the new-session modal opens |
 | Markdown source picker | Implemented in v0.8.0a7 | The `n` picker shows all discovered `.md`/`.markdown` files rather than only PRD-named files, while sorting PRD/spec candidates first |
 | Edit mission flow | Implemented in v0.8.0a8 | `e` opens a dashboard editor for goal/title/why/done/criteria/plan/next/phase/blocker/source/issue/PR/worktree/claimed paths/topic, saves graph memory + live fields, and records a `mission_edit` event |
@@ -1146,6 +1353,42 @@ Not in v0.7:
 - Full custom terminal multiplexer
 - Automatic destructive actions
 - Web-search topic watcher execution unless mission graph recall is already solid
+
+### v0.9 — Autonomous Goal Runs
+
+This is the move from "Morpheus can organize a PRD run" to "Morpheus can keep a
+PRD implementation moving without the user typing keep-going prompts."
+
+Must ship:
+
+- **Goal run schema and CLI** — `goal_runs`, `goal_tasks`, `morpheus goal
+  start/status/pause/resume/clear`, and graph/event/artifact integration.
+- **In-cockpit start flow** — `Shift+G` on a PRD/mission opens an autonomy
+  envelope form: objective, done definition, command/provider, max workers,
+  turn/time/spend budgets, and whether bounded fan-out is allowed.
+- **Visible controller session** — one controller tab owns decomposition,
+  worker launch, reconciliation, judge/check decisions, and final synthesis.
+- **Worker fan-out** — controller-created worker sessions get explicit scopes,
+  isolated worktrees where possible, verification requirements, graph edges, and
+  white-rabbit ticker updates.
+- **Goal evaluation loop** — after each controller turn, Morpheus records
+  surfaced evidence, runs deterministic checks when configured, asks a cheap
+  evaluator for continue/done/block, and either queues the next controller turn
+  or pauses/completes the run.
+- **Status rollups** — selected goal card, PRD tree, context files,
+  `morpheus ask`, MCP tools, and activity cache can explain progress without
+  attaching to raw transcripts.
+- **Budget and safety controls** — hard caps for turns, wall time, spend,
+  workers, and changed paths; user preemption; no auto-merge/push/approve or
+  external side effects.
+- **Recovery** — if the controller closes, Morpheus keeps the goal row visible
+  and resumes through provider-native resume metadata or a fresh controller
+  seeded from the goal graph.
+
+Success bar: select a PRD, approve a bounded goal run, leave it alone, and come
+back to a cockpit that can answer what shipped, which workers are still active,
+what proof exists, why the goal is or is not done, and what human decision is
+needed next.
 
 ### v1.0 — Cross-platform + extensibility
 

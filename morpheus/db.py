@@ -153,6 +153,8 @@ class ProjectTenantUsage:
     artifacts: int = 0
     edges: int = 0
     notes: int = 0
+    goal_runs: int = 0
+    goal_tasks: int = 0
     loops: int = 0
     loop_runs: int = 0
 
@@ -165,6 +167,8 @@ class ProjectTenantUsage:
             + self.artifacts
             + self.edges
             + self.notes
+            + self.goal_runs
+            + self.goal_tasks
             + self.loops
             + self.loop_runs
         )
@@ -195,6 +199,50 @@ class MissionEdge:
     relation: str
     reason: str
     created_at: float
+
+
+@dataclass
+class GoalRun:
+    goal_id: str
+    parent_mission_id: str
+    controller_mission_id: str = ""
+    tenant_id: str = ""
+    project_root: str = ""
+    source_kind: str = "mission"
+    source_ref: str = ""
+    objective: str = ""
+    done_definition: str = ""
+    status: str = "active"
+    autonomy_level: str = "ask_to_spawn"
+    max_turns: int = 20
+    turns_used: int = 0
+    max_workers: int = 3
+    active_workers: int = 0
+    max_spend_usd: float = 0.0
+    spent_usd: float = 0.0
+    judge_model: str = ""
+    last_judge_reason: str = ""
+    last_continued_at: float = 0.0
+    created_at: float = field(default_factory=time.time)
+    updated_at: float = field(default_factory=time.time)
+    finished_at: float = 0.0
+
+
+@dataclass
+class GoalTask:
+    task_id: str
+    goal_id: str
+    worker_mission_id: str = ""
+    title: str = ""
+    scope: str = ""
+    status: str = "planned"
+    claimed_paths: str = "[]"
+    verification: str = ""
+    last_heartbeat_at: float = 0.0
+    result_summary: str = ""
+    metadata: dict[str, Any] = field(default_factory=dict)
+    created_at: float = field(default_factory=time.time)
+    updated_at: float = field(default_factory=time.time)
 
 
 @dataclass
@@ -347,6 +395,57 @@ CREATE INDEX IF NOT EXISTS mission_edges_from_idx ON mission_edges(from_id);
 CREATE INDEX IF NOT EXISTS mission_edges_to_idx ON mission_edges(to_id);
 CREATE INDEX IF NOT EXISTS mission_edges_relation_idx ON mission_edges(relation);
 
+CREATE TABLE IF NOT EXISTS goal_runs (
+    goal_id               TEXT PRIMARY KEY,
+    parent_mission_id     TEXT NOT NULL,
+    controller_mission_id TEXT NOT NULL DEFAULT '',
+    tenant_id             TEXT NOT NULL DEFAULT '',
+    project_root          TEXT NOT NULL DEFAULT '',
+    source_kind           TEXT NOT NULL DEFAULT 'mission',
+    source_ref            TEXT NOT NULL DEFAULT '',
+    objective             TEXT NOT NULL,
+    done_definition       TEXT NOT NULL DEFAULT '',
+    status                TEXT NOT NULL DEFAULT 'active',
+    autonomy_level        TEXT NOT NULL DEFAULT 'ask_to_spawn',
+    max_turns             INTEGER NOT NULL DEFAULT 20,
+    turns_used            INTEGER NOT NULL DEFAULT 0,
+    max_workers           INTEGER NOT NULL DEFAULT 3,
+    active_workers        INTEGER NOT NULL DEFAULT 0,
+    max_spend_usd         REAL NOT NULL DEFAULT 0,
+    spent_usd             REAL NOT NULL DEFAULT 0,
+    judge_model           TEXT NOT NULL DEFAULT '',
+    last_judge_reason     TEXT NOT NULL DEFAULT '',
+    last_continued_at     REAL NOT NULL DEFAULT 0,
+    created_at            REAL NOT NULL,
+    updated_at            REAL NOT NULL,
+    finished_at           REAL NOT NULL DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS goal_runs_parent_idx ON goal_runs(parent_mission_id);
+CREATE INDEX IF NOT EXISTS goal_runs_controller_idx ON goal_runs(controller_mission_id);
+CREATE INDEX IF NOT EXISTS goal_runs_status_idx ON goal_runs(status, updated_at DESC);
+CREATE INDEX IF NOT EXISTS goal_runs_tenant_idx ON goal_runs(tenant_id, updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS goal_tasks (
+    task_id            TEXT PRIMARY KEY,
+    goal_id            TEXT NOT NULL,
+    worker_mission_id  TEXT NOT NULL DEFAULT '',
+    title              TEXT NOT NULL DEFAULT '',
+    scope              TEXT NOT NULL DEFAULT '',
+    status             TEXT NOT NULL DEFAULT 'planned',
+    claimed_paths      TEXT NOT NULL DEFAULT '[]',
+    verification       TEXT NOT NULL DEFAULT '',
+    last_heartbeat_at  REAL NOT NULL DEFAULT 0,
+    result_summary     TEXT NOT NULL DEFAULT '',
+    metadata_json      TEXT NOT NULL DEFAULT '{}',
+    created_at         REAL NOT NULL,
+    updated_at         REAL NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS goal_tasks_goal_idx ON goal_tasks(goal_id, updated_at DESC);
+CREATE INDEX IF NOT EXISTS goal_tasks_worker_idx ON goal_tasks(worker_mission_id);
+CREATE INDEX IF NOT EXISTS goal_tasks_status_idx ON goal_tasks(status);
+
 CREATE TABLE IF NOT EXISTS notes (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     tab_id      TEXT,
@@ -436,11 +535,14 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
     _ensure_column(conn, "prompt_loop_runs", "mission_id", "TEXT NOT NULL DEFAULT ''")
     _ensure_column(conn, "prompt_loop_runs", "tab_id", "TEXT")
     _ensure_column(conn, "prompt_loop_runs", "session_id", "TEXT")
+    _ensure_column(conn, "goal_runs", "tenant_id", "TEXT NOT NULL DEFAULT ''")
+    _ensure_column(conn, "goal_runs", "project_root", "TEXT NOT NULL DEFAULT ''")
     conn.execute("CREATE INDEX IF NOT EXISTS missions_mission_id_idx ON missions(mission_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS missions_tenant_idx ON missions(tenant_id, updated_at DESC)")
     conn.execute("CREATE INDEX IF NOT EXISTS missions_project_root_idx ON missions(project_root)")
     conn.execute("CREATE INDEX IF NOT EXISTS mission_memory_tenant_idx ON mission_memory(tenant_id, updated_at DESC)")
     conn.execute("CREATE INDEX IF NOT EXISTS mission_memory_project_root_idx ON mission_memory(project_root)")
+    conn.execute("CREATE INDEX IF NOT EXISTS goal_runs_tenant_idx ON goal_runs(tenant_id, updated_at DESC)")
     conn.execute("CREATE INDEX IF NOT EXISTS prompt_loops_tenant_idx ON prompt_loops(tenant_id, next_run_at)")
     conn.execute("CREATE INDEX IF NOT EXISTS prompt_loop_runs_mission_idx ON prompt_loop_runs(mission_id)")
     _backfill_loop_project_columns(conn)
@@ -550,6 +652,16 @@ def _loop_project_from_target(
 def _new_mission_id(now: Optional[float] = None) -> str:
     ts = time.strftime("%Y%m%d%H%M%S", time.localtime(now or time.time()))
     return f"m_{ts}_{secrets.token_hex(4)}"
+
+
+def _new_goal_id(now: Optional[float] = None) -> str:
+    ts = time.strftime("%Y%m%d%H%M%S", time.localtime(now or time.time()))
+    return f"g_{ts}_{secrets.token_hex(4)}"
+
+
+def _new_goal_task_id(now: Optional[float] = None) -> str:
+    ts = time.strftime("%Y%m%d%H%M%S", time.localtime(now or time.time()))
+    return f"gt_{ts}_{secrets.token_hex(4)}"
 
 
 def _infer_agent_kind(command: str) -> str:
@@ -768,6 +880,14 @@ def new_mission_id(now: Optional[float] = None) -> str:
     return _new_mission_id(now)
 
 
+def new_goal_id(now: Optional[float] = None) -> str:
+    return _new_goal_id(now)
+
+
+def new_goal_task_id(now: Optional[float] = None) -> str:
+    return _new_goal_task_id(now)
+
+
 def upsert_project_tenant(tenant: ProjectTenant) -> ProjectTenant:
     now = time.time()
     if not tenant.created_at:
@@ -921,9 +1041,12 @@ def delete_project_tenant(
             )
 
         mission_ids, tab_ids, session_ids = _project_tenant_related_ids(conn, tenant_id)
+        goal_ids = _project_tenant_goal_ids(conn, tenant_id, mission_ids)
         loop_ids = _project_tenant_loop_ids(conn, mission_ids, tab_ids, tenant_id=tenant_id)
         deleted: dict[str, int] = {}
 
+        deleted["goal_tasks"] = _delete_goal_tasks(conn, goal_ids, mission_ids)
+        deleted["goal_runs"] = _delete_where_ids(conn, "goal_runs", "goal_id", goal_ids)
         deleted["prompt_loop_runs"] = _delete_project_loop_runs(
             conn,
             loop_ids,
@@ -973,6 +1096,7 @@ def delete_project_tenant(
 
 def _project_tenant_usage(conn: sqlite3.Connection, tenant_id: str) -> ProjectTenantUsage:
     mission_ids, tab_ids, session_ids = _project_tenant_related_ids(conn, tenant_id)
+    goal_ids = _project_tenant_goal_ids(conn, tenant_id, mission_ids)
     loop_ids = _project_tenant_loop_ids(conn, mission_ids, tab_ids, tenant_id=tenant_id)
     return ProjectTenantUsage(
         tenant_id=tenant_id,
@@ -994,6 +1118,8 @@ def _project_tenant_usage(conn: sqlite3.Connection, tenant_id: str) -> ProjectTe
         artifacts=_count_where_ids(conn, "mission_artifacts", "mission_id", mission_ids),
         edges=_count_project_edges(conn, mission_ids),
         notes=_count_project_notes(conn, tab_ids, session_ids),
+        goal_runs=len(goal_ids),
+        goal_tasks=_count_goal_tasks(conn, goal_ids, mission_ids),
         loops=len(loop_ids),
         loop_runs=_count_project_loop_runs(conn, loop_ids, mission_ids, tab_ids),
     )
@@ -1040,6 +1166,25 @@ def _project_tenant_loop_ids(
         params,
     ).fetchall()
     return sorted({int(row["id"]) for row in rows})
+
+
+def _project_tenant_goal_ids(
+    conn: sqlite3.Connection,
+    tenant_id: str,
+    mission_ids: list[str],
+) -> list[str]:
+    where, params = _or_in_conditions([
+        ("tenant_id", [tenant_id] if tenant_id else []),
+        ("parent_mission_id", mission_ids),
+        ("controller_mission_id", mission_ids),
+    ])
+    if not where:
+        return []
+    rows = conn.execute(
+        f"SELECT goal_id FROM goal_runs WHERE {where}",
+        params,
+    ).fetchall()
+    return sorted({row["goal_id"] for row in rows if row["goal_id"]})
 
 
 def _count(
@@ -1115,6 +1260,34 @@ def _delete_project_edges(conn: sqlite3.Connection, mission_ids: list[str]) -> i
     if not where:
         return 0
     return conn.execute(f"DELETE FROM mission_edges WHERE {where}", params).rowcount
+
+
+def _count_goal_tasks(
+    conn: sqlite3.Connection,
+    goal_ids: list[str],
+    mission_ids: list[str],
+) -> int:
+    where, params = _or_in_conditions([
+        ("goal_id", goal_ids),
+        ("worker_mission_id", mission_ids),
+    ])
+    if not where:
+        return 0
+    return _count(conn, "goal_tasks", where, params)
+
+
+def _delete_goal_tasks(
+    conn: sqlite3.Connection,
+    goal_ids: list[str],
+    mission_ids: list[str],
+) -> int:
+    where, params = _or_in_conditions([
+        ("goal_id", goal_ids),
+        ("worker_mission_id", mission_ids),
+    ])
+    if not where:
+        return 0
+    return conn.execute(f"DELETE FROM goal_tasks WHERE {where}", params).rowcount
 
 
 def _count_project_notes(
@@ -1777,9 +1950,397 @@ def edges_to_id(node_id: str, relation: str = "", limit: int = 50) -> list[Missi
     return [_row_to_edge(r) for r in rows]
 
 
+def upsert_goal_run(goal: GoalRun) -> GoalRun:
+    now = time.time()
+    if not goal.created_at:
+        goal.created_at = now
+    goal.updated_at = now
+    with _connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO goal_runs (
+                goal_id, parent_mission_id, controller_mission_id, tenant_id,
+                project_root, source_kind, source_ref, objective,
+                done_definition, status, autonomy_level, max_turns, turns_used,
+                max_workers, active_workers, max_spend_usd, spent_usd,
+                judge_model, last_judge_reason, last_continued_at,
+                created_at, updated_at, finished_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(goal_id) DO UPDATE SET
+                parent_mission_id     = excluded.parent_mission_id,
+                controller_mission_id = excluded.controller_mission_id,
+                tenant_id             = CASE WHEN excluded.tenant_id != '' THEN excluded.tenant_id ELSE goal_runs.tenant_id END,
+                project_root          = CASE WHEN excluded.project_root != '' THEN excluded.project_root ELSE goal_runs.project_root END,
+                source_kind           = excluded.source_kind,
+                source_ref            = excluded.source_ref,
+                objective             = excluded.objective,
+                done_definition       = excluded.done_definition,
+                status                = excluded.status,
+                autonomy_level        = excluded.autonomy_level,
+                max_turns             = excluded.max_turns,
+                turns_used            = excluded.turns_used,
+                max_workers           = excluded.max_workers,
+                active_workers        = excluded.active_workers,
+                max_spend_usd         = excluded.max_spend_usd,
+                spent_usd             = excluded.spent_usd,
+                judge_model           = excluded.judge_model,
+                last_judge_reason     = excluded.last_judge_reason,
+                last_continued_at     = excluded.last_continued_at,
+                updated_at            = excluded.updated_at,
+                finished_at           = excluded.finished_at
+            """,
+            (
+                goal.goal_id,
+                goal.parent_mission_id,
+                goal.controller_mission_id,
+                goal.tenant_id,
+                goal.project_root,
+                goal.source_kind,
+                goal.source_ref,
+                goal.objective,
+                goal.done_definition,
+                goal.status,
+                goal.autonomy_level,
+                int(goal.max_turns),
+                int(goal.turns_used),
+                int(goal.max_workers),
+                int(goal.active_workers),
+                float(goal.max_spend_usd),
+                float(goal.spent_usd),
+                goal.judge_model,
+                goal.last_judge_reason,
+                float(goal.last_continued_at),
+                float(goal.created_at),
+                float(goal.updated_at),
+                float(goal.finished_at),
+            ),
+        )
+        row = conn.execute("SELECT * FROM goal_runs WHERE goal_id = ?", (goal.goal_id,)).fetchone()
+    return _row_to_goal_run(row)
+
+
+def get_goal_run(goal_id: str) -> Optional[GoalRun]:
+    with _connect() as conn:
+        row = conn.execute("SELECT * FROM goal_runs WHERE goal_id = ?", (goal_id,)).fetchone()
+    return _row_to_goal_run(row) if row else None
+
+
+def all_goal_runs(
+    include_finished: bool = True,
+    tenant_id: Optional[str] = None,
+) -> list[GoalRun]:
+    query = "SELECT * FROM goal_runs"
+    clauses: list[str] = []
+    params: list[Any] = []
+    if not include_finished:
+        clauses.append("status NOT IN ('done', 'failed', 'cleared')")
+    if tenant_id:
+        clauses.append("tenant_id = ?")
+        params.append(tenant_id)
+    if clauses:
+        query += " WHERE " + " AND ".join(clauses)
+    query += " ORDER BY updated_at DESC"
+    with _connect() as conn:
+        rows = conn.execute(query, params).fetchall()
+    return [_row_to_goal_run(row) for row in rows]
+
+
+def goal_run_for_mission(mission_id: str) -> Optional[GoalRun]:
+    with _connect() as conn:
+        row = conn.execute(
+            """
+            SELECT * FROM goal_runs
+             WHERE goal_id = ?
+                OR parent_mission_id = ?
+                OR controller_mission_id = ?
+                OR goal_id IN (
+                    SELECT goal_id FROM goal_tasks WHERE worker_mission_id = ?
+                )
+             ORDER BY updated_at DESC
+             LIMIT 1
+            """,
+            (mission_id, mission_id, mission_id, mission_id),
+        ).fetchone()
+    return _row_to_goal_run(row) if row else None
+
+
+def attach_goal_controller(goal_id: str, controller_mission_id: str) -> Optional[GoalRun]:
+    now = time.time()
+    with _connect() as conn:
+        conn.execute(
+            """
+            UPDATE goal_runs
+               SET controller_mission_id = ?,
+                   status = CASE WHEN status = 'cleared' THEN status ELSE 'active' END,
+                   updated_at = ?
+             WHERE goal_id = ?
+            """,
+            (controller_mission_id, now, goal_id),
+        )
+        row = conn.execute("SELECT * FROM goal_runs WHERE goal_id = ?", (goal_id,)).fetchone()
+    return _row_to_goal_run(row) if row else None
+
+
+def reserve_goal_continuation(
+    goal_id: str,
+    *,
+    reason: str = "",
+    cooldown_seconds: float = 0.0,
+    now: Optional[float] = None,
+) -> tuple[Optional[GoalRun], str]:
+    """Reserve one controller continuation turn.
+
+    Returns `(goal, outcome)` where outcome is one of:
+    `reserved`, `not_found`, `inactive`, `too_soon`, or `budget_exhausted`.
+    """
+    ts = time.time() if now is None else now
+    with _connect() as conn:
+        row = conn.execute("SELECT * FROM goal_runs WHERE goal_id = ?", (goal_id,)).fetchone()
+        if row is None:
+            return None, "not_found"
+        goal = _row_to_goal_run(row)
+        if goal.status != "active":
+            return goal, "inactive"
+        if cooldown_seconds > 0 and goal.last_continued_at > 0:
+            if ts - goal.last_continued_at < cooldown_seconds:
+                return goal, "too_soon"
+        if goal.turns_used >= goal.max_turns:
+            budget_reason = reason or f"controller turn budget exhausted ({goal.turns_used}/{goal.max_turns})"
+            conn.execute(
+                """
+                UPDATE goal_runs
+                   SET status = 'paused',
+                       last_judge_reason = ?,
+                       updated_at = ?
+                 WHERE goal_id = ?
+                """,
+                (budget_reason, ts, goal_id),
+            )
+            row = conn.execute("SELECT * FROM goal_runs WHERE goal_id = ?", (goal_id,)).fetchone()
+            return _row_to_goal_run(row), "budget_exhausted"
+
+        conn.execute(
+            """
+            UPDATE goal_runs
+               SET turns_used = turns_used + 1,
+                   last_continued_at = ?,
+                   last_judge_reason = CASE WHEN ? != '' THEN ? ELSE last_judge_reason END,
+                   updated_at = ?
+             WHERE goal_id = ?
+            """,
+            (ts, reason, reason, ts, goal_id),
+        )
+        row = conn.execute("SELECT * FROM goal_runs WHERE goal_id = ?", (goal_id,)).fetchone()
+    return _row_to_goal_run(row), "reserved"
+
+
+def set_goal_run_status(
+    goal_id: str,
+    status: str,
+    *,
+    reason: str = "",
+    reset_turns: bool = False,
+) -> Optional[GoalRun]:
+    now = time.time()
+    finished_at = now if status in {"done", "failed", "cleared"} else 0.0
+    with _connect() as conn:
+        conn.execute(
+            """
+            UPDATE goal_runs
+               SET status = ?,
+                   turns_used = CASE WHEN ? THEN 0 ELSE turns_used END,
+                   last_judge_reason = CASE WHEN ? != '' THEN ? ELSE last_judge_reason END,
+                   updated_at = ?,
+                   finished_at = CASE WHEN ? != 0 THEN ? ELSE finished_at END
+             WHERE goal_id = ?
+            """,
+            (
+                status,
+                1 if reset_turns else 0,
+                reason,
+                reason,
+                now,
+                finished_at,
+                finished_at,
+                goal_id,
+            ),
+        )
+        row = conn.execute("SELECT * FROM goal_runs WHERE goal_id = ?", (goal_id,)).fetchone()
+    return _row_to_goal_run(row) if row else None
+
+
+def goal_task(task_id: str) -> Optional[GoalTask]:
+    with _connect() as conn:
+        row = conn.execute("SELECT * FROM goal_tasks WHERE task_id = ?", (task_id,)).fetchone()
+    return _row_to_goal_task(row) if row else None
+
+
+def goal_task_for_worker(worker_mission_id: str) -> Optional[GoalTask]:
+    with _connect() as conn:
+        row = conn.execute(
+            """
+            SELECT * FROM goal_tasks
+             WHERE worker_mission_id = ?
+             ORDER BY updated_at DESC
+             LIMIT 1
+            """,
+            (worker_mission_id,),
+        ).fetchone()
+    return _row_to_goal_task(row) if row else None
+
+
+def create_goal_task(
+    goal_id: str,
+    *,
+    title: str,
+    scope: str = "",
+    verification: str = "",
+    claimed_paths: str = "[]",
+    status: str = "planned",
+    worker_mission_id: str = "",
+    metadata: Optional[dict[str, Any]] = None,
+) -> GoalTask:
+    now = time.time()
+    task_id = _new_goal_task_id(now)
+    with _connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO goal_tasks (
+                task_id, goal_id, worker_mission_id, title, scope, status,
+                claimed_paths, verification, last_heartbeat_at, result_summary,
+                metadata_json, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                task_id,
+                goal_id,
+                worker_mission_id,
+                title,
+                scope,
+                status,
+                claimed_paths,
+                verification,
+                0.0,
+                "",
+                json.dumps(metadata or {}, sort_keys=True),
+                now,
+                now,
+            ),
+        )
+        _refresh_goal_active_workers(conn, goal_id)
+        row = conn.execute("SELECT * FROM goal_tasks WHERE task_id = ?", (task_id,)).fetchone()
+    return _row_to_goal_task(row)
+
+
+def update_goal_task(
+    task_id: str,
+    *,
+    status: Optional[str] = None,
+    worker_mission_id: Optional[str] = None,
+    title: Optional[str] = None,
+    scope: Optional[str] = None,
+    verification: Optional[str] = None,
+    claimed_paths: Optional[str] = None,
+    result_summary: Optional[str] = None,
+    metadata: Optional[dict[str, Any]] = None,
+    heartbeat: bool = False,
+) -> Optional[GoalTask]:
+    now = time.time()
+    with _connect() as conn:
+        existing = conn.execute(
+            "SELECT * FROM goal_tasks WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()
+        if existing is None:
+            return None
+        task = _row_to_goal_task(existing)
+        merged_metadata = dict(task.metadata)
+        if metadata is not None:
+            merged_metadata.update(metadata)
+        conn.execute(
+            """
+            UPDATE goal_tasks
+               SET status = CASE WHEN ? IS NULL THEN status ELSE ? END,
+                   worker_mission_id = CASE WHEN ? IS NULL THEN worker_mission_id ELSE ? END,
+                   title = CASE WHEN ? IS NULL THEN title ELSE ? END,
+                   scope = CASE WHEN ? IS NULL THEN scope ELSE ? END,
+                   verification = CASE WHEN ? IS NULL THEN verification ELSE ? END,
+                   claimed_paths = CASE WHEN ? IS NULL THEN claimed_paths ELSE ? END,
+                   result_summary = CASE WHEN ? IS NULL THEN result_summary ELSE ? END,
+                   metadata_json = ?,
+                   last_heartbeat_at = CASE WHEN ? THEN ? ELSE last_heartbeat_at END,
+                   updated_at = ?
+             WHERE task_id = ?
+            """,
+            (
+                status, status,
+                worker_mission_id, worker_mission_id,
+                title, title,
+                scope, scope,
+                verification, verification,
+                claimed_paths, claimed_paths,
+                result_summary, result_summary,
+                json.dumps(merged_metadata, sort_keys=True),
+                1 if heartbeat else 0,
+                now,
+                now,
+                task_id,
+            ),
+        )
+        _refresh_goal_active_workers(conn, task.goal_id)
+        row = conn.execute("SELECT * FROM goal_tasks WHERE task_id = ?", (task_id,)).fetchone()
+    return _row_to_goal_task(row) if row else None
+
+
+def attach_goal_worker(
+    task_id: str,
+    worker_mission_id: str,
+    *,
+    status: str = "running",
+) -> Optional[GoalTask]:
+    return update_goal_task(
+        task_id,
+        worker_mission_id=worker_mission_id,
+        status=status,
+        heartbeat=True,
+    )
+
+
+def goal_tasks(goal_id: str) -> list[GoalTask]:
+    with _connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT * FROM goal_tasks
+             WHERE goal_id = ?
+             ORDER BY created_at ASC
+            """,
+            (goal_id,),
+        ).fetchall()
+    return [_row_to_goal_task(row) for row in rows]
+
+
+def _refresh_goal_active_workers(conn: sqlite3.Connection, goal_id: str) -> int:
+    row = conn.execute(
+        """
+        SELECT COUNT(*) AS n
+          FROM goal_tasks
+         WHERE goal_id = ?
+           AND status IN ('running', 'blocked')
+        """,
+        (goal_id,),
+    ).fetchone()
+    count = int(row["n"] or 0)
+    conn.execute(
+        "UPDATE goal_runs SET active_workers = ?, updated_at = ? WHERE goal_id = ?",
+        (count, time.time(), goal_id),
+    )
+    return count
+
+
 def graph_counts(tenant_id: Optional[str] = None) -> dict[str, int]:
     mission_filter = " WHERE tenant_id = ?" if tenant_id else ""
     memory_filter = " WHERE tenant_id = ?" if tenant_id else ""
+    goal_filter = " WHERE tenant_id = ?" if tenant_id else ""
     active_filter = " WHERE archived_at IS NULL"
     archived_filter = " WHERE archived_at IS NOT NULL"
     if tenant_id:
@@ -1807,6 +2368,11 @@ def graph_counts(tenant_id: Optional[str] = None) -> dict[str, int]:
             "events": conn.execute("SELECT COUNT(*) AS n FROM mission_events").fetchone()["n"],
             "artifacts": conn.execute("SELECT COUNT(*) AS n FROM mission_artifacts").fetchone()["n"],
             "edges": conn.execute("SELECT COUNT(*) AS n FROM mission_edges").fetchone()["n"],
+            "goal_runs": conn.execute(
+                f"SELECT COUNT(*) AS n FROM goal_runs{goal_filter}",
+                mission_params,
+            ).fetchone()["n"],
+            "goal_tasks": conn.execute("SELECT COUNT(*) AS n FROM goal_tasks").fetchone()["n"],
             "loops": conn.execute("SELECT COUNT(*) AS n FROM prompt_loops").fetchone()["n"],
             "loop_runs": conn.execute("SELECT COUNT(*) AS n FROM prompt_loop_runs").fetchone()["n"],
         }
@@ -2368,6 +2934,56 @@ def _row_to_prompt_loop_run(row: sqlite3.Row) -> PromptLoopRun:
         session_id=row["session_id"],
         target_mission_id=row["target_mission_id"],
         target_tab_id=row["target_tab_id"],
+    )
+
+
+def _row_to_goal_run(row: sqlite3.Row) -> GoalRun:
+    return GoalRun(
+        goal_id=row["goal_id"],
+        parent_mission_id=row["parent_mission_id"],
+        controller_mission_id=row["controller_mission_id"],
+        tenant_id=row["tenant_id"],
+        project_root=row["project_root"],
+        source_kind=row["source_kind"],
+        source_ref=row["source_ref"],
+        objective=row["objective"],
+        done_definition=row["done_definition"],
+        status=row["status"],
+        autonomy_level=row["autonomy_level"],
+        max_turns=row["max_turns"],
+        turns_used=row["turns_used"],
+        max_workers=row["max_workers"],
+        active_workers=row["active_workers"],
+        max_spend_usd=row["max_spend_usd"],
+        spent_usd=row["spent_usd"],
+        judge_model=row["judge_model"],
+        last_judge_reason=row["last_judge_reason"],
+        last_continued_at=row["last_continued_at"],
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
+        finished_at=row["finished_at"],
+    )
+
+
+def _row_to_goal_task(row: sqlite3.Row) -> GoalTask:
+    try:
+        metadata = json.loads(row["metadata_json"] or "{}")
+    except json.JSONDecodeError:
+        metadata = {}
+    return GoalTask(
+        task_id=row["task_id"],
+        goal_id=row["goal_id"],
+        worker_mission_id=row["worker_mission_id"],
+        title=row["title"],
+        scope=row["scope"],
+        status=row["status"],
+        claimed_paths=row["claimed_paths"],
+        verification=row["verification"],
+        last_heartbeat_at=row["last_heartbeat_at"],
+        result_summary=row["result_summary"],
+        metadata=metadata,
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
     )
 
 
