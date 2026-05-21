@@ -2929,25 +2929,31 @@ class LoopManagerScreen(ModalScreen[Optional[LoopActionRequest]]):
         confirm_delete_run: Optional[db.PromptLoopRun] = None,
     ) -> str:
         run = self._selected_run()
-        lines = [
-            f"#{loop.id} {loop.name}",
-            f"status {loop.status} · every {loops_mod.format_interval(loop.interval_seconds)} · next {loops_mod.format_due(loop.next_run_at)}",
-            f"target {_loop_target_label(loop)} · command {loop.command}",
-            f"prompt {loop.prompt}",
-            "keys tab loops/runs · enter/J join/resume selected run · e edit loop · o output · r run now · d delete selected",
-        ]
         runs = self.runs_by_loop.get(loop.id, [])
-        if runs:
+        if run is not None:
+            lines = [
+                f"#{loop.id} {loop.name} · run #{run.id}",
+                f"status {run.status} · start {_format_dashboard_ts(run.started_at)} · session {_loop_run_session_label(run)}",
+                f"output {_truncate(run.output_path or 'pending', 94)}",
+            ]
+            if run.resume_ref:
+                lines.append(f"resume id {run.resume_ref}")
+            lines.append("result")
+            lines.extend(_loop_run_response_preview(run, fallback=run.summary))
+        else:
+            lines = [
+                f"#{loop.id} {loop.name}",
+                f"status {loop.status} · every {loops_mod.format_interval(loop.interval_seconds)} · next {loops_mod.format_due(loop.next_run_at)}",
+                f"target {_loop_target_label(loop)} · command {loop.command}",
+                f"prompt {loop.prompt}",
+            ]
+        lines.append(
+            "keys tab loops/runs · enter/J join/resume selected run · e edit loop · o output · r run now · d delete selected"
+        )
+        if runs and run is None:
             count = self.run_counts_by_loop.get(loop.id, len(runs))
             lines.append(f"recent runs ({count} total, newest first) · select a run above")
-            if run is not None:
-                lines.append(
-                    f"selected run #{run.id} {run.status} · {_loop_run_session_label(run)} · output {run.output_path or 'pending'}"
-                )
-                if run.resume_ref:
-                    lines.append(f"resume id {run.resume_ref}")
-                lines.append(f"summary {run.summary or 'run started'}")
-        else:
+        elif not runs:
             lines.append("recent runs: none yet")
             if loop.last_run_status == "running":
                 lines.append("run is starting; press o in a moment to inspect its output file")
@@ -2962,6 +2968,39 @@ class LoopManagerScreen(ModalScreen[Optional[LoopActionRequest]]):
             lines.append("")
             lines.append("Press delete again to remove this loop. Output files remain on disk.")
         return "\n".join(lines)
+
+
+def _loop_run_response_preview(run: db.PromptLoopRun, *, fallback: str = "", limit: int = 4, width: int = 100) -> list[str]:
+    text = _loop_run_output_text(run)
+    lines: list[str] = []
+    for raw in text.splitlines():
+        line = _clean_terminal_line(raw)
+        if not line or _is_loop_output_noise(line):
+            continue
+        lines.append(line)
+    if not lines:
+        fallback_text = fallback or ("run is still writing output" if run.status == "running" else "no visible response recorded")
+        lines = [fallback_text]
+    return [_truncate(line, width) for line in lines[-limit:]]
+
+
+def _loop_run_output_text(run: db.PromptLoopRun) -> str:
+    if not run.output_path:
+        return ""
+    try:
+        return Path(run.output_path).read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return ""
+
+
+def _is_loop_output_noise(line: str) -> bool:
+    lowered = line.lower()
+    return (
+        lowered.startswith("$ ")
+        or lowered.startswith("started:")
+        or lowered.startswith("cwd:")
+        or lowered.startswith("[loop ")
+    )
 
 
 class LoopOutputScreen(ModalScreen[None]):

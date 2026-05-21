@@ -2292,6 +2292,20 @@ class DashboardTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_manage_loops_action_opens_manager_with_history(self) -> None:
         app = DashboardHarness()
+        output_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(output_dir.cleanup)
+        output_path = Path(output_dir.name) / "loop.txt"
+        output_path.write_text(
+            "$ codex exec 'summarize catalysts'\n"
+            "started: 2026-05-20 19:00:00\n"
+            "cwd: /tmp/project\n"
+            "\n"
+            "The response body should be visible in the run browser.\n"
+            "A second useful result line.\n"
+            "\n"
+            "[loop success; exit=0]\n",
+            encoding="utf-8",
+        )
         loop = dashboard.db.PromptLoop(
             id=7,
             name="market scan",
@@ -2310,7 +2324,7 @@ class DashboardTest(unittest.IsolatedAsyncioTestCase):
             finished_at=2,
             status="success",
             exit_code=0,
-            output_path="/tmp/loop.txt",
+            output_path=str(output_path),
             summary="WMT disciplined zone",
             target_mission_id=loop.target_mission_id,
             target_tab_id=loop.target_tab_id,
@@ -2329,10 +2343,13 @@ class DashboardTest(unittest.IsolatedAsyncioTestCase):
 
                 self.assertIsInstance(app.screen, LoopManagerScreen)
                 detail = app.screen._detail(loop)
+                rendered_detail = str(app.screen.query_one("#loop_detail", dashboard.Static).content)
                 actions = app.screen.query_one("#loop_actions", dashboard.Static).content
                 self.assertIn("market scan", str(detail))
-                self.assertIn("recent runs (1 total", str(detail))
-                self.assertIn("WMT disciplined zone", str(detail))
+                self.assertIn("run #3", rendered_detail)
+                self.assertIn("The response body should be visible", rendered_detail)
+                self.assertIn("A second useful result line", rendered_detail)
+                self.assertNotIn("prompt summarize catalysts", rendered_detail)
                 self.assertIn("o output", str(actions))
                 self.assertIn("r run now", str(actions))
                 self.assertIn("t target", str(actions))
