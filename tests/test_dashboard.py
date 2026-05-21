@@ -225,42 +225,61 @@ class DashboardTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("decision build card before edit flow", expanded)
         self.assertIn("pass test tests/test_dashboard.py", expanded)
 
-    def test_loop_card_renders_prompt_and_run_history(self) -> None:
+    def test_loop_card_renders_latest_run_result_instead_of_history(self) -> None:
         card = MissionCardWidget()
-        loop = dashboard.db.PromptLoop(
-            id=7,
-            name="market scan",
-            prompt="summarize tomorrow's market catalysts and blockers",
-            interval_seconds=900,
-            command="codex exec",
-            status="active",
-            last_summary="WMT disciplined zone",
-            next_run_at=0,
-        )
-        run = dashboard.db.PromptLoopRun(
-            id=3,
-            loop_id=loop.id,
-            started_at=1,
-            finished_at=2,
-            status="success",
-            exit_code=0,
-            output_path="/tmp/loop.txt",
-            summary="WMT disciplined zone",
-        )
+        with tempfile.TemporaryDirectory() as tmp:
+            output_path = Path(tmp) / "loop.txt"
+            output_path.write_text(
+                "$ codex exec 'summarize tomorrow'\n"
+                "started: 2026-05-20 21:00:00\n"
+                "cwd: /tmp/project\n"
+                "\n"
+                "summarize tomorrow's market catalysts and blockers\n"
+                "Result headline: WMT remains in the disciplined zone.\n"
+                "Second result line with a catalyst.\n"
+                "\n"
+                "[loop success; exit=0]\n",
+                encoding="utf-8",
+            )
+            loop = dashboard.db.PromptLoop(
+                id=7,
+                name="market scan",
+                prompt="summarize tomorrow's market catalysts and blockers",
+                interval_seconds=900,
+                command="codex exec",
+                status="active",
+                last_summary="WMT disciplined zone",
+                next_run_at=0,
+            )
+            run = dashboard.db.PromptLoopRun(
+                id=3,
+                loop_id=loop.id,
+                started_at=1,
+                finished_at=2,
+                status="success",
+                exit_code=0,
+                output_path=str(output_path),
+                summary="WMT disciplined zone",
+            )
 
-        rendered = card._render_loop_card(loop, [run]).plain
+            rendered = card._render_loop_card(loop, [run]).plain
 
-        self.assertIn("LOOP CARD", rendered)
-        self.assertIn("market scan", rendered)
-        self.assertIn("summarize tomorrow's market catalysts", rendered)
-        self.assertIn("WMT disciplined zone", rendered)
-        self.assertNotIn("run model:", rendered)
+            self.assertIn("LOOP CARD", rendered)
+            self.assertIn("market scan", rendered)
+            self.assertIn("LATEST RESULT", rendered)
+            self.assertIn("Result headline: WMT remains", rendered)
+            self.assertIn("Second result line", rendered)
+            self.assertNotIn("PROMPT", rendered)
+            self.assertNotIn("RUNS", rendered)
+            self.assertNotIn("summarize tomorrow's market catalysts", rendered)
+            self.assertNotIn("run model:", rendered)
 
-        card.toggle_details()
-        expanded = card._render_loop_card(loop, [run]).plain
-        self.assertIn("command: codex exec", expanded)
-        self.assertIn("output /tmp/loop.txt", expanded)
-        self.assertIn("not reusable live tabs yet", expanded)
+            card.toggle_details()
+            expanded = card._render_loop_card(loop, [run]).plain
+            self.assertIn("command: codex exec", expanded)
+            self.assertIn("prompt: summarize tomorrow's market catalysts", expanded)
+            self.assertIn("output", expanded)
+            self.assertIn("latest captured output", expanded)
 
     def test_tail_lines_prefers_recent_non_empty_output(self) -> None:
         rendered = _tail_lines("old\n\nmiddle\nlatest and very long", limit=2, width=12)
@@ -2493,6 +2512,16 @@ class DashboardTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_selected_loop_row_updates_loop_card(self) -> None:
         app = DashboardHarness()
+        output_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(output_dir.cleanup)
+        output_path = Path(output_dir.name) / "loop.txt"
+        output_path.write_text(
+            "$ codex exec 'summarize catalysts'\n"
+            "started: 2026-05-20 21:00:00\n"
+            "\n"
+            "Latest card output line.\n",
+            encoding="utf-8",
+        )
         loop = dashboard.db.PromptLoop(
             id=7,
             name="market scan",
@@ -2501,13 +2530,23 @@ class DashboardTest(unittest.IsolatedAsyncioTestCase):
             command="codex exec",
             next_run_at=0,
         )
+        run = dashboard.db.PromptLoopRun(
+            id=12,
+            loop_id=loop.id,
+            started_at=1,
+            finished_at=2,
+            status="success",
+            exit_code=0,
+            output_path=str(output_path),
+            summary="fallback summary",
+        )
 
         with isolated_dashboard_runtime(), patch.object(
             dashboard.db, "all_loops", new=lambda include_paused=True, tenant_id="": [loop]
         ), patch.object(
             dashboard.db, "get_loop", new=lambda loop_id: loop if loop_id == loop.id else None
         ), patch.object(
-            dashboard.db, "loop_runs", new=lambda loop_id, limit=8: []
+            dashboard.db, "loop_runs", new=lambda loop_id, limit=8: [run]
         ):
             async with app.run_test(size=(120, 40)) as pilot:
                 app._refresh_table()
@@ -2517,7 +2556,8 @@ class DashboardTest(unittest.IsolatedAsyncioTestCase):
                 card = app.query_one(MissionCardWidget)
                 rendered = str(card.content)
                 self.assertIn("LOOP CARD", rendered)
-                self.assertIn("summarize catalysts", rendered)
+                self.assertIn("Latest card output line", rendered)
+                self.assertNotIn("PROMPT", rendered)
 
     async def test_loop_manager_edit_action_updates_loop(self) -> None:
         app = DashboardHarness()

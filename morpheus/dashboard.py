@@ -1304,22 +1304,27 @@ class MissionCardWidget(Static):
         )
         text.append("\n")
 
-        text.append("\nPROMPT\n", style="bold bright_green")
-        for line in _wrap_display_lines(loop.prompt, width=74, limit=6 if self.details_expanded else 3):
-            text.append(line, style=COL_BODY)
+        text.append("\nLATEST RESULT\n", style="bold bright_green")
+        if runs:
+            latest = runs[0]
+            text.append(f"#{latest.id} ", style=COL_ACCENT)
+            text.append(f"{_format_dashboard_ts(latest.started_at)} {latest.status}", style=COL_BODY)
+            if latest.exit_code is not None:
+                text.append(f" exit {latest.exit_code}", style=COL_DIMMER)
+            if latest.status == "running":
+                text.append(" · still writing", style=COL_DIMMER)
             text.append("\n")
 
-        text.append("\nRUNS\n", style="bold bright_green")
-        if runs:
-            for run in runs[: 8 if self.details_expanded else 4]:
-                text.append(f"#{run.id} ", style=COL_ACCENT)
-                text.append(f"{_format_dashboard_ts(run.started_at)} {run.status}", style=COL_BODY)
-                if run.exit_code is not None:
-                    text.append(f" exit {run.exit_code}", style=COL_DIMMER)
+            lines = _loop_run_response_lines(latest, fallback=latest.summary, prompt=loop.prompt)
+            line_limit = 18 if self.details_expanded else 12
+            visible_lines = lines[:line_limit]
+            for line in visible_lines:
+                text.append(_truncate(line, 92), style=COL_BODY)
                 text.append("\n")
-                text.append(f"  {run.summary or 'no summary'}\n", style=COL_BODY)
-                if self.details_expanded and run.output_path:
-                    text.append(f"  output {run.output_path}\n", style=COL_DIMMER)
+            if len(lines) > len(visible_lines):
+                text.append(f"… {len(lines) - len(visible_lines)} more lines; Shift+L opens the scrollable run view\n", style=COL_DIMMER)
+            if self.details_expanded and latest.output_path:
+                text.append(f"output {_display_path(latest.output_path)}\n", style=COL_DIMMER)
         else:
             text.append("none yet\n", style=COL_DIMMER)
             text.append("press Shift+L then r to run now; launchd/cron handles recurring runs\n", style=COL_DIMMER)
@@ -1331,11 +1336,12 @@ class MissionCardWidget(Static):
         self._field(text, "loop", str(loop.id))
         self._field(text, "status", loop.status)
         self._field(text, "command", loop.command)
+        self._field(text, "prompt", loop.prompt)
         self._field(text, "project", _display_path(loop.project_root), muted=not loop.project_root)
         self._field(text, "tenant", loop.tenant_id, muted=not loop.tenant_id)
         self._field(text, "last", loop.last_summary or "unset", muted=not loop.last_summary)
         text.append("\n")
-        text.append("run model: captured command executions, not reusable live tabs yet\n", style=COL_DIMMER)
+        text.append("run model: latest captured output; Shift+L opens history and full scrollback\n", style=COL_DIMMER)
         return text
 
     def _render_latest_output(self, text: Text, live: Optional[LiveBuffer]) -> None:
@@ -2960,7 +2966,7 @@ class LoopManagerScreen(ModalScreen[Optional[LoopActionRequest]]):
             if run.resume_ref:
                 lines.append(f"resume id {run.resume_ref}")
             lines.append("result")
-            lines.extend(_loop_run_response_lines(run, fallback=run.summary))
+            lines.extend(_loop_run_response_lines(run, fallback=run.summary, prompt=loop.prompt))
         else:
             lines = [
                 f"#{loop.id} {loop.name}",
@@ -2991,12 +2997,13 @@ class LoopManagerScreen(ModalScreen[Optional[LoopActionRequest]]):
         return "\n".join(lines)
 
 
-def _loop_run_response_lines(run: db.PromptLoopRun, *, fallback: str = "") -> list[str]:
+def _loop_run_response_lines(run: db.PromptLoopRun, *, fallback: str = "", prompt: str = "") -> list[str]:
     text = _loop_run_output_text(run)
+    prompt_text = _clean_terminal_line(prompt)
     lines: list[str] = []
     for raw in text.splitlines():
         line = _clean_terminal_line(raw)
-        if not line or _is_loop_output_noise(line):
+        if not line or _is_loop_output_noise(line, prompt=prompt_text):
             continue
         lines.append(line)
     if not lines:
@@ -3014,13 +3021,14 @@ def _loop_run_output_text(run: db.PromptLoopRun) -> str:
         return ""
 
 
-def _is_loop_output_noise(line: str) -> bool:
+def _is_loop_output_noise(line: str, *, prompt: str = "") -> bool:
     lowered = line.lower()
     return (
         lowered.startswith("$ ")
         or lowered.startswith("started:")
         or lowered.startswith("cwd:")
         or lowered.startswith("[loop ")
+        or (bool(prompt) and len(line) > 20 and line in prompt)
     )
 
 
