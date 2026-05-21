@@ -562,8 +562,10 @@ Implemented cockpit controls:
 - The loop manager has separate loop and run tables. Pressing `Tab` switches
   between them; pressing `Enter` or `J` on a run joins/resumes that specific
   run in an iTerm tab. Active captured runs open a companion session seeded with
-  the live output file; completed runs resume from the captured output and stable
-  loop-run mission id.
+  the live output file; completed Codex runs resume the exact `codex exec`
+  session id captured from the run output when available, then fall back to a
+  fresh companion session seeded with the captured output and stable loop-run
+  mission id.
 - Pressing `o` in the loop manager opens the selected captured run output and
   refreshes while that run is still marked running. Runs insert a `running`
   history row, stable mission id, and output path as soon as they start, so
@@ -838,6 +840,8 @@ untrusted hints, not as durable truth.
 | `exit_code` | INTEGER | Process exit code when available |
 | `output_path` | TEXT | Captured stdout/stderr artifact |
 | `summary` | TEXT | Ticker headline |
+| `mission_id`, `tab_id`, `session_id` | TEXT | Stable run mission id plus optional attached iTerm session |
+| `agent_kind`, `resume_ref`, `resume_command`, `resume_confidence` | TEXT | Provider resume metadata, exact for Codex when `session id:` is captured |
 | `target_mission_id`, `target_tab_id` | TEXT | Routing snapshot |
 
 ### 7.4 Detection
@@ -928,7 +932,7 @@ This table is the source of truth for where the product stands right now.
 | Immediate loop first run | Implemented in v0.8.0a30 | New loops are due at creation and the cockpit starts the first run in a background task; the loop manager also exposes `r`/run-now for existing loops while recurring execution remains cron/launchd-friendly |
 | Loop runner LaunchAgent | Implemented in v0.8.0a31 | `morpheus install-loop-runner` installs `com.morpheus.loop-runner`, a separate launchd job that wakes every interval to run due loops without blocking the watcher; status/log/beacon commands mirror the watcher daemon |
 | Loop run output inspection | Implemented in v0.8.0a32 | Loop runs now record a `running` history row and output file at start, stream command output to that file, and expose `o` in the loop manager to inspect/follow selected run output; `t` now targets/focuses missions instead of reading like a run join |
-| Loop run join/resume | Implemented in v0.8.0a33 | The loop manager now has selectable run rows; `Enter`/`J` joins or resumes the selected run in an iTerm tab, run rows keep stable `looprun_<loop>_<run>` mission ids plus attached tab/session ids, and `o` follows selected run output |
+| Loop run join/resume | Implemented in v0.8.0a33, exact Codex resume in v0.8.0a35 | The loop manager now has selectable run rows; `Enter`/`J` joins or resumes the selected run in an iTerm tab, run rows keep stable `looprun_<loop>_<run>` mission ids plus attached tab/session ids, completed `codex exec` runs store exact session ids from captured output, and `o` follows selected run output |
 | PRD Runs foundation | Implemented in v0.8.0a1 | PRD finder, new-session PRD selector, parent mission creation, coordinator prompt/status files, `morpheus run start`, and coordinator graph edge shipped |
 | PRD run tree UI | Partially implemented in v0.8.0a5 | Shows virtual PRD parent rows with coordinator/worker sessions rendered underneath them; collapse/expand remains future polish |
 | PRD child worker spawn | Implemented in v0.8.0a5 | `w` spawns a manual child worker under the selected PRD parent/coordinator/worker with scope and verification prompts |

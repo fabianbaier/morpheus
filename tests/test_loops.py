@@ -133,6 +133,7 @@ class LoopsTest(unittest.TestCase):
                 running = db.loop_runs(observed["loop_id"], limit=1)[0]
                 observed["running_status"] = running.status
                 observed["output_exists_during_run"] = Path(running.output_path).exists()
+                kwargs["stdout"].write("session id: 019e4824-ec9a-7ce0-bf54-0b29e9b42f86\n")
                 kwargs["stdout"].write("Summary: streamed while running.\n")
                 kwargs["stdout"].flush()
                 return SimpleNamespace(returncode=0)
@@ -150,7 +151,7 @@ class LoopsTest(unittest.TestCase):
                     name="streaming loop",
                     prompt="ignored prompt",
                     interval_seconds=300,
-                    command="printf ok",
+                    command="codex exec",
                 )
                 observed["loop_id"] = loop.id
 
@@ -160,6 +161,9 @@ class LoopsTest(unittest.TestCase):
             self.assertEqual(observed["running_status"], "running")
             self.assertTrue(observed["output_exists_during_run"])
             self.assertEqual(run.mission_id, f"looprun_{loop.id}_{run.id}")
+            self.assertEqual(run.resume_ref, "019e4824-ec9a-7ce0-bf54-0b29e9b42f86")
+            self.assertEqual(run.resume_command, f"codex resume {run.resume_ref}")
+            self.assertEqual(run.resume_confidence, "exact")
             self.assertEqual(run.status, "success")
             self.assertIn("Summary: streamed while running.", run.summary)
             self.assertIn("Summary: streamed while running.", text)

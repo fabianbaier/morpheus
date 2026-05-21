@@ -351,13 +351,14 @@ edit/join/output/run/pause/target/delete controls plus selectable run history. S
 opens the manager on that loop and `e` opens its editor. Inside the loop manager,
 `Tab` switches between the loop and run tables, `Enter`/`J` joins or resumes the
 selected run in an iTerm tab, `o` opens/follows the selected run output file, and
-`r` runs the loop once immediately. `t` targets the loop to the mission selected
-before opening the loop manager; if no candidate was selected and the loop already
-has a target, it focuses that target mission instead. The dashboard does not run long loop commands inline; first-run and
+`r` runs the loop once immediately. Completed Codex loop runs resume by exact
+session id when the captured `codex exec` output contains one. `t` targets the
+loop to the mission selected before opening the loop manager; if no candidate
+was selected and the loop already has a target, it focuses that target mission
+instead. The dashboard does not run long loop commands inline; first-run and
 run-now actions happen in a background task, while recurring runs should still
 come from the loop runner LaunchAgent, another launchd/cron entry, or
-`morpheus loops run-due`. Loop runs are captured command executions today, not
-reusable live tab sessions. The default Codex loop command includes
+`morpheus loops run-due`. The default Codex loop command includes
 `--skip-git-repo-check` so launchd can run loops without an interactive trust
 prompt; older loops saved as plain `codex exec` are adjusted when they execute.
 

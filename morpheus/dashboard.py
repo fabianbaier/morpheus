@@ -1500,6 +1500,93 @@ def _loop_run_agent_kind(command: str) -> str:
     return Path(_loop_run_agent_command(command).split()[0]).name.lower()
 
 
+def _shell_append_arg(command: str, value: str) -> str:
+    return f"{command} {shlex.quote(value)}"
+
+
+def _loop_run_exact_resume_metadata(
+    loop: db.PromptLoop,
+    run: db.PromptLoopRun,
+    *,
+    project_root: str = "",
+) -> tuple[str, str, str, str]:
+    if run.resume_confidence == "exact" and run.resume_command and run.resume_ref:
+        return run.agent_kind, run.resume_ref, run.resume_command, run.resume_confidence
+    if run.mission_id:
+        try:
+            memory = db.get_memory(run.mission_id)
+        except Exception:
+            memory = None
+        if (
+            memory is not None
+            and memory.resume_confidence == "exact"
+            and memory.resume_command
+            and memory.resume_ref
+        ):
+            return memory.agent_kind, memory.resume_ref, memory.resume_command, memory.resume_confidence
+    output = ""
+    if run.output_path:
+        try:
+            output = Path(run.output_path).read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            output = ""
+    agent_kind, resume_ref, resume_command, confidence = db.resume_metadata_from_text(
+        loops_mod.normalize_command(loop.command),
+        output,
+        linked_worktree=project_root or loop.project_root,
+    )
+    if confidence == "exact" and resume_command:
+        try:
+            db.update_loop_run_resume_metadata(
+                run.id,
+                agent_kind=agent_kind,
+                resume_ref=resume_ref,
+                resume_command=resume_command,
+                resume_confidence=confidence,
+            )
+        except Exception:
+            pass
+    return agent_kind, resume_ref, resume_command, confidence
+
+
+def _loop_run_launch_command(
+    loop: db.PromptLoop,
+    run: db.PromptLoopRun,
+    *,
+    project_root: str = "",
+) -> tuple[str, str, str, str, str]:
+    prompt = _loop_run_join_prompt(loop, run)
+    agent_kind, resume_ref, resume_command, confidence = _loop_run_exact_resume_metadata(
+        loop,
+        run,
+        project_root=project_root,
+    )
+    if confidence == "exact" and resume_command:
+        return (
+            _shell_append_arg(resume_command, prompt),
+            agent_kind,
+            resume_ref,
+            resume_command,
+            confidence,
+        )
+
+    base = _loop_run_agent_command(loop.command)
+    cmd = _shell_append_arg(base, prompt)
+    if project_root:
+        cmd = tenant_mod.command_in_project(cmd, project_root)
+    return cmd, _loop_run_agent_kind(loop.command), "", "", ""
+
+
+def _loop_run_session_label(run: db.PromptLoopRun) -> str:
+    if run.tab_id:
+        return run.tab_id.split("-")[0]
+    if run.resume_ref:
+        return f"resume {run.resume_ref[:8]}"
+    if run.mission_id:
+        return "resumable"
+    return "capture"
+
+
 def _loop_run_join_prompt(loop: db.PromptLoop, run: db.PromptLoopRun) -> str:
     mode = "Join this active Morpheus loop run." if run.status == "running" else "Resume this completed Morpheus loop run."
     instructions = (
@@ -2750,12 +2837,11 @@ class LoopManagerScreen(ModalScreen[Optional[LoopActionRequest]]):
         table = self.query_one("#loop_runs_table", DataTable)
         table.clear()
         for run in self._runs_for_selected_loop():
-            session = run.tab_id.split("-")[0] if run.tab_id else ("resumable" if run.mission_id else "capture")
             table.add_row(
                 str(run.id),
                 run.status,
                 _format_dashboard_ts(run.started_at),
-                session,
+                _loop_run_session_label(run),
                 run.summary or run.output_path or "no summary",
             )
         if self._runs_for_selected_loop():
@@ -2783,10 +2869,11 @@ class LoopManagerScreen(ModalScreen[Optional[LoopActionRequest]]):
             count = self.run_counts_by_loop.get(loop.id, len(runs))
             lines.append(f"recent runs ({count} total, newest first) · select a run above")
             if run is not None:
-                session = run.tab_id.split("-")[0] if run.tab_id else "no tab yet"
                 lines.append(
-                    f"selected run #{run.id} {run.status} · {session} · output {run.output_path or 'pending'}"
+                    f"selected run #{run.id} {run.status} · {_loop_run_session_label(run)} · output {run.output_path or 'pending'}"
                 )
+                if run.resume_ref:
+                    lines.append(f"resume id {run.resume_ref}")
                 lines.append(f"summary {run.summary or 'run started'}")
         else:
             lines.append("recent runs: none yet")
@@ -4285,16 +4372,12 @@ class MorpheusApp(App):
             self._push_alert(Alert(time.time(), "summary", f"focused loop run #{run.id} tab"))
             return
 
-        if run.mission_id:
-            memory = db.get_memory(run.mission_id)
-            if memory is not None and memory.archived_at is not None and memory.resume_command:
-                await self._resume_closed_mission(run.mission_id)
-                return
-
         project_root = loop.project_root or (self.project.root_path if self.project else "")
-        cmd = _loop_run_agent_command(loop.command)
-        if project_root:
-            cmd = tenant_mod.command_in_project(cmd, project_root)
+        cmd, agent_kind, resume_ref, resume_command, resume_confidence = _loop_run_launch_command(
+            loop,
+            run,
+            project_root=project_root,
+        )
         goal = f"loop {loop.name} run #{run.id}"
         try:
             info = await iterm_client.spawn_tab(self.iterm_conn, command=cmd, goal=goal)
@@ -4304,17 +4387,6 @@ class MorpheusApp(App):
         if info is None:
             self._push_alert(Alert(time.time(), "error", "loop run join failed — is iTerm focused?"))
             return
-
-        prompt = _loop_run_join_prompt(loop, run)
-        try:
-            await asyncio.sleep(0.7)
-            await iterm_client.send_text_to_tabs(
-                self.iterm_conn,
-                [info.tab_id],
-                iterm_client.text_with_enter(prompt),
-            )
-        except Exception:
-            pass
 
         now = time.time()
         mission_id = run.mission_id or db.loop_run_mission_id(loop.id, run.id)
@@ -4352,9 +4424,10 @@ class MorpheusApp(App):
             source_kind="loop-run",
             source_ref=run.output_path,
             topic="loop-run",
-            agent_kind=_loop_run_agent_kind(loop.command),
-            resume_command=cmd,
-            resume_confidence="loop-run",
+            agent_kind=agent_kind,
+            resume_ref=resume_ref,
+            resume_command=resume_command,
+            resume_confidence=resume_confidence,
             last_tab_id=info.tab_id,
         ))
         if loop.target_mission_id:
@@ -4388,6 +4461,7 @@ class MorpheusApp(App):
                 "run_id": run.id,
                 "mission_id": mission.mission_id,
                 "status": run.status,
+                "resume_confidence": resume_confidence,
             },
         )
         try:

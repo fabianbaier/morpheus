@@ -26,6 +26,9 @@ CODEX_SESSION_ID_RE = re.compile(
 CODEX_RESUME_LINE_RE = re.compile(
     r"\bcodex\b[^\r\n]*?\bresume\s+(?P<ref>[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})\b"
 )
+CODEX_SESSION_ID_LINE_RE = re.compile(
+    r"(?im)^\s*session id:\s*(?P<ref>[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})\s*$"
+)
 CODEX_VALUE_OPTIONS = {
     "-c",
     "-C",
@@ -230,6 +233,10 @@ class PromptLoopRun:
     mission_id: str = ""
     tab_id: Optional[str] = None
     session_id: Optional[str] = None
+    agent_kind: str = ""
+    resume_ref: str = ""
+    resume_command: str = ""
+    resume_confidence: str = ""
     target_mission_id: str = ""
     target_tab_id: Optional[str] = None
 
@@ -393,6 +400,10 @@ CREATE TABLE IF NOT EXISTS prompt_loop_runs (
     mission_id        TEXT NOT NULL DEFAULT '',
     tab_id            TEXT,
     session_id        TEXT,
+    agent_kind        TEXT NOT NULL DEFAULT '',
+    resume_ref        TEXT NOT NULL DEFAULT '',
+    resume_command    TEXT NOT NULL DEFAULT '',
+    resume_confidence TEXT NOT NULL DEFAULT '',
     target_mission_id TEXT NOT NULL DEFAULT '',
     target_tab_id     TEXT
 );
@@ -436,6 +447,10 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
     _ensure_column(conn, "prompt_loop_runs", "mission_id", "TEXT NOT NULL DEFAULT ''")
     _ensure_column(conn, "prompt_loop_runs", "tab_id", "TEXT")
     _ensure_column(conn, "prompt_loop_runs", "session_id", "TEXT")
+    _ensure_column(conn, "prompt_loop_runs", "agent_kind", "TEXT NOT NULL DEFAULT ''")
+    _ensure_column(conn, "prompt_loop_runs", "resume_ref", "TEXT NOT NULL DEFAULT ''")
+    _ensure_column(conn, "prompt_loop_runs", "resume_command", "TEXT NOT NULL DEFAULT ''")
+    _ensure_column(conn, "prompt_loop_runs", "resume_confidence", "TEXT NOT NULL DEFAULT ''")
     conn.execute("CREATE INDEX IF NOT EXISTS missions_mission_id_idx ON missions(mission_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS missions_tenant_idx ON missions(tenant_id, updated_at DESC)")
     conn.execute("CREATE INDEX IF NOT EXISTS missions_project_root_idx ON missions(project_root)")
@@ -659,7 +674,29 @@ def _codex_resume_ref_from_buffer(buffer: str) -> str:
     found = ""
     for match in CODEX_RESUME_LINE_RE.finditer(buffer or ""):
         found = match.group("ref")
+    if found:
+        return found
+    for match in CODEX_SESSION_ID_LINE_RE.finditer(buffer or ""):
+        found = match.group("ref")
     return found
+
+
+def resume_metadata_from_text(
+    command: str,
+    text: str,
+    *,
+    linked_worktree: str = "",
+) -> tuple[str, str, str, str]:
+    agent_kind = _infer_agent_kind(command)
+    if agent_kind == "codex":
+        resume_ref = _codex_resume_ref_from_buffer(text)
+        if resume_ref:
+            resume_command = _with_worktree(
+                _codex_resume_command(command, resume_ref),
+                linked_worktree,
+            )
+            return agent_kind, resume_ref, resume_command, "exact"
+    return "", "", "", ""
 
 
 def _resume_command_for_mission(mission: Mission) -> tuple[str, str, str, str]:
@@ -2121,6 +2158,30 @@ def finish_loop_run(
     return _row_to_prompt_loop_run(row)
 
 
+def update_loop_run_resume_metadata(
+    run_id: int,
+    *,
+    agent_kind: str,
+    resume_ref: str,
+    resume_command: str,
+    resume_confidence: str,
+) -> Optional[PromptLoopRun]:
+    with _connect() as conn:
+        conn.execute(
+            """
+            UPDATE prompt_loop_runs
+               SET agent_kind = ?,
+                   resume_ref = ?,
+                   resume_command = ?,
+                   resume_confidence = ?
+             WHERE id = ?
+            """,
+            (agent_kind, resume_ref, resume_command, resume_confidence, run_id),
+        )
+        row = conn.execute("SELECT * FROM prompt_loop_runs WHERE id = ?", (run_id,)).fetchone()
+    return _row_to_prompt_loop_run(row) if row else None
+
+
 def loop_run_mission_id(loop_id: int, run_id: int) -> str:
     return f"looprun_{loop_id}_{run_id}"
 
@@ -2366,6 +2427,10 @@ def _row_to_prompt_loop_run(row: sqlite3.Row) -> PromptLoopRun:
         mission_id=row["mission_id"],
         tab_id=row["tab_id"],
         session_id=row["session_id"],
+        agent_kind=row["agent_kind"],
+        resume_ref=row["resume_ref"],
+        resume_command=row["resume_command"],
+        resume_confidence=row["resume_confidence"],
         target_mission_id=row["target_mission_id"],
         target_tab_id=row["target_tab_id"],
     )
