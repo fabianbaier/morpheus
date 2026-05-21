@@ -34,6 +34,7 @@ from typing import Optional
 
 import iterm2
 from rich.text import Text
+from textual.actions import SkipAction
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Container, Horizontal, Vertical
@@ -2607,6 +2608,10 @@ class LoopManagerScreen(ModalScreen[Optional[LoopActionRequest]]):
         padding: 0 1;
         color: ansi_bright_yellow;
         margin-bottom: 1;
+        overflow-y: auto;
+    }
+    #loop_detail:focus {
+        border: round ansi_bright_green;
     }
     #loop_actions {
         height: 2;
@@ -2671,9 +2676,9 @@ class LoopManagerScreen(ModalScreen[Optional[LoopActionRequest]]):
             )
             yield DataTable(id="loops_table")
             yield DataTable(id="loop_runs_table")
-            yield Static("", id="loop_detail")
+            yield RichLog(id="loop_detail", markup=False, wrap=True, highlight=False, auto_scroll=False)
             yield Static(
-                "tab loops/runs · enter/J join/resume run · e edit loop · o output · r run now · p pause · t target · d delete",
+                "tab loops/runs/result · enter/J join/resume run · e edit loop · o output · r run now · p pause · t target · d delete",
                 id="loop_actions",
             )
             with Horizontal():
@@ -2742,12 +2747,18 @@ class LoopManagerScreen(ModalScreen[Optional[LoopActionRequest]]):
             self.action_close()
 
     def action_cursor_down(self) -> None:
+        if self.focus_table == "detail":
+            self.query_one("#loop_detail", RichLog).action_scroll_down()
+            return
         table = self._focused_table()
         table.action_cursor_down()
         self.confirm_delete_ref = None
         self._refresh_detail()
 
     def action_cursor_up(self) -> None:
+        if self.focus_table == "detail":
+            self.query_one("#loop_detail", RichLog).action_scroll_up()
+            return
         table = self._focused_table()
         table.action_cursor_up()
         self.confirm_delete_ref = None
@@ -2756,9 +2767,13 @@ class LoopManagerScreen(ModalScreen[Optional[LoopActionRequest]]):
     def action_switch_focus(self) -> None:
         loops_table = self.query_one("#loops_table", DataTable)
         runs_table = self.query_one("#loop_runs_table", DataTable)
+        detail = self.query_one("#loop_detail", RichLog)
         if self.focus_table == "loops" and self._runs_for_selected_loop():
             self.focus_table = "runs"
             runs_table.focus()
+        elif self.focus_table == "runs" and self._selected_run() is not None:
+            self.focus_table = "detail"
+            detail.focus()
         else:
             self.focus_table = "loops"
             loops_table.focus()
@@ -2800,7 +2815,7 @@ class LoopManagerScreen(ModalScreen[Optional[LoopActionRequest]]):
             return
         run = self._selected_run()
         if run is None:
-            self.query_one("#loop_detail", Static).update(
+            self._set_detail(
                 "No loop run selected yet. Press r to start one, or wait for the loop runner."
             )
             return
@@ -2819,7 +2834,7 @@ class LoopManagerScreen(ModalScreen[Optional[LoopActionRequest]]):
                     target_tab_id=loop.target_tab_id,
                 ))
             else:
-                self.query_one("#loop_detail", Static).update(
+                self._set_detail(
                     "Select a mission row before opening loops to target this loop to it. Use o to inspect the latest run output."
                 )
             return
@@ -2842,16 +2857,14 @@ class LoopManagerScreen(ModalScreen[Optional[LoopActionRequest]]):
             if run is None:
                 return
             if run.status == "running":
-                self.query_one("#loop_detail", Static).update(
+                self._set_detail(
                     "Cannot delete a running loop run. Wait for it to finish, then delete its history row."
                 )
                 return
             ref = ("run", run.id)
             if self.confirm_delete_ref != ref:
                 self.confirm_delete_ref = ref
-                self.query_one("#loop_detail", Static).update(
-                    self._detail(loop, confirm_delete_run=run)
-                )
+                self._set_detail(self._detail(loop, confirm_delete_run=run))
                 return
             self.dismiss(LoopActionRequest(action="delete-run", loop_id=loop.id, run_id=run.id))
             return
@@ -2859,9 +2872,7 @@ class LoopManagerScreen(ModalScreen[Optional[LoopActionRequest]]):
         ref = ("loop", loop.id)
         if self.confirm_delete_ref != ref:
             self.confirm_delete_ref = ref
-            self.query_one("#loop_detail", Static).update(
-                self._detail(loop, confirm_delete_loop=True)
-            )
+            self._set_detail(self._detail(loop, confirm_delete_loop=True))
             return
         self.dismiss(LoopActionRequest(action="delete", loop_id=loop.id))
 
@@ -2919,7 +2930,17 @@ class LoopManagerScreen(ModalScreen[Optional[LoopActionRequest]]):
             f"no loops configured for {self.scope_label} yet\n"
             "Press l to create one. Use launchd/cron or `morpheus loops run-due` to execute due loops."
         ) if loop is None else self._detail(loop)
-        self.query_one("#loop_detail", Static).update(detail)
+        self._set_detail(detail)
+
+    def _set_detail(self, detail: str) -> None:
+        log = self.query_one("#loop_detail", RichLog)
+        log.clear()
+        for line in detail.splitlines() or [""]:
+            log.write(line)
+        try:
+            log.scroll_home(animate=False)
+        except SkipAction:
+            pass
 
     def _detail(
         self,
@@ -2939,7 +2960,7 @@ class LoopManagerScreen(ModalScreen[Optional[LoopActionRequest]]):
             if run.resume_ref:
                 lines.append(f"resume id {run.resume_ref}")
             lines.append("result")
-            lines.extend(_loop_run_response_preview(run, fallback=run.summary))
+            lines.extend(_loop_run_response_lines(run, fallback=run.summary))
         else:
             lines = [
                 f"#{loop.id} {loop.name}",
@@ -2970,7 +2991,7 @@ class LoopManagerScreen(ModalScreen[Optional[LoopActionRequest]]):
         return "\n".join(lines)
 
 
-def _loop_run_response_preview(run: db.PromptLoopRun, *, fallback: str = "", limit: int = 4, width: int = 100) -> list[str]:
+def _loop_run_response_lines(run: db.PromptLoopRun, *, fallback: str = "") -> list[str]:
     text = _loop_run_output_text(run)
     lines: list[str] = []
     for raw in text.splitlines():
@@ -2981,7 +3002,7 @@ def _loop_run_response_preview(run: db.PromptLoopRun, *, fallback: str = "", lim
     if not lines:
         fallback_text = fallback or ("run is still writing output" if run.status == "running" else "no visible response recorded")
         lines = [fallback_text]
-    return [_truncate(line, width) for line in lines[-limit:]]
+    return lines
 
 
 def _loop_run_output_text(run: db.PromptLoopRun) -> str:
@@ -3350,9 +3371,11 @@ FOOTER_BINDINGS = [
     Binding("s", "snapshot_session", "snapshot"),
     Binding("slash", "post_note", "note"),
     Binding("l", "new_loop", "loop"),
-    Binding("shift+l", "manage_loops", "loops"),
+    Binding("L", "manage_loops", "loops"),
+    Binding("shift+l", "manage_loops", "loops", show=False),
     Binding("upper_l", "manage_loops", "loops", show=False),
-    Binding("shift+g", "new_goal", "goal"),
+    Binding("G", "new_goal", "goal"),
+    Binding("shift+g", "new_goal", "goal", show=False),
     Binding("upper_g", "new_goal", "goal", show=False),
     Binding("t", "switch_project", "project"),
     Binding("o", "toggle_prd_tree", "tree"),

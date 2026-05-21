@@ -13,6 +13,7 @@ from morpheus import dashboard, mission_brief
 from morpheus.dashboard import (
     BriefScreenContent,
     EditMissionScreen,
+    GoalScreen,
     LiveBuffer,
     LoopActionRequest,
     LoopEditScreen,
@@ -58,6 +59,13 @@ class FakeRichLog:
 
     def write(self, value) -> None:
         self.lines.append(value.plain if hasattr(value, "plain") else str(value))
+
+
+def _rich_log_text(log) -> str:
+    parts = []
+    for line in getattr(log, "lines", []):
+        parts.append(getattr(line, "plain", str(line)))
+    return "\n".join(parts)
 
 
 @contextmanager
@@ -2302,6 +2310,8 @@ class DashboardTest(unittest.IsolatedAsyncioTestCase):
             "\n"
             "The response body should be visible in the run browser.\n"
             "A second useful result line.\n"
+            + "\n".join(f"Scrollable result line {idx}" for idx in range(30))
+            + "\n"
             "\n"
             "[loop success; exit=0]\n",
             encoding="utf-8",
@@ -2343,17 +2353,27 @@ class DashboardTest(unittest.IsolatedAsyncioTestCase):
 
                 self.assertIsInstance(app.screen, LoopManagerScreen)
                 detail = app.screen._detail(loop)
-                rendered_detail = str(app.screen.query_one("#loop_detail", dashboard.Static).content)
                 actions = app.screen.query_one("#loop_actions", dashboard.Static).content
+                detail_log = app.screen.query_one("#loop_detail", dashboard.RichLog)
                 self.assertIn("market scan", str(detail))
-                self.assertIn("run #3", rendered_detail)
-                self.assertIn("The response body should be visible", rendered_detail)
-                self.assertIn("A second useful result line", rendered_detail)
-                self.assertNotIn("prompt summarize catalysts", rendered_detail)
+                self.assertIn("run #3", detail)
+                self.assertIn("The response body should be visible", detail)
+                self.assertIn("A second useful result line", detail)
+                self.assertIn("Scrollable result line 29", detail)
+                self.assertNotIn("prompt summarize catalysts", detail)
                 self.assertIn("o output", str(actions))
                 self.assertIn("r run now", str(actions))
                 self.assertIn("t target", str(actions))
                 self.assertIn("d delete", str(actions))
+
+                await pilot.press("tab")
+                await pilot.pause()
+                self.assertEqual(app.screen.focus_table, "detail")
+                self.assertTrue(detail_log.has_focus)
+                before = detail_log.scroll_y
+                await pilot.press("j")
+                await pilot.pause()
+                self.assertGreater(detail_log.scroll_y, before)
 
     async def test_uppercase_loop_key_opens_manager(self) -> None:
         app = DashboardHarness()
@@ -2372,10 +2392,37 @@ class DashboardTest(unittest.IsolatedAsyncioTestCase):
             dashboard.db, "loop_runs", new=lambda loop_id, limit=5: []
         ):
             async with app.run_test(size=(120, 40)) as pilot:
-                await pilot.press("upper_l")
+                await pilot.press("L")
                 await pilot.pause()
 
                 self.assertIsInstance(app.screen, LoopManagerScreen)
+
+    async def test_uppercase_goal_key_opens_goal_modal(self) -> None:
+        app = DashboardHarness()
+        mission = dashboard.db.Mission(
+            tab_id="tab-123456",
+            mission_id="m_20260520000102_abcd1234",
+            goal="goal candidate",
+            state="idle",
+            buffer_changed_at=1,
+        )
+        memory = dashboard.db.MissionMemory(
+            mission_id=mission.mission_id,
+            title="Goal Candidate",
+            done_definition="verified completion",
+        )
+
+        with isolated_dashboard_runtime([mission], [memory]), patch.object(
+            dashboard.db, "get_memory", new=lambda mission_id: memory if mission_id == memory.mission_id else None
+        ):
+            async with app.run_test(size=(120, 40)) as pilot:
+                app._refresh_table()
+                await pilot.pause()
+                await pilot.press("G")
+                await pilot.pause()
+
+                self.assertIsInstance(app.screen, GoalScreen)
+                self.assertEqual(app.screen.source_id, mission.mission_id)
 
     async def test_enter_on_loop_row_opens_manager_for_selected_loop(self) -> None:
         app = DashboardHarness()
@@ -2664,7 +2711,8 @@ class DashboardTest(unittest.IsolatedAsyncioTestCase):
 
                 await pilot.press("d")
                 await pilot.pause()
-                self.assertIn("remove run #12", str(app.screen.query_one("#loop_detail", dashboard.Static).content))
+                detail_text = _rich_log_text(app.screen.query_one("#loop_detail", dashboard.RichLog))
+                self.assertIn("remove run #12", detail_text)
                 await pilot.press("d")
                 await pilot.pause()
 
