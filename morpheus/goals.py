@@ -8,6 +8,7 @@ and proof live in the mission graph.
 from __future__ import annotations
 
 import shlex
+import posixpath
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -19,7 +20,29 @@ GOALS_DIR = Path.home() / ".morpheus" / "goals"
 DEFAULT_MAX_TURNS = 20
 DEFAULT_MAX_WORKERS = 3
 DEFAULT_CONTINUATION_COOLDOWN_SECONDS = 120.0
-CONTROLLER_CONTINUE_STATES = {"idle", "finished", "unknown"}
+CONTROLLER_CONTINUE_STATES = {"idle"}
+ALLOWED_AGENT_COMMANDS = {"codex", "claude", "gemini", "opencode", "aider"}
+BLOCKED_COMMAND_TOKENS = {";", "&&", "||", "|", ">", ">>", "<", "$(", "`"}
+AGENT_VALUE_OPTIONS = {
+    "-m",
+    "-p",
+    "-s",
+    "--append-system-prompt",
+    "--approval-policy",
+    "--ask-for-approval",
+    "--config",
+    "--model",
+    "--model-provider",
+    "--mcp-config",
+    "--output-schema",
+    "--permission-prompt-tool",
+    "--profile",
+    "--sandbox",
+}
+AGENT_BLOCKED_OPTIONS = {"-C", "--add-dir", "--cd", "--cwd"}
+GOAL_STATUSES = {"active", "paused", "done", "failed", "cleared"}
+TASK_STATUSES = {"planned", "running", "blocked", "done", "failed", "ready_for_retry", "cancelled"}
+AUTONOMY_LEVELS = {"observe_only", "ask_to_spawn", "bounded_fanout"}
 ACTIVE_TASK_STATUSES = {"running", "blocked"}
 FINAL_TASK_STATUSES = {"done", "failed", "cancelled"}
 
@@ -53,6 +76,9 @@ def create_goal_run(
     judge_model: str = "",
 ) -> GoalRunBundle:
     """Create a durable goal run from a PRD path or existing mission ref."""
+    autonomy_level = _validate_value("autonomy_level", autonomy_level, AUTONOMY_LEVELS)
+    max_turns = _positive_int("max_turns", max_turns)
+    max_workers = _positive_int("max_workers", max_workers)
     parent = _resolve_or_create_parent(source, title=title, project=project)
     project = _project_for_parent(parent, fallback=project)
     now = time.time()
@@ -68,8 +94,8 @@ def create_goal_run(
         done_definition=done_definition or parent.done_definition or default_done_definition(parent),
         status="active",
         autonomy_level=autonomy_level,
-        max_turns=max(1, int(max_turns)),
-        max_workers=max(1, int(max_workers)),
+        max_turns=max_turns,
+        max_workers=max_workers,
         max_spend_usd=max(0.0, float(max_spend_usd)),
         judge_model=judge_model,
         created_at=now,
@@ -150,7 +176,7 @@ def resolve_goal(ref: str) -> Optional[db.GoalRun]:
 
 
 def controller_command(base_command: str, bundle: GoalRunBundle) -> str:
-    cmd = (base_command or "codex").strip()
+    cmd = _safe_agent_command(base_command)
     prompt = (
         f"You are the Morpheus autonomous goal controller for goal run {bundle.goal.goal_id}. "
         f"Read {bundle.prompt_path}, use {bundle.status_path} for current run state, "
@@ -203,8 +229,10 @@ def create_task(
     goal = resolve_goal(goal_ref)
     if goal is None:
         raise ValueError(f"goal run not found: {goal_ref}")
-    encoded_paths = _encode_claimed_paths(claimed_paths)
-    path_conflicts = _claimed_path_conflicts(goal.goal_id, _decode_claimed_paths(encoded_paths))
+    status = _validate_value("task status", status, TASK_STATUSES)
+    normalized_paths = _normalize_claimed_paths(claimed_paths, project_root=goal.project_root)
+    encoded_paths = _encode_claimed_paths(normalized_paths)
+    path_conflicts = _claimed_path_conflicts(goal.goal_id, normalized_paths, project_root=goal.project_root)
     if path_conflicts:
         summary = "Goal task path conflict: " + "; ".join(path_conflicts)
         db.add_event(
@@ -272,7 +300,7 @@ def resolve_task(ref: str) -> Optional[db.GoalTask]:
 
 
 def worker_command(base_command: str, bundle: GoalRunBundle, task: db.GoalTask) -> str:
-    cmd = (base_command or "codex").strip()
+    cmd = _safe_agent_command(base_command)
     prompt = (
         f"You are a worker for Morpheus goal run {bundle.goal.goal_id}. "
         f"Task: {task.title} ({task.task_id}). "
@@ -295,6 +323,7 @@ def attach_worker(
     *,
     status: str = "running",
 ) -> db.GoalTask:
+    status = _validate_value("task status", status, TASK_STATUSES)
     task = resolve_task(task_ref)
     if task is None:
         raise ValueError(f"goal task not found: {task_ref}")
@@ -395,6 +424,7 @@ def set_task_status(
     summary: str = "",
     metadata: Optional[dict] = None,
 ) -> db.GoalTask:
+    status = _validate_value("task status", status, TASK_STATUSES)
     task = resolve_task(task_ref)
     if task is None:
         raise ValueError(f"goal task not found: {task_ref}")
@@ -489,31 +519,23 @@ def reserve_continuation(
 def continuation_text(bundle: GoalRunBundle, *, reason: str = "scheduled continuation") -> str:
     goal = bundle.goal
     tasks = db.goal_tasks(goal.goal_id)
-    task_summary = "; ".join(
+    task_summary = ", ".join(
         f"{task.task_id}:{task.status}:{task.title}"
         for task in tasks[:12]
     ) or "none"
-    return "\n".join(
+    return " ".join(
         [
-            f"[morpheus goal continuation] {goal.goal_id}",
-            "",
-            f"Reason: {reason}",
-            f"Turn budget: {goal.turns_used}/{goal.max_turns}",
-            f"Worker budget: {goal.active_workers}/{goal.max_workers} active",
-            f"Status file: {bundle.status_path}",
-            f"Controller prompt: {bundle.prompt_path}",
-            f"Tasks: {task_summary}",
-            "",
-            "Do one bounded controller turn:",
-            "1. Read the status file and recent Morpheus graph events/artifacts.",
-            "2. Reconcile worker progress and proof into mission events.",
-            "3. If work can proceed under the budget, create bounded tasks with `morpheus goal task-add` and spawn them with `morpheus goal task-spawn` only when scopes are disjoint.",
-            "4. If the done definition is satisfied by recorded proof, run `morpheus goal done "
-            f"{goal.goal_id} --reason \"...\"`.",
-            "5. If blocked or unsafe, run `morpheus goal pause "
-            f"{goal.goal_id} --reason \"...\"` and explain the blocker.",
-            "",
-            "Never push, merge, approve PRs, send external messages, spend money, or take account actions.",
+            "# MORPHEUS_GOAL_CONTINUATION",
+            f"goal={goal.goal_id}",
+            f"reason={_comment_field(reason, limit=120)}",
+            f"turns={goal.turns_used}/{goal.max_turns}",
+            f"workers={goal.active_workers}/{goal.max_workers}",
+            f"status_file={bundle.status_path}",
+            f"prompt_file={bundle.prompt_path}",
+            f"tasks={_comment_field(task_summary, limit=240)}",
+            "commands=morpheus goal task-add, morpheus goal task-spawn, morpheus goal done, morpheus goal pause",
+            "action=read status, reconcile proof, create/spawn only disjoint bounded tasks, mark done or pause when proven",
+            "never=push, merge, approve PRs, send external messages, spend money, or take account actions",
         ]
     )
 
@@ -572,6 +594,7 @@ def set_status(
     reason: str = "",
     reset_turns: bool = False,
 ) -> GoalRunBundle:
+    status = _validate_value("goal status", status, GOAL_STATUSES)
     goal = db.set_goal_run_status(
         goal_id,
         status,
@@ -824,6 +847,64 @@ def _recent_artifacts(mission_ids: list[str], *, limit: int) -> list[db.MissionA
     return artifacts[:limit]
 
 
+def _safe_agent_command(command: str) -> str:
+    raw = (command or "codex").strip()
+    if not raw:
+        raw = "codex"
+    if "\n" in raw or "\r" in raw or any(token in raw for token in BLOCKED_COMMAND_TOKENS):
+        raise ValueError("agent command must be a direct provider command without shell control operators")
+    try:
+        parts = shlex.split(raw)
+    except ValueError as exc:
+        raise ValueError(f"agent command is not parseable: {exc}") from exc
+    if not parts:
+        return "codex"
+    executable = Path(parts[0]).name.lower()
+    if executable not in ALLOWED_AGENT_COMMANDS:
+        allowed = ", ".join(sorted(ALLOWED_AGENT_COMMANDS))
+        raise ValueError(f"agent command must start with one of: {allowed}")
+    _validate_agent_options(parts[1:])
+    return " ".join(shlex.quote(part) for part in parts)
+
+
+def _validate_agent_options(parts: list[str]) -> None:
+    index = 0
+    while index < len(parts):
+        part = parts[index]
+        if part == "--" or not part.startswith("-"):
+            raise ValueError("agent command may only include options, not positional subcommands")
+        option_name = part.split("=", 1)[0]
+        if option_name in AGENT_BLOCKED_OPTIONS:
+            raise ValueError(f"agent command option {option_name} cannot override the goal project root")
+        if "=" in part:
+            index += 1
+            continue
+        if part in AGENT_VALUE_OPTIONS:
+            if index + 1 >= len(parts) or parts[index + 1].startswith("-"):
+                raise ValueError(f"agent command option {part} requires a value")
+            index += 2
+            continue
+        index += 1
+
+
+def _validate_value(label: str, value: str, allowed: set[str]) -> str:
+    candidate = (value or "").strip()
+    if candidate not in allowed:
+        allowed_values = ", ".join(sorted(allowed))
+        raise ValueError(f"invalid {label} '{value}'; expected one of: {allowed_values}")
+    return candidate
+
+
+def _positive_int(label: str, value: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{label} must be a positive integer") from exc
+    if parsed < 1:
+        raise ValueError(f"{label} must be a positive integer")
+    return parsed
+
+
 def _encode_claimed_paths(paths: Iterable[str] | str) -> str:
     if isinstance(paths, str):
         if not paths.strip():
@@ -846,18 +927,77 @@ def _decode_claimed_paths(raw: str) -> list[str]:
     return [str(item) for item in decoded if str(item)]
 
 
-def _claimed_path_conflicts(goal_id: str, claimed_paths: list[str]) -> list[str]:
+def _normalize_claimed_paths(paths: Iterable[str] | str, *, project_root: str = "") -> list[str]:
+    if isinstance(paths, str):
+        raw_items = [item.strip() for item in paths.split(",") if item.strip()]
+    else:
+        raw_items = [str(item).strip() for item in paths if str(item).strip()]
+
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for raw in raw_items:
+        path = _normalize_claimed_path(raw, project_root=project_root)
+        if path and path not in seen:
+            normalized.append(path)
+            seen.add(path)
+    return normalized
+
+
+def _normalize_claimed_path(raw: str, *, project_root: str = "") -> str:
+    value = str(raw).strip()
+    if not value:
+        return ""
+    candidate = Path(value).expanduser()
+    root = Path(project_root).expanduser().resolve() if project_root else None
+    if candidate.is_absolute():
+        if root is None:
+            raise ValueError("absolute claimed paths require a project root")
+        try:
+            return _clean_claimed_path(candidate.resolve(strict=False).relative_to(root))
+        except ValueError as exc:
+            raise ValueError(f"claimed path must stay inside project root: {raw}") from exc
+    return _clean_claimed_path(value)
+
+
+def _clean_claimed_path(path: object) -> str:
+    normalized = posixpath.normpath(str(path).replace("\\", "/").strip())
+    if normalized in {"", "."}:
+        return "."
+    if normalized == ".." or normalized.startswith("../"):
+        raise ValueError(f"claimed path must stay inside project root: {path}")
+    return normalized.strip("/")
+
+
+def _claimed_path_conflicts(goal_id: str, claimed_paths: list[str], *, project_root: str = "") -> list[str]:
     if not claimed_paths:
         return []
-    claimed = set(claimed_paths)
     conflicts: list[str] = []
     for task in db.goal_tasks(goal_id):
         if task.status in FINAL_TASK_STATUSES:
             continue
-        overlap = claimed & set(_decode_claimed_paths(task.claimed_paths))
+        existing = _normalize_claimed_paths(_decode_claimed_paths(task.claimed_paths), project_root=project_root)
+        overlap = [
+            claimed
+            for claimed in claimed_paths
+            for current in existing
+            if _paths_overlap(claimed, current)
+        ]
         if overlap:
-            conflicts.append(f"{task.task_id} already claims {', '.join(sorted(overlap))}")
+            conflicts.append(f"{task.task_id} already claims overlapping paths: {', '.join(sorted(set(overlap)))}")
     return conflicts
+
+
+def _paths_overlap(left: str, right: str) -> bool:
+    if left == "." or right == ".":
+        return True
+    return left == right or left.startswith(f"{right}/") or right.startswith(f"{left}/")
+
+
+def _comment_field(text: object, *, limit: int) -> str:
+    compact = _one_line(str(text), limit=limit)
+    compact = compact.replace("\r", " ").replace("\n", " ")
+    compact = compact.replace("`", "'").replace("$(", "(")
+    return compact
 
 
 def _format_ts(ts: float) -> str:

@@ -2132,6 +2132,7 @@ def reserve_goal_continuation(
     """
     ts = time.time() if now is None else now
     with _connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
         row = conn.execute("SELECT * FROM goal_runs WHERE goal_id = ?", (goal_id,)).fetchone()
         if row is None:
             return None, "not_found"

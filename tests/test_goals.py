@@ -50,6 +50,18 @@ class GoalRunsTest(unittest.TestCase):
         self.assertIn("Safety Rules", prompt)
         self.assertTrue(any(edge.relation == "goal_run" and edge.to_id == stored.goal_id for edge in edges))
 
+    def test_goal_creation_rejects_invalid_autonomy_and_budgets(self) -> None:
+        with isolated_goal_runtime() as root:
+            prd = root / "PRD.md"
+            prd.write_text("# Autonomous PRD\n", encoding="utf-8")
+
+            with self.assertRaises(ValueError):
+                goals.create_goal_run(prd, autonomy_level="unbounded_shell")
+            with self.assertRaises(ValueError):
+                goals.create_goal_run(prd, max_turns=0)
+            with self.assertRaises(ValueError):
+                goals.create_goal_run(prd, max_workers=0)
+
     def test_attach_controller_links_live_controller_and_refreshes_status(self) -> None:
         with isolated_goal_runtime() as root:
             prd = root / "PRD.md"
@@ -95,6 +107,20 @@ class GoalRunsTest(unittest.TestCase):
         self.assertTrue(any(event.kind == "goal_paused" for event in events))
         self.assertTrue(any(event.kind == "goal_cleared" for event in events))
         self.assertIn("done testing", status)
+
+    def test_goal_and_task_status_reject_unknown_values(self) -> None:
+        with isolated_goal_runtime() as root:
+            prd = root / "PRD.md"
+            prd.write_text("# Autonomous PRD\n", encoding="utf-8")
+            bundle = goals.create_goal_run(prd)
+            task = goals.create_task(bundle.goal.goal_id, title="bounded task")
+
+            with self.assertRaises(ValueError):
+                goals.set_status(bundle.goal.goal_id, "done; rm -rf /")
+            with self.assertRaises(ValueError):
+                goals.create_task(bundle.goal.goal_id, title="bad task", status="shell")
+            with self.assertRaises(ValueError):
+                goals.set_task_status(task.task_id, "done; rm -rf /")
 
     def test_resolve_goal_from_parent_or_controller_mission(self) -> None:
         with isolated_goal_runtime() as root:
@@ -161,6 +187,56 @@ class GoalRunsTest(unittest.TestCase):
         self.assertIn("rollup implemented and tested", status)
         self.assertIn("morpheus/goals.py", status)
 
+    def test_task_path_claims_normalize_and_detect_prefix_conflicts(self) -> None:
+        with isolated_goal_runtime() as root:
+            prd = root / "PRD.md"
+            prd.write_text("# Autonomous PRD\n", encoding="utf-8")
+            bundle = goals.create_goal_run(prd)
+            project_root = Path(bundle.goal.project_root)
+
+            task = goals.create_task(
+                bundle.goal.goal_id,
+                title="claim package",
+                claimed_paths=[project_root / "morpheus"],
+            )
+
+            with self.assertRaises(ValueError) as err:
+                goals.create_task(
+                    bundle.goal.goal_id,
+                    title="claim nested file",
+                    claimed_paths=["./morpheus/goals.py"],
+                )
+            with self.assertRaises(ValueError):
+                goals.create_task(
+                    bundle.goal.goal_id,
+                    title="claim outside root",
+                    claimed_paths=["../outside.py"],
+                )
+
+        self.assertEqual(goals._decode_claimed_paths(task.claimed_paths), ["morpheus"])
+        self.assertIn("overlapping paths", str(err.exception))
+
+    def test_agent_commands_reject_shell_control_operators(self) -> None:
+        with isolated_goal_runtime() as root:
+            prd = root / "PRD.md"
+            prd.write_text("# Autonomous PRD\n", encoding="utf-8")
+            bundle = goals.create_goal_run(prd)
+            task = goals.create_task(bundle.goal.goal_id, title="bounded task")
+
+            command = goals.controller_command("codex --model gpt-5", bundle)
+            with self.assertRaises(ValueError):
+                goals.controller_command("codex; rm -rf /", bundle)
+            with self.assertRaises(ValueError):
+                goals.worker_command("sh -c 'codex'", bundle, task)
+            with self.assertRaises(ValueError):
+                goals.worker_command("codex $(touch /tmp/pwned)", bundle, task)
+            with self.assertRaises(ValueError):
+                goals.worker_command("codex exec 'rm -rf /'", bundle, task)
+            with self.assertRaises(ValueError):
+                goals.worker_command("codex --cwd /", bundle, task)
+
+        self.assertTrue(command.startswith("codex --model gpt-5 "))
+
     def test_controller_continuation_respects_cooldown_and_turn_budget(self) -> None:
         with isolated_goal_runtime() as root:
             prd = root / "PRD.md"
@@ -193,11 +269,37 @@ class GoalRunsTest(unittest.TestCase):
         self.assertEqual([target.goal.goal_id for target in due], [bundle.goal.goal_id])
         self.assertEqual(outcome, "reserved")
         self.assertIn("morpheus goal task-add", text)
-        self.assertIn("Turn budget: 1/1", text)
+        self.assertIn("turns=1/1", text)
+        self.assertTrue(text.startswith("# MORPHEUS_GOAL_CONTINUATION"))
+        self.assertNotIn("\n", text)
+        self.assertNotIn("`", text)
         self.assertEqual(exhausted_outcome, "budget_exhausted")
         self.assertEqual(exhausted.goal.status, "paused")
         self.assertTrue(any(event.kind == "goal_continue" for event in events))
         self.assertTrue(any(event.kind == "goal_budget_pause" for event in events))
+
+    def test_controller_continuation_only_targets_idle_live_sessions(self) -> None:
+        with isolated_goal_runtime() as root:
+            prd = root / "PRD.md"
+            prd.write_text("# Autonomous PRD\n", encoding="utf-8")
+            bundle = goals.create_goal_run(prd, max_turns=3)
+            controller = db.Mission(
+                tab_id="tab-controller",
+                mission_id="m_controller",
+                goal="autonomous prd goal controller",
+                state="finished",
+                cmd="codex",
+            )
+            db.upsert(controller)
+            goals.attach_controller(bundle, controller)
+
+            not_due = goals.due_continuation_targets(cooldown_seconds=0, limit=5)
+            controller.state = "idle"
+            db.upsert(controller)
+            due = goals.due_continuation_targets(cooldown_seconds=0, limit=5)
+
+        self.assertEqual(not_due, [])
+        self.assertEqual([target.goal.goal_id for target in due], [bundle.goal.goal_id])
 
 
 if __name__ == "__main__":
