@@ -3046,6 +3046,81 @@ class DashboardTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertNotIn(loop.id, app.running_loop_ids)
         self.assertIn("WMT disciplined zone", app.alerts[0].text)
+        self.assertIn(run.id, app.alerted_loop_run_ids)
+
+    def test_scan_new_loop_runs_posts_white_rabbit_alert(self) -> None:
+        app = DashboardHarness()
+        loop = dashboard.db.PromptLoop(
+            id=7,
+            name="market scan",
+            prompt="summarize catalysts",
+            interval_seconds=900,
+            command="codex exec",
+            next_run_at=0,
+        )
+        running = dashboard.db.PromptLoopRun(
+            id=4,
+            loop_id=loop.id,
+            started_at=1,
+            finished_at=0,
+            status="running",
+            exit_code=None,
+            output_path="/tmp/running.txt",
+            summary="run started",
+        )
+        finished = dashboard.db.PromptLoopRun(
+            id=5,
+            loop_id=loop.id,
+            started_at=2,
+            finished_at=3,
+            status="success",
+            exit_code=0,
+            output_path="/tmp/done.txt",
+            summary="WMT disciplined zone",
+        )
+
+        with patch.object(app, "_visible_loops", new=lambda: [loop]), patch.object(
+            dashboard.db, "loop_runs", new=lambda loop_id, limit=5: [running]
+        ):
+            app._scan_new_loop_runs()
+        self.assertEqual(list(app.alerts), [])
+        self.assertNotIn(running.id, app.alerted_loop_run_ids)
+
+        with patch.object(app, "_visible_loops", new=lambda: [loop]), patch.object(
+            dashboard.db, "loop_runs", new=lambda loop_id, limit=5: [finished, running]
+        ):
+            app._scan_new_loop_runs()
+
+        self.assertIn(finished.id, app.alerted_loop_run_ids)
+        self.assertNotIn(running.id, app.alerted_loop_run_ids)
+        self.assertEqual(app.alerts[0].kind, "summary")
+        self.assertIn("↻ loop [market scan] success: WMT disciplined zone", app.alerts[0].text)
+
+        with patch.object(app, "_visible_loops", new=lambda: [loop]), patch.object(
+            dashboard.db, "loop_runs", new=lambda loop_id, limit=5: [finished, running]
+        ):
+            app._scan_new_loop_runs()
+        self.assertEqual(len(app.alerts), 1)
+
+    def test_scan_new_notes_skips_loop_notes_but_advances_watermark(self) -> None:
+        app = DashboardHarness()
+        app.last_seen_note_id = 10
+        notes = [
+            dashboard.db.Note(
+                id=11,
+                tab_id=None,
+                session_id=None,
+                text="loop [market scan] WMT disciplined zone",
+                kind="loop",
+                created_at=1,
+            )
+        ]
+
+        with patch.object(app, "_recent_notes", new=lambda limit: notes):
+            app._scan_new_notes()
+
+        self.assertEqual(list(app.alerts), [])
+        self.assertEqual(app.last_seen_note_id, 11)
 
     async def test_refresh_table_renders_project_loop_rows(self) -> None:
         app = DashboardHarness()

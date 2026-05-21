@@ -3493,6 +3493,7 @@ class MorpheusApp(App):
         self.last_seen_note_id: int = 0
         self.live_buffers: dict[str, LiveBuffer] = {}
         self.summary_alert_hashes: dict[str, str] = {}
+        self.alerted_loop_run_ids: set[int] = set()
         self.self_tab_id: Optional[str] = None
         self.self_session_id: Optional[str] = None
         self.current_missions: list[db.Mission] = []
@@ -3612,6 +3613,7 @@ class MorpheusApp(App):
             self.last_seen_note_id = recent[0].id if recent else 0
         except Exception:
             pass
+        self._prime_loop_run_alerts()
         try:
             self.last_seen_tabs = {m.tab_id for m in self._all_missions()}
         except Exception:
@@ -3673,6 +3675,7 @@ class MorpheusApp(App):
             self.current_missions = missions
             self._scan_new_missions(missions)
             self._scan_new_notes()
+            self._scan_new_loop_runs()
         except Exception as e:
             self.log_handle.exception("tick error: %s", e)
 
@@ -3979,8 +3982,11 @@ class MorpheusApp(App):
 
     def _scan_new_notes(self) -> None:
         recent = self._recent_notes(limit=12)
-        fresh = [n for n in recent if n.id > self.last_seen_note_id]
+        fresh_all = [n for n in recent if n.id > self.last_seen_note_id]
+        fresh = [n for n in fresh_all if n.kind != "loop"]
         if not fresh:
+            if fresh_all:
+                self.last_seen_note_id = max(n.id for n in fresh_all)
             return
         goals = {m.tab_id: (m.goal or "(untitled)") for m in self._all_missions()}
         for n in sorted(fresh, key=lambda n: n.created_at):
@@ -3990,7 +3996,43 @@ class MorpheusApp(App):
                 n.created_at, "note",
                 f"{marker} note from [{goal}]: {n.text}",
             ))
-        self.last_seen_note_id = max(n.id for n in fresh)
+        self.last_seen_note_id = max(n.id for n in fresh_all)
+
+    def _prime_loop_run_alerts(self) -> None:
+        try:
+            for loop in self._visible_loops():
+                for run in db.loop_runs(loop.id, limit=10):
+                    self.alerted_loop_run_ids.add(run.id)
+        except Exception:
+            pass
+
+    def _scan_new_loop_runs(self) -> None:
+        try:
+            loops = self._visible_loops()
+        except Exception:
+            return
+        fresh: list[tuple[db.PromptLoop, db.PromptLoopRun]] = []
+        for loop in loops:
+            try:
+                runs = db.loop_runs(loop.id, limit=5)
+            except Exception:
+                continue
+            for run in runs:
+                if run.id in self.alerted_loop_run_ids or run.status == "running":
+                    continue
+                fresh.append((loop, run))
+        if not fresh:
+            return
+        fresh.sort(key=lambda item: item[1].finished_at or item[1].started_at)
+        for loop, run in fresh:
+            self.alerted_loop_run_ids.add(run.id)
+            summary = run.summary or "loop completed with no summary"
+            kind = "summary" if run.status == "success" else "error"
+            self._push_alert(Alert(
+                run.finished_at or time.time(),
+                kind,
+                f"↻ loop [{loop.name}] {run.status}: {summary}",
+            ))
 
     def _push_alert(self, alert: Alert) -> None:
         self.alerts.appendleft(alert)
@@ -4861,6 +4903,7 @@ class MorpheusApp(App):
                 kind,
                 f"loop [{loop.name}] {run.status}: {run.summary}",
             ))
+            self.alerted_loop_run_ids.add(run.id)
         finally:
             self.running_loop_ids.discard(loop_id)
             self._refresh_table()
