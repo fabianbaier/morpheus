@@ -1432,6 +1432,85 @@ class DashboardTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(list(app.alerts), [])
         self.assertEqual(final_row_count, 0)
 
+    def test_loop_run_memories_do_not_render_as_closed_dashboard_rows(self) -> None:
+        app = DashboardHarness()
+        loop_memory = dashboard.db.MissionMemory(
+            mission_id="looprun_2_11",
+            title="loop News run #11",
+            topic="loop-run",
+            source_kind="loop-run",
+            resume_command="cd /tmp/project && codex resume 019e4824-ec9a-7ce0-bf54-0b29e9b42f86",
+            resume_confidence="exact",
+            archived_at=10,
+            closed_at=10,
+        )
+        closed_memory = dashboard.db.MissionMemory(
+            mission_id="m_closed",
+            title="closed codex",
+            resume_command="codex resume 019e466d-0fd8-7441-aa1f-32a5db211a73",
+            resume_confidence="exact",
+            archived_at=10,
+            closed_at=10,
+        )
+
+        with patch.object(
+            app,
+            "_all_memory",
+            new=lambda include_archived=False: [loop_memory, closed_memory],
+        ):
+            rows = app._closed_resumable_memories([])
+
+        self.assertEqual([row.mission_id for row in rows], ["m_closed"])
+
+    async def test_loop_run_missions_do_not_render_as_dashboard_rows(self) -> None:
+        app = DashboardHarness()
+        loop_run = dashboard.db.Mission(
+            tab_id="tab-loop",
+            mission_id="looprun_2_11",
+            goal="loop News run #11",
+            state="idle",
+            buffer_changed_at=10,
+        )
+        mission = dashboard.db.Mission(
+            tab_id="tab-normal",
+            mission_id="m_normal",
+            goal="normal mission",
+            state="working",
+            buffer_changed_at=10,
+        )
+
+        with isolated_dashboard_runtime([loop_run, mission]):
+            async with app.run_test(size=(120, 40)) as pilot:
+                app._refresh_table()
+                await pilot.pause()
+                table = app.query_one(dashboard.MissionsTable)
+
+        self.assertEqual([ref.mission_id for ref in table.row_refs], ["m_normal"])
+
+    async def test_observed_loop_run_mission_does_not_update_dashboard_rain(self) -> None:
+        app = DashboardHarness()
+        loop_run = dashboard.db.Mission(
+            tab_id="tab-loop",
+            mission_id="looprun_2_11",
+            goal="loop News run #11",
+            state="idle",
+        )
+        app.live_buffers = {
+            "tab-loop": dashboard.LiveBuffer("tab-loop", "stale", "working", "", "old", 0)
+        }
+        tab = dashboard.iterm_client.TabInfo(
+            tab_id="tab-loop",
+            session_id="session-loop",
+            window_id="window",
+            buffer="loop output",
+            current_name="codex",
+            cwd="/tmp/project",
+        )
+
+        await app._on_tab_observed(tab, loop_run, SimpleNamespace(last_event="idle"))
+
+        self.assertNotIn("tab-loop", app.live_buffers)
+
     async def test_prune_archives_orphan_prd_parent_rows(self) -> None:
         app = DashboardHarness()
         orphan_parent = dashboard.db.MissionMemory(
@@ -2528,6 +2607,54 @@ class DashboardTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(captured["result"].loop_id, 7)
         self.assertEqual(captured["result"].run_id, 12)
 
+    async def test_loop_manager_delete_on_run_requests_history_delete(self) -> None:
+        app = DashboardHarness()
+        captured = {}
+        loop = dashboard.db.PromptLoop(
+            id=7,
+            name="market scan",
+            prompt="summarize catalysts",
+            interval_seconds=900,
+            command="codex exec",
+            next_run_at=0,
+        )
+        run = dashboard.db.PromptLoopRun(
+            id=12,
+            loop_id=loop.id,
+            started_at=1,
+            finished_at=2,
+            status="success",
+            exit_code=0,
+            output_path="/tmp/loop.txt",
+            summary="done",
+            mission_id="looprun_7_12",
+        )
+
+        with isolated_dashboard_runtime(), patch.object(
+            dashboard.db, "all_loops", new=lambda include_paused=True, tenant_id="": [loop]
+        ), patch.object(
+            dashboard.db, "loop_runs", new=lambda loop_id, limit=5: [run]
+        ), patch.object(
+            dashboard.db, "loop_run_count", new=lambda loop_id: 1
+        ), patch.object(
+            app,
+            "_handle_loop_action_result",
+            new=lambda result: captured.setdefault("result", result),
+        ):
+            async with app.run_test(size=(120, 40)) as pilot:
+                app.action_manage_loops()
+                await pilot.pause()
+
+                await pilot.press("d")
+                await pilot.pause()
+                self.assertIn("remove run #12", str(app.screen.query_one("#loop_detail", dashboard.Static).content))
+                await pilot.press("d")
+                await pilot.pause()
+
+        self.assertEqual(captured["result"].action, "delete-run")
+        self.assertEqual(captured["result"].loop_id, 7)
+        self.assertEqual(captured["result"].run_id, 12)
+
     async def test_join_loop_run_spawns_agent_session_and_links_run(self) -> None:
         app = DashboardHarness()
         captured = {}
@@ -2558,9 +2685,6 @@ class DashboardTest(unittest.IsolatedAsyncioTestCase):
             captured["spawn"] = (connection, command, goal)
             return SimpleNamespace(tab_id="tab-run", session_id="sess-run")
 
-        async def fake_send_text(connection, tab_ids, text):
-            captured["send"] = (connection, tab_ids, text)
-
         with isolated_dashboard_runtime(), patch.object(
             dashboard.db, "get_loop", new=lambda loop_id: loop if loop_id == loop.id else None
         ), patch.object(
@@ -2569,8 +2693,6 @@ class DashboardTest(unittest.IsolatedAsyncioTestCase):
             dashboard.db, "get_memory", new=lambda mission_id: None
         ), patch.object(
             dashboard.iterm_client, "spawn_tab", new=fake_spawn_tab
-        ), patch.object(
-            dashboard.iterm_client, "send_text_to_tabs", new=fake_send_text
         ), patch.object(
             dashboard.db, "upsert", new=lambda mission: captured.setdefault("mission", mission)
         ), patch.object(
@@ -2595,14 +2717,143 @@ class DashboardTest(unittest.IsolatedAsyncioTestCase):
             async with app.run_test(size=(120, 40)):
                 await app._join_loop_run(loop.id, run.id)
 
-        self.assertEqual(captured["spawn"][1], "cd /tmp/project && codex")
+        self.assertTrue(captured["spawn"][1].startswith("cd /tmp/project && codex "))
+        self.assertIn("Join this active Morpheus loop run.", captured["spawn"][1])
         self.assertEqual(captured["spawn"][2], "loop market scan run #12")
         self.assertEqual(captured["attach"][0], 12)
         self.assertEqual(captured["attach"][1]["tab_id"], "tab-run")
         self.assertEqual(captured["mission"].mission_id, "looprun_7_12")
         self.assertEqual(captured["memory"].topic, "loop-run")
-        self.assertIn("Loop: #7 market scan", captured["send"][2])
+        self.assertEqual(captured["memory"].resume_command, "")
         self.assertEqual(captured["ledger"][0][0], "loop_run_join")
+
+    async def test_join_completed_codex_loop_run_resumes_exact_exec_session(self) -> None:
+        app = DashboardHarness()
+        captured = {}
+        resume_id = "019e4824-ec9a-7ce0-bf54-0b29e9b42f86"
+        loop = dashboard.db.PromptLoop(
+            id=7,
+            name="market scan",
+            prompt="summarize catalysts",
+            interval_seconds=900,
+            command="codex exec",
+            tenant_id="p_test",
+            project_root="/tmp/project",
+            next_run_at=0,
+        )
+        output_path = Path("/tmp/loop-run-output.txt")
+        run = dashboard.db.PromptLoopRun(
+            id=12,
+            loop_id=loop.id,
+            started_at=1,
+            finished_at=2,
+            status="success",
+            exit_code=0,
+            output_path=str(output_path),
+            summary="summary",
+            mission_id="looprun_7_12",
+        )
+
+        async def fake_spawn_tab(connection, *, command, goal):
+            captured["spawn"] = (connection, command, goal)
+            return SimpleNamespace(tab_id="tab-run", session_id="sess-run")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            output_path = Path(tmp) / "loop.txt"
+            output_path.write_text(f"session id: {resume_id}\nsummary\n", encoding="utf-8")
+            run.output_path = str(output_path)
+            with isolated_dashboard_runtime(), patch.object(
+                dashboard.db, "get_loop", new=lambda loop_id: loop if loop_id == loop.id else None
+            ), patch.object(
+                dashboard.db, "get_loop_run", new=lambda run_id: run if run_id == run.id else None
+            ), patch.object(
+                dashboard.db, "get_memory", new=lambda mission_id: None
+            ), patch.object(
+                dashboard.iterm_client, "spawn_tab", new=fake_spawn_tab
+            ), patch.object(
+                dashboard.db, "upsert", new=lambda mission: captured.setdefault("mission", mission)
+            ), patch.object(
+                dashboard.db,
+                "attach_loop_run_session",
+                new=lambda run_id, **kwargs: captured.setdefault("attach", (run_id, kwargs)) or run,
+            ), patch.object(
+                dashboard.db, "update_loop_run_resume_metadata", new=lambda run_id, **kwargs: captured.setdefault("resume", (run_id, kwargs)) or run
+            ), patch.object(
+                dashboard.db, "upsert_memory", new=lambda memory: captured.setdefault("memory", memory)
+            ), patch.object(
+                dashboard.db, "add_event", new=lambda *args, **kwargs: captured.setdefault("event", (args, kwargs)) or 1
+            ), patch.object(
+                dashboard.ledger_mod, "log_action", new=lambda *args, **kwargs: captured.setdefault("ledger", (args, kwargs))
+            ), patch.object(
+                dashboard.ctx_mod, "write_context_file", new=lambda: None
+            ), patch.object(
+                dashboard.ctx_mod, "write_context_json", new=lambda: None
+            ), patch.object(
+                app, "_refresh_table", new=lambda: None
+            ):
+                async with app.run_test(size=(120, 40)):
+                    await app._join_loop_run(loop.id, run.id)
+
+        self.assertEqual(captured["spawn"][1], f"cd /tmp/project && codex resume {resume_id}")
+        self.assertNotIn("Resume this completed Morpheus loop run.", captured["spawn"][1])
+        self.assertEqual(captured["resume"][0], 12)
+        self.assertEqual(captured["resume"][1]["resume_ref"], resume_id)
+        self.assertEqual(captured["memory"].resume_ref, resume_id)
+        self.assertEqual(captured["memory"].resume_command, f"cd /tmp/project && codex resume {resume_id}")
+        self.assertEqual(captured["memory"].resume_confidence, "exact")
+
+    async def test_loop_run_delete_action_removes_history_row(self) -> None:
+        app = DashboardHarness()
+        done = asyncio.Event()
+        captured = {}
+        loop = dashboard.db.PromptLoop(
+            id=7,
+            name="market scan",
+            prompt="summarize catalysts",
+            interval_seconds=900,
+            command="codex exec",
+            target_tab_id="tab-target",
+            next_run_at=0,
+        )
+        run = dashboard.db.PromptLoopRun(
+            id=12,
+            loop_id=loop.id,
+            started_at=1,
+            finished_at=2,
+            status="success",
+            exit_code=0,
+            output_path="/tmp/loop.txt",
+            summary="done",
+            mission_id="looprun_7_12",
+            target_tab_id="tab-target",
+        )
+
+        def fake_delete_loop_run(run_id):
+            captured["delete"] = run_id
+            done.set()
+            return run
+
+        with patch.object(
+            dashboard.db, "get_loop", new=lambda loop_id: loop if loop_id == loop.id else None
+        ), patch.object(
+            dashboard.db, "get_loop_run", new=lambda run_id: run if run_id == run.id else None
+        ), patch.object(
+            dashboard.db, "delete_loop_run", new=fake_delete_loop_run
+        ), patch.object(
+            dashboard.ledger_mod, "log_action", new=lambda *args, **kwargs: captured.setdefault("ledger", (args, kwargs))
+        ), patch.object(
+            dashboard.ctx_mod, "write_context_file", new=lambda: None
+        ), patch.object(
+            dashboard.ctx_mod, "write_context_json", new=lambda: None
+        ), patch.object(
+            app, "_refresh_table", new=lambda: None
+        ):
+            app._handle_loop_action_result(LoopActionRequest(action="delete-run", loop_id=loop.id, run_id=run.id))
+            await asyncio.wait_for(done.wait(), timeout=1)
+
+        self.assertEqual(captured["delete"], 12)
+        self.assertEqual(captured["ledger"][0][0], "loop_run_delete")
+        self.assertIn("deleted loop run #12", app.alerts[0].text)
 
     async def test_loop_target_key_focuses_existing_target_when_no_candidate(self) -> None:
         app = DashboardHarness()

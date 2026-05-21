@@ -916,8 +916,12 @@ class MissionsTable(DataTable):
         self.row_tab_ids = []
         self.row_refs = []
 
-        sorted_m = sorted(missions, key=_sort_key)
-        missions_by_id = {m.mission_id: m for m in missions if m.mission_id}
+        visible_missions = [
+            mission for mission in missions
+            if not db.is_loop_run_mission_id(mission.mission_id)
+        ]
+        sorted_m = sorted(visible_missions, key=_sort_key)
+        missions_by_id = {m.mission_id: m for m in visible_missions if m.mission_id}
         child_ids: set[str] = set()
         collapsed_prd_ids = collapsed_prd_ids or set()
         rows: list[
@@ -1546,6 +1550,87 @@ def _loop_run_agent_command(command: str) -> str:
 
 def _loop_run_agent_kind(command: str) -> str:
     return Path(_loop_run_agent_command(command).split()[0]).name.lower()
+
+
+def _shell_append_arg(command: str, value: str) -> str:
+    return f"{command} {shlex.quote(value)}"
+
+
+def _loop_run_exact_resume_metadata(
+    loop: db.PromptLoop,
+    run: db.PromptLoopRun,
+    *,
+    project_root: str = "",
+) -> tuple[str, str, str, str]:
+    if run.resume_confidence == "exact" and run.resume_command and run.resume_ref:
+        return run.agent_kind, run.resume_ref, run.resume_command, run.resume_confidence
+    if run.mission_id:
+        try:
+            memory = db.get_memory(run.mission_id)
+        except Exception:
+            memory = None
+        if (
+            memory is not None
+            and memory.resume_confidence == "exact"
+            and memory.resume_command
+            and memory.resume_ref
+        ):
+            return memory.agent_kind, memory.resume_ref, memory.resume_command, memory.resume_confidence
+    output = ""
+    if run.output_path:
+        try:
+            output = Path(run.output_path).read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            output = ""
+    agent_kind, resume_ref, resume_command, confidence = db.resume_metadata_from_text(
+        loops_mod.normalize_command(loop.command),
+        output,
+        linked_worktree=project_root or loop.project_root,
+    )
+    if confidence == "exact" and resume_command:
+        try:
+            db.update_loop_run_resume_metadata(
+                run.id,
+                agent_kind=agent_kind,
+                resume_ref=resume_ref,
+                resume_command=resume_command,
+                resume_confidence=confidence,
+            )
+        except Exception:
+            pass
+    return agent_kind, resume_ref, resume_command, confidence
+
+
+def _loop_run_launch_command(
+    loop: db.PromptLoop,
+    run: db.PromptLoopRun,
+    *,
+    project_root: str = "",
+) -> tuple[str, str, str, str, str]:
+    prompt = _loop_run_join_prompt(loop, run)
+    agent_kind, resume_ref, resume_command, confidence = _loop_run_exact_resume_metadata(
+        loop,
+        run,
+        project_root=project_root,
+    )
+    if confidence == "exact" and resume_command:
+        return resume_command, agent_kind, resume_ref, resume_command, confidence
+
+    base = _loop_run_agent_command(loop.command)
+    cmd = _shell_append_arg(base, prompt)
+    if project_root:
+        cmd = tenant_mod.command_in_project(cmd, project_root)
+    return cmd, _loop_run_agent_kind(loop.command), "", "", ""
+
+
+def _loop_run_session_label(run: db.PromptLoopRun) -> str:
+    if run.tab_id:
+        return run.tab_id.split("-")[0]
+    if run.resume_ref:
+        return f"resume {run.resume_ref[:8]}"
+    if run.mission_id:
+        return "resumable"
+    return "capture"
 
 
 def _loop_run_join_prompt(loop: db.PromptLoop, run: db.PromptLoopRun) -> str:
@@ -2574,7 +2659,7 @@ class LoopManagerScreen(ModalScreen[Optional[LoopActionRequest]]):
         self.selected_loop_id = selected_loop_id
         self.join_target_mission_id = join_target_mission_id
         self.join_target_tab_id = join_target_tab_id
-        self.confirm_delete_id: Optional[int] = None
+        self.confirm_delete_ref: Optional[tuple[str, int]] = None
         self.focus_table = "loops"
 
     def compose(self) -> ComposeResult:
@@ -2633,7 +2718,7 @@ class LoopManagerScreen(ModalScreen[Optional[LoopActionRequest]]):
         self._refresh_detail()
 
     def on_data_table_row_highlighted(self, event) -> None:
-        self.confirm_delete_id = None
+        self.confirm_delete_ref = None
         if getattr(event.data_table, "id", "") == "loops_table":
             self._refresh_runs()
         self._refresh_detail()
@@ -2659,13 +2744,13 @@ class LoopManagerScreen(ModalScreen[Optional[LoopActionRequest]]):
     def action_cursor_down(self) -> None:
         table = self._focused_table()
         table.action_cursor_down()
-        self.confirm_delete_id = None
+        self.confirm_delete_ref = None
         self._refresh_detail()
 
     def action_cursor_up(self) -> None:
         table = self._focused_table()
         table.action_cursor_up()
-        self.confirm_delete_id = None
+        self.confirm_delete_ref = None
         self._refresh_detail()
 
     def action_switch_focus(self) -> None:
@@ -2752,10 +2837,30 @@ class LoopManagerScreen(ModalScreen[Optional[LoopActionRequest]]):
         loop = self._selected_loop()
         if loop is None:
             return
-        if self.confirm_delete_id != loop.id:
-            self.confirm_delete_id = loop.id
+        if self.focus_table == "runs":
+            run = self._selected_run()
+            if run is None:
+                return
+            if run.status == "running":
+                self.query_one("#loop_detail", Static).update(
+                    "Cannot delete a running loop run. Wait for it to finish, then delete its history row."
+                )
+                return
+            ref = ("run", run.id)
+            if self.confirm_delete_ref != ref:
+                self.confirm_delete_ref = ref
+                self.query_one("#loop_detail", Static).update(
+                    self._detail(loop, confirm_delete_run=run)
+                )
+                return
+            self.dismiss(LoopActionRequest(action="delete-run", loop_id=loop.id, run_id=run.id))
+            return
+
+        ref = ("loop", loop.id)
+        if self.confirm_delete_ref != ref:
+            self.confirm_delete_ref = ref
             self.query_one("#loop_detail", Static).update(
-                self._detail(loop, confirm_delete=True)
+                self._detail(loop, confirm_delete_loop=True)
             )
             return
         self.dismiss(LoopActionRequest(action="delete", loop_id=loop.id))
@@ -2798,12 +2903,11 @@ class LoopManagerScreen(ModalScreen[Optional[LoopActionRequest]]):
         table = self.query_one("#loop_runs_table", DataTable)
         table.clear()
         for run in self._runs_for_selected_loop():
-            session = run.tab_id.split("-")[0] if run.tab_id else ("resumable" if run.mission_id else "capture")
             table.add_row(
                 str(run.id),
                 run.status,
                 _format_dashboard_ts(run.started_at),
-                session,
+                _loop_run_session_label(run),
                 run.summary or run.output_path or "no summary",
             )
         if self._runs_for_selected_loop():
@@ -2817,24 +2921,31 @@ class LoopManagerScreen(ModalScreen[Optional[LoopActionRequest]]):
         ) if loop is None else self._detail(loop)
         self.query_one("#loop_detail", Static).update(detail)
 
-    def _detail(self, loop: db.PromptLoop, *, confirm_delete: bool = False) -> str:
+    def _detail(
+        self,
+        loop: db.PromptLoop,
+        *,
+        confirm_delete_loop: bool = False,
+        confirm_delete_run: Optional[db.PromptLoopRun] = None,
+    ) -> str:
         run = self._selected_run()
         lines = [
             f"#{loop.id} {loop.name}",
             f"status {loop.status} · every {loops_mod.format_interval(loop.interval_seconds)} · next {loops_mod.format_due(loop.next_run_at)}",
             f"target {_loop_target_label(loop)} · command {loop.command}",
             f"prompt {loop.prompt}",
-            "keys tab loops/runs · enter/J join/resume selected run · e edit loop · o output · r run now",
+            "keys tab loops/runs · enter/J join/resume selected run · e edit loop · o output · r run now · d delete selected",
         ]
         runs = self.runs_by_loop.get(loop.id, [])
         if runs:
             count = self.run_counts_by_loop.get(loop.id, len(runs))
             lines.append(f"recent runs ({count} total, newest first) · select a run above")
             if run is not None:
-                session = run.tab_id.split("-")[0] if run.tab_id else "no tab yet"
                 lines.append(
-                    f"selected run #{run.id} {run.status} · {session} · output {run.output_path or 'pending'}"
+                    f"selected run #{run.id} {run.status} · {_loop_run_session_label(run)} · output {run.output_path or 'pending'}"
                 )
+                if run.resume_ref:
+                    lines.append(f"resume id {run.resume_ref}")
                 lines.append(f"summary {run.summary or 'run started'}")
         else:
             lines.append("recent runs: none yet")
@@ -2842,7 +2953,12 @@ class LoopManagerScreen(ModalScreen[Optional[LoopActionRequest]]):
                 lines.append("run is starting; press o in a moment to inspect its output file")
             else:
                 lines.append("press r to run now; recurring runs still come from launchd/cron or `morpheus loops run-due`")
-        if confirm_delete:
+        if confirm_delete_run is not None:
+            lines.append("")
+            lines.append(
+                f"Press delete again to remove run #{confirm_delete_run.id} from history. Output files remain on disk."
+            )
+        elif confirm_delete_loop:
             lines.append("")
             lines.append("Press delete again to remove this loop. Output files remain on disk.")
         return "\n".join(lines)
@@ -3321,8 +3437,13 @@ class MorpheusApp(App):
     def _all_missions(self) -> list[db.Mission]:
         tenant_id = self._tenant_filter()
         if tenant_id:
-            return db.all_missions(tenant_id=tenant_id)
-        return db.all_missions()
+            missions = db.all_missions(tenant_id=tenant_id)
+        else:
+            missions = db.all_missions()
+        return [
+            mission for mission in missions
+            if not db.is_loop_run_mission_id(mission.mission_id)
+        ]
 
     def _all_memory(self, include_archived: bool = False) -> list[db.MissionMemory]:
         tenant_id = self._tenant_filter()
@@ -3337,6 +3458,8 @@ class MorpheusApp(App):
         return db.recent_notes(limit=limit)
 
     def _mission_in_scope(self, mission: db.Mission) -> bool:
+        if db.is_loop_run_mission_id(mission.mission_id):
+            return False
         tenant_id = self._tenant_filter()
         return not tenant_id or mission.tenant_id == tenant_id
 
@@ -3580,7 +3703,9 @@ class MorpheusApp(App):
             and memory.mission_id not in live_ids
             and memory.resume_command
             and memory.topic != "prd-run"
+            and memory.topic != "loop-run"
             and memory.source_kind != "prd"
+            and memory.source_kind != "loop-run"
         ][:20]
 
     def _prd_tree_context(self) -> tuple[list[db.MissionMemory], list[db.MissionEdge]]:
@@ -4419,6 +4544,26 @@ class MorpheusApp(App):
                         metadata={"loop_id": deleted.id, "target_tab_id": deleted.target_tab_id},
                     )
                 message = f"deleted loop [{deleted.name}]"
+            elif result.action == "delete-run":
+                if result.run_id is None:
+                    raise ValueError("no loop run selected")
+                run = db.get_loop_run(result.run_id)
+                if run is None or run.loop_id != loop.id:
+                    raise ValueError(f"loop run #{result.run_id} not found")
+                deleted_run = db.delete_loop_run(result.run_id)
+                if deleted_run is None:
+                    raise ValueError(f"loop run #{result.run_id} not found")
+                ledger_mod.log_action(
+                    "loop_run_delete",
+                    tab_id=deleted_run.target_tab_id,
+                    details={
+                        "loop_id": loop.id,
+                        "run_id": deleted_run.id,
+                        "mission_id": deleted_run.mission_id,
+                        "status": deleted_run.status,
+                    },
+                )
+                message = f"deleted loop run #{deleted_run.id} from [{loop.name}] history"
             else:
                 return
             ctx_mod.write_context_file()
@@ -4470,16 +4615,12 @@ class MorpheusApp(App):
             self._push_alert(Alert(time.time(), "summary", f"focused loop run #{run.id} tab"))
             return
 
-        if run.mission_id:
-            memory = db.get_memory(run.mission_id)
-            if memory is not None and memory.archived_at is not None and memory.resume_command:
-                await self._resume_closed_mission(run.mission_id)
-                return
-
         project_root = loop.project_root or (self.project.root_path if self.project else "")
-        cmd = _loop_run_agent_command(loop.command)
-        if project_root:
-            cmd = tenant_mod.command_in_project(cmd, project_root)
+        cmd, agent_kind, resume_ref, resume_command, resume_confidence = _loop_run_launch_command(
+            loop,
+            run,
+            project_root=project_root,
+        )
         goal = f"loop {loop.name} run #{run.id}"
         try:
             info = await iterm_client.spawn_tab(self.iterm_conn, command=cmd, goal=goal)
@@ -4489,17 +4630,6 @@ class MorpheusApp(App):
         if info is None:
             self._push_alert(Alert(time.time(), "error", "loop run join failed — is iTerm focused?"))
             return
-
-        prompt = _loop_run_join_prompt(loop, run)
-        try:
-            await asyncio.sleep(0.7)
-            await iterm_client.send_text_to_tabs(
-                self.iterm_conn,
-                [info.tab_id],
-                iterm_client.text_with_enter(prompt),
-            )
-        except Exception:
-            pass
 
         now = time.time()
         mission_id = run.mission_id or db.loop_run_mission_id(loop.id, run.id)
@@ -4537,9 +4667,10 @@ class MorpheusApp(App):
             source_kind="loop-run",
             source_ref=run.output_path,
             topic="loop-run",
-            agent_kind=_loop_run_agent_kind(loop.command),
-            resume_command=cmd,
-            resume_confidence="loop-run",
+            agent_kind=agent_kind,
+            resume_ref=resume_ref,
+            resume_command=resume_command,
+            resume_confidence=resume_confidence,
             last_tab_id=info.tab_id,
         ))
         if loop.target_mission_id:
@@ -4573,6 +4704,7 @@ class MorpheusApp(App):
                 "run_id": run.id,
                 "mission_id": mission.mission_id,
                 "status": run.status,
+                "resume_confidence": resume_confidence,
             },
         )
         try:

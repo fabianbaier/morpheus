@@ -191,6 +191,39 @@ class CoreTickTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(observation.tab_id, "tab-live")
         self.assertIn("Tests are next", observation.buffer)
 
+    async def test_worktree_collision_ignores_loop_run_sessions(self) -> None:
+        alerts = []
+
+        async def fake_alert(kind, mission, text):
+            alerts.append((kind, mission, text))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with (
+                patch.object(db, "DB_DIR", root),
+                patch.object(db, "DB_PATH", root / "morpheus.db"),
+            ):
+                core._collisions_seen.clear()
+                db.upsert(db.Mission(
+                    tab_id="tab-normal",
+                    mission_id="m_normal",
+                    goal="normal mission",
+                    linked_worktree="/tmp/work",
+                ))
+                db.upsert(db.Mission(
+                    tab_id="tab-loop",
+                    mission_id=db.loop_run_mission_id(7, 12),
+                    goal="loop News run #12",
+                    linked_worktree="/tmp/work",
+                ))
+
+                await core._check_worktree_collisions(
+                    {"tab-normal": "/tmp/work", "tab-loop": "/tmp/work"},
+                    fake_alert,
+                )
+
+        self.assertEqual(alerts, [])
+
 
 if __name__ == "__main__":
     unittest.main()

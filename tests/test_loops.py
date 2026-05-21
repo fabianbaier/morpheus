@@ -133,6 +133,7 @@ class LoopsTest(unittest.TestCase):
                 running = db.loop_runs(observed["loop_id"], limit=1)[0]
                 observed["running_status"] = running.status
                 observed["output_exists_during_run"] = Path(running.output_path).exists()
+                kwargs["stdout"].write("session id: 019e4824-ec9a-7ce0-bf54-0b29e9b42f86\n")
                 kwargs["stdout"].write("Summary: streamed while running.\n")
                 kwargs["stdout"].flush()
                 return SimpleNamespace(returncode=0)
@@ -150,7 +151,7 @@ class LoopsTest(unittest.TestCase):
                     name="streaming loop",
                     prompt="ignored prompt",
                     interval_seconds=300,
-                    command="printf ok",
+                    command="codex exec",
                 )
                 observed["loop_id"] = loop.id
 
@@ -160,6 +161,9 @@ class LoopsTest(unittest.TestCase):
             self.assertEqual(observed["running_status"], "running")
             self.assertTrue(observed["output_exists_during_run"])
             self.assertEqual(run.mission_id, f"looprun_{loop.id}_{run.id}")
+            self.assertEqual(run.resume_ref, "019e4824-ec9a-7ce0-bf54-0b29e9b42f86")
+            self.assertEqual(run.resume_command, f"codex resume {run.resume_ref}")
+            self.assertEqual(run.resume_confidence, "exact")
             self.assertEqual(run.status, "success")
             self.assertIn("Summary: streamed while running.", run.summary)
             self.assertIn("Summary: streamed while running.", text)
@@ -210,6 +214,20 @@ class LoopsTest(unittest.TestCase):
                     target_tab_id="tab-target",
                 )
                 self.assertEqual(db.loop_runs(loop.id), [run])
+
+                db.upsert_memory(db.MissionMemory(
+                    mission_id=run.mission_id,
+                    title="loop run memory",
+                    topic="loop-run",
+                    source_kind="loop-run",
+                    archived_at=4,
+                ))
+                db.add_event(run.mission_id, "loop_run_joined", "joined")
+                deleted_run = db.delete_loop_run(run.id)
+                self.assertIsNotNone(deleted_run)
+                self.assertEqual(deleted_run.id, run.id)
+                self.assertEqual(db.loop_runs(loop.id), [])
+                self.assertIsNone(db.get_memory(run.mission_id))
 
                 deleted = db.delete_loop(loop.id)
                 self.assertIsNotNone(deleted)

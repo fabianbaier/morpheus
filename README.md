@@ -346,18 +346,24 @@ From the cockpit, press `l` to create a loop. If a mission is selected, loop
 results route back to that mission as `loop_output` events and `loop-output`
 artifacts; otherwise they report to the ticker/context only. Loops are visible
 as project-scoped `LOOP` rows, and `Shift+L` / `L` opens the loop manager for
-edit/join/output/run/pause/target/delete controls plus selectable run history. Selecting a
+edit/join/output/run/pause/target/delete controls plus selectable run history. Loop
+run tabs and completed runs stay inside this manager; they do not appear as
+separate rows, rain entries, or collision participants in the main mission
+table. Selecting a
 `LOOP` row shows its prompt/config/history in the right-side card; `Enter`
 opens the manager on that loop and `e` opens its editor. Inside the loop manager,
 `Tab` switches between the loop and run tables, `Enter`/`J` joins or resumes the
 selected run in an iTerm tab, `o` opens/follows the selected run output file, and
-`r` runs the loop once immediately. `t` targets the loop to the mission selected
-before opening the loop manager; if no candidate was selected and the loop already
-has a target, it focuses that target mission instead. The dashboard does not run long loop commands inline; first-run and
+`r` runs the loop once immediately. Completed Codex loop runs resume by exact
+session id when the captured `codex exec` output contains one, without sending
+an extra prompt into the resumed session. `d` deletes the selected history run
+when the run table has focus, and deletes the selected loop when the loop table
+has focus. `t` targets the loop to the mission selected before opening the loop
+manager; if no candidate was selected and the loop already has a target, it
+focuses that target mission instead. The dashboard does not run long loop commands inline; first-run and
 run-now actions happen in a background task, while recurring runs should still
 come from the loop runner LaunchAgent, another launchd/cron entry, or
-`morpheus loops run-due`. Loop runs are captured command executions today, not
-reusable live tab sessions. The default Codex loop command includes
+`morpheus loops run-due`. The default Codex loop command includes
 `--skip-git-repo-check` so launchd can run loops without an interactive trust
 prompt; older loops saved as plain `codex exec` are adjusted when they execute.
 

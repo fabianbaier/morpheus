@@ -212,6 +212,7 @@ def run_loop(
         exit_code=exit_code,
         summary=summary,
     )
+    run = _persist_resume_metadata(loop, run, command, run_cwd) or run
     db.update_loop_after_run(
         loop.id,
         last_run_at=finished,
@@ -236,6 +237,28 @@ def run_loop(
         },
     )
     return run
+
+
+def _persist_resume_metadata(
+    loop: db.PromptLoop,
+    run: db.PromptLoopRun,
+    command: str,
+    run_cwd: Optional[Path],
+) -> Optional[db.PromptLoopRun]:
+    agent_kind, resume_ref, resume_command, confidence = db.resume_metadata_from_text(
+        command,
+        _read_output(Path(run.output_path)),
+        linked_worktree=str(run_cwd or loop.project_root or ""),
+    )
+    if confidence != "exact" or not resume_command:
+        return None
+    return db.update_loop_run_resume_metadata(
+        run.id,
+        agent_kind=agent_kind,
+        resume_ref=resume_ref,
+        resume_command=resume_command,
+        resume_confidence=confidence,
+    )
 
 
 def publish_run(loop: db.PromptLoop, run: db.PromptLoopRun) -> None:

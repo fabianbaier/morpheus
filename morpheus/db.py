@@ -26,6 +26,9 @@ CODEX_SESSION_ID_RE = re.compile(
 CODEX_RESUME_LINE_RE = re.compile(
     r"\bcodex\b[^\r\n]*?\bresume\s+(?P<ref>[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})\b"
 )
+CODEX_SESSION_ID_LINE_RE = re.compile(
+    r"(?im)^\s*session id:\s*(?P<ref>[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})\s*$"
+)
 CODEX_VALUE_OPTIONS = {
     "-c",
     "-C",
@@ -278,6 +281,10 @@ class PromptLoopRun:
     mission_id: str = ""
     tab_id: Optional[str] = None
     session_id: Optional[str] = None
+    agent_kind: str = ""
+    resume_ref: str = ""
+    resume_command: str = ""
+    resume_confidence: str = ""
     target_mission_id: str = ""
     target_tab_id: Optional[str] = None
 
@@ -492,6 +499,10 @@ CREATE TABLE IF NOT EXISTS prompt_loop_runs (
     mission_id        TEXT NOT NULL DEFAULT '',
     tab_id            TEXT,
     session_id        TEXT,
+    agent_kind        TEXT NOT NULL DEFAULT '',
+    resume_ref        TEXT NOT NULL DEFAULT '',
+    resume_command    TEXT NOT NULL DEFAULT '',
+    resume_confidence TEXT NOT NULL DEFAULT '',
     target_mission_id TEXT NOT NULL DEFAULT '',
     target_tab_id     TEXT
 );
@@ -535,6 +546,10 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
     _ensure_column(conn, "prompt_loop_runs", "mission_id", "TEXT NOT NULL DEFAULT ''")
     _ensure_column(conn, "prompt_loop_runs", "tab_id", "TEXT")
     _ensure_column(conn, "prompt_loop_runs", "session_id", "TEXT")
+    _ensure_column(conn, "prompt_loop_runs", "agent_kind", "TEXT NOT NULL DEFAULT ''")
+    _ensure_column(conn, "prompt_loop_runs", "resume_ref", "TEXT NOT NULL DEFAULT ''")
+    _ensure_column(conn, "prompt_loop_runs", "resume_command", "TEXT NOT NULL DEFAULT ''")
+    _ensure_column(conn, "prompt_loop_runs", "resume_confidence", "TEXT NOT NULL DEFAULT ''")
     _ensure_column(conn, "goal_runs", "tenant_id", "TEXT NOT NULL DEFAULT ''")
     _ensure_column(conn, "goal_runs", "project_root", "TEXT NOT NULL DEFAULT ''")
     conn.execute("CREATE INDEX IF NOT EXISTS missions_mission_id_idx ON missions(mission_id)")
@@ -771,7 +786,29 @@ def _codex_resume_ref_from_buffer(buffer: str) -> str:
     found = ""
     for match in CODEX_RESUME_LINE_RE.finditer(buffer or ""):
         found = match.group("ref")
+    if found:
+        return found
+    for match in CODEX_SESSION_ID_LINE_RE.finditer(buffer or ""):
+        found = match.group("ref")
     return found
+
+
+def resume_metadata_from_text(
+    command: str,
+    text: str,
+    *,
+    linked_worktree: str = "",
+) -> tuple[str, str, str, str]:
+    agent_kind = _infer_agent_kind(command)
+    if agent_kind == "codex":
+        resume_ref = _codex_resume_ref_from_buffer(text)
+        if resume_ref:
+            resume_command = _with_worktree(
+                _codex_resume_command(command, resume_ref),
+                linked_worktree,
+            )
+            return agent_kind, resume_ref, resume_command, "exact"
+    return "", "", "", ""
 
 
 def _resume_command_for_mission(mission: Mission) -> tuple[str, str, str, str]:
@@ -2687,8 +2724,36 @@ def finish_loop_run(
     return _row_to_prompt_loop_run(row)
 
 
+def update_loop_run_resume_metadata(
+    run_id: int,
+    *,
+    agent_kind: str,
+    resume_ref: str,
+    resume_command: str,
+    resume_confidence: str,
+) -> Optional[PromptLoopRun]:
+    with _connect() as conn:
+        conn.execute(
+            """
+            UPDATE prompt_loop_runs
+               SET agent_kind = ?,
+                   resume_ref = ?,
+                   resume_command = ?,
+                   resume_confidence = ?
+             WHERE id = ?
+            """,
+            (agent_kind, resume_ref, resume_command, resume_confidence, run_id),
+        )
+        row = conn.execute("SELECT * FROM prompt_loop_runs WHERE id = ?", (run_id,)).fetchone()
+    return _row_to_prompt_loop_run(row) if row else None
+
+
 def loop_run_mission_id(loop_id: int, run_id: int) -> str:
     return f"looprun_{loop_id}_{run_id}"
+
+
+def is_loop_run_mission_id(mission_id: str | None) -> bool:
+    return bool(mission_id and mission_id.startswith("looprun_"))
 
 
 def get_loop_run(run_id: int) -> Optional[PromptLoopRun]:
@@ -2740,6 +2805,67 @@ def loop_run_count(loop_id: int) -> int:
             (loop_id,),
         ).fetchone()
     return int(row["n"]) if row else 0
+
+
+def delete_loop_run(run_id: int) -> Optional[PromptLoopRun]:
+    with _connect() as conn:
+        row = conn.execute("SELECT * FROM prompt_loop_runs WHERE id = ?", (run_id,)).fetchone()
+        if row is None:
+            return None
+        run = _row_to_prompt_loop_run(row)
+        conn.execute("DELETE FROM prompt_loop_runs WHERE id = ?", (run_id,))
+        if run.mission_id:
+            live = conn.execute(
+                "SELECT 1 FROM missions WHERE mission_id = ? LIMIT 1",
+                (run.mission_id,),
+            ).fetchone()
+            if live is None:
+                conn.execute("DELETE FROM mission_events WHERE mission_id = ?", (run.mission_id,))
+                conn.execute("DELETE FROM mission_artifacts WHERE mission_id = ?", (run.mission_id,))
+                conn.execute(
+                    "DELETE FROM mission_edges WHERE from_id = ? OR to_id = ?",
+                    (run.mission_id, run.mission_id),
+                )
+                conn.execute("DELETE FROM mission_memory WHERE mission_id = ?", (run.mission_id,))
+        _refresh_loop_last_run(conn, run.loop_id)
+    return run
+
+
+def _refresh_loop_last_run(conn: sqlite3.Connection, loop_id: int) -> None:
+    row = conn.execute(
+        """
+        SELECT * FROM prompt_loop_runs
+         WHERE loop_id = ?
+         ORDER BY started_at DESC, id DESC
+         LIMIT 1
+        """,
+        (loop_id,),
+    ).fetchone()
+    now = time.time()
+    if row is None:
+        conn.execute(
+            """
+            UPDATE prompt_loops
+               SET last_run_at = 0,
+                   last_run_status = '',
+                   last_summary = '',
+                   updated_at = ?
+             WHERE id = ?
+            """,
+            (now, loop_id),
+        )
+        return
+    conn.execute(
+        """
+        UPDATE prompt_loops
+           SET last_run_at = ?,
+               last_run_status = ?,
+               last_summary = ?,
+               updated_at = ?
+         WHERE id = ?
+        """,
+        (row["finished_at"] or row["started_at"], row["status"], row["summary"], now, loop_id),
+    )
 
 
 def update_loop_details(
@@ -2932,6 +3058,10 @@ def _row_to_prompt_loop_run(row: sqlite3.Row) -> PromptLoopRun:
         mission_id=row["mission_id"],
         tab_id=row["tab_id"],
         session_id=row["session_id"],
+        agent_kind=row["agent_kind"],
+        resume_ref=row["resume_ref"],
+        resume_command=row["resume_command"],
+        resume_confidence=row["resume_confidence"],
         target_mission_id=row["target_mission_id"],
         target_tab_id=row["target_tab_id"],
     )
