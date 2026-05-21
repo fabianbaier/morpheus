@@ -1462,6 +1462,55 @@ class DashboardTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual([row.mission_id for row in rows], ["m_closed"])
 
+    async def test_loop_run_missions_do_not_render_as_dashboard_rows(self) -> None:
+        app = DashboardHarness()
+        loop_run = dashboard.db.Mission(
+            tab_id="tab-loop",
+            mission_id="looprun_2_11",
+            goal="loop News run #11",
+            state="idle",
+            buffer_changed_at=10,
+        )
+        mission = dashboard.db.Mission(
+            tab_id="tab-normal",
+            mission_id="m_normal",
+            goal="normal mission",
+            state="working",
+            buffer_changed_at=10,
+        )
+
+        with isolated_dashboard_runtime([loop_run, mission]):
+            async with app.run_test(size=(120, 40)) as pilot:
+                app._refresh_table()
+                await pilot.pause()
+                table = app.query_one(dashboard.MissionsTable)
+
+        self.assertEqual([ref.mission_id for ref in table.row_refs], ["m_normal"])
+
+    async def test_observed_loop_run_mission_does_not_update_dashboard_rain(self) -> None:
+        app = DashboardHarness()
+        loop_run = dashboard.db.Mission(
+            tab_id="tab-loop",
+            mission_id="looprun_2_11",
+            goal="loop News run #11",
+            state="idle",
+        )
+        app.live_buffers = {
+            "tab-loop": dashboard.LiveBuffer("tab-loop", "stale", "working", "", "old", 0)
+        }
+        tab = dashboard.iterm_client.TabInfo(
+            tab_id="tab-loop",
+            session_id="session-loop",
+            window_id="window",
+            buffer="loop output",
+            current_name="codex",
+            cwd="/tmp/project",
+        )
+
+        await app._on_tab_observed(tab, loop_run, SimpleNamespace(last_event="idle"))
+
+        self.assertNotIn("tab-loop", app.live_buffers)
+
     async def test_prune_archives_orphan_prd_parent_rows(self) -> None:
         app = DashboardHarness()
         orphan_parent = dashboard.db.MissionMemory(

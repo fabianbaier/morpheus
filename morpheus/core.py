@@ -225,6 +225,9 @@ async def _check_worktree_collisions(cwd_by_tab: dict[str, str], on_alert) -> No
     for tab_id, cwd in cwd_by_tab.items():
         if not cwd:
             continue
+        mission = db.get(tab_id)
+        if mission and db.is_loop_run_mission_id(mission.mission_id):
+            continue
         by_cwd.setdefault(cwd, []).append(tab_id)
     for cwd, tabs in by_cwd.items():
         if len(tabs) < 2:

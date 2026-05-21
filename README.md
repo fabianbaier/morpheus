@@ -346,9 +346,10 @@ From the cockpit, press `l` to create a loop. If a mission is selected, loop
 results route back to that mission as `loop_output` events and `loop-output`
 artifacts; otherwise they report to the ticker/context only. Loops are visible
 as project-scoped `LOOP` rows, and `Shift+L` / `L` opens the loop manager for
-edit/join/output/run/pause/target/delete controls plus selectable run history. Completed
-loop runs stay inside this manager; they do not appear as separate closed rows
-in the main mission table. Selecting a
+edit/join/output/run/pause/target/delete controls plus selectable run history. Loop
+run tabs and completed runs stay inside this manager; they do not appear as
+separate rows, rain entries, or collision participants in the main mission
+table. Selecting a
 `LOOP` row shows its prompt/config/history in the right-side card; `Enter`
 opens the manager on that loop and `e` opens its editor. Inside the loop manager,
 `Tab` switches between the loop and run tables, `Enter`/`J` joins or resumes the

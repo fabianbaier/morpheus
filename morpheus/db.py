@@ -2186,6 +2186,10 @@ def loop_run_mission_id(loop_id: int, run_id: int) -> str:
     return f"looprun_{loop_id}_{run_id}"
 
 
+def is_loop_run_mission_id(mission_id: str | None) -> bool:
+    return bool(mission_id and mission_id.startswith("looprun_"))
+
+
 def get_loop_run(run_id: int) -> Optional[PromptLoopRun]:
     with _connect() as conn:
         row = conn.execute("SELECT * FROM prompt_loop_runs WHERE id = ?", (run_id,)).fetchone()

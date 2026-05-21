@@ -905,8 +905,12 @@ class MissionsTable(DataTable):
         self.row_tab_ids = []
         self.row_refs = []
 
-        sorted_m = sorted(missions, key=_sort_key)
-        missions_by_id = {m.mission_id: m for m in missions if m.mission_id}
+        visible_missions = [
+            mission for mission in missions
+            if not db.is_loop_run_mission_id(mission.mission_id)
+        ]
+        sorted_m = sorted(visible_missions, key=_sort_key)
+        missions_by_id = {m.mission_id: m for m in visible_missions if m.mission_id}
         child_ids: set[str] = set()
         collapsed_prd_ids = collapsed_prd_ids or set()
         rows: list[
@@ -3289,8 +3293,13 @@ class MorpheusApp(App):
     def _all_missions(self) -> list[db.Mission]:
         tenant_id = self._tenant_filter()
         if tenant_id:
-            return db.all_missions(tenant_id=tenant_id)
-        return db.all_missions()
+            missions = db.all_missions(tenant_id=tenant_id)
+        else:
+            missions = db.all_missions()
+        return [
+            mission for mission in missions
+            if not db.is_loop_run_mission_id(mission.mission_id)
+        ]
 
     def _all_memory(self, include_archived: bool = False) -> list[db.MissionMemory]:
         tenant_id = self._tenant_filter()
@@ -3305,6 +3314,8 @@ class MorpheusApp(App):
         return db.recent_notes(limit=limit)
 
     def _mission_in_scope(self, mission: db.Mission) -> bool:
+        if db.is_loop_run_mission_id(mission.mission_id):
+            return False
         tenant_id = self._tenant_filter()
         return not tenant_id or mission.tenant_id == tenant_id
 
