@@ -2237,6 +2237,67 @@ def loop_run_count(loop_id: int) -> int:
     return int(row["n"]) if row else 0
 
 
+def delete_loop_run(run_id: int) -> Optional[PromptLoopRun]:
+    with _connect() as conn:
+        row = conn.execute("SELECT * FROM prompt_loop_runs WHERE id = ?", (run_id,)).fetchone()
+        if row is None:
+            return None
+        run = _row_to_prompt_loop_run(row)
+        conn.execute("DELETE FROM prompt_loop_runs WHERE id = ?", (run_id,))
+        if run.mission_id:
+            live = conn.execute(
+                "SELECT 1 FROM missions WHERE mission_id = ? LIMIT 1",
+                (run.mission_id,),
+            ).fetchone()
+            if live is None:
+                conn.execute("DELETE FROM mission_events WHERE mission_id = ?", (run.mission_id,))
+                conn.execute("DELETE FROM mission_artifacts WHERE mission_id = ?", (run.mission_id,))
+                conn.execute(
+                    "DELETE FROM mission_edges WHERE from_id = ? OR to_id = ?",
+                    (run.mission_id, run.mission_id),
+                )
+                conn.execute("DELETE FROM mission_memory WHERE mission_id = ?", (run.mission_id,))
+        _refresh_loop_last_run(conn, run.loop_id)
+    return run
+
+
+def _refresh_loop_last_run(conn: sqlite3.Connection, loop_id: int) -> None:
+    row = conn.execute(
+        """
+        SELECT * FROM prompt_loop_runs
+         WHERE loop_id = ?
+         ORDER BY started_at DESC, id DESC
+         LIMIT 1
+        """,
+        (loop_id,),
+    ).fetchone()
+    now = time.time()
+    if row is None:
+        conn.execute(
+            """
+            UPDATE prompt_loops
+               SET last_run_at = 0,
+                   last_run_status = '',
+                   last_summary = '',
+                   updated_at = ?
+             WHERE id = ?
+            """,
+            (now, loop_id),
+        )
+        return
+    conn.execute(
+        """
+        UPDATE prompt_loops
+           SET last_run_at = ?,
+               last_run_status = ?,
+               last_summary = ?,
+               updated_at = ?
+         WHERE id = ?
+        """,
+        (row["finished_at"] or row["started_at"], row["status"], row["summary"], now, loop_id),
+    )
+
+
 def update_loop_details(
     loop_id: int,
     *,

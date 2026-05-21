@@ -1562,13 +1562,7 @@ def _loop_run_launch_command(
         project_root=project_root,
     )
     if confidence == "exact" and resume_command:
-        return (
-            _shell_append_arg(resume_command, prompt),
-            agent_kind,
-            resume_ref,
-            resume_command,
-            confidence,
-        )
+        return resume_command, agent_kind, resume_ref, resume_command, confidence
 
     base = _loop_run_agent_command(loop.command)
     cmd = _shell_append_arg(base, prompt)
@@ -2613,7 +2607,7 @@ class LoopManagerScreen(ModalScreen[Optional[LoopActionRequest]]):
         self.selected_loop_id = selected_loop_id
         self.join_target_mission_id = join_target_mission_id
         self.join_target_tab_id = join_target_tab_id
-        self.confirm_delete_id: Optional[int] = None
+        self.confirm_delete_ref: Optional[tuple[str, int]] = None
         self.focus_table = "loops"
 
     def compose(self) -> ComposeResult:
@@ -2672,7 +2666,7 @@ class LoopManagerScreen(ModalScreen[Optional[LoopActionRequest]]):
         self._refresh_detail()
 
     def on_data_table_row_highlighted(self, event) -> None:
-        self.confirm_delete_id = None
+        self.confirm_delete_ref = None
         if getattr(event.data_table, "id", "") == "loops_table":
             self._refresh_runs()
         self._refresh_detail()
@@ -2698,13 +2692,13 @@ class LoopManagerScreen(ModalScreen[Optional[LoopActionRequest]]):
     def action_cursor_down(self) -> None:
         table = self._focused_table()
         table.action_cursor_down()
-        self.confirm_delete_id = None
+        self.confirm_delete_ref = None
         self._refresh_detail()
 
     def action_cursor_up(self) -> None:
         table = self._focused_table()
         table.action_cursor_up()
-        self.confirm_delete_id = None
+        self.confirm_delete_ref = None
         self._refresh_detail()
 
     def action_switch_focus(self) -> None:
@@ -2791,10 +2785,30 @@ class LoopManagerScreen(ModalScreen[Optional[LoopActionRequest]]):
         loop = self._selected_loop()
         if loop is None:
             return
-        if self.confirm_delete_id != loop.id:
-            self.confirm_delete_id = loop.id
+        if self.focus_table == "runs":
+            run = self._selected_run()
+            if run is None:
+                return
+            if run.status == "running":
+                self.query_one("#loop_detail", Static).update(
+                    "Cannot delete a running loop run. Wait for it to finish, then delete its history row."
+                )
+                return
+            ref = ("run", run.id)
+            if self.confirm_delete_ref != ref:
+                self.confirm_delete_ref = ref
+                self.query_one("#loop_detail", Static).update(
+                    self._detail(loop, confirm_delete_run=run)
+                )
+                return
+            self.dismiss(LoopActionRequest(action="delete-run", loop_id=loop.id, run_id=run.id))
+            return
+
+        ref = ("loop", loop.id)
+        if self.confirm_delete_ref != ref:
+            self.confirm_delete_ref = ref
             self.query_one("#loop_detail", Static).update(
-                self._detail(loop, confirm_delete=True)
+                self._detail(loop, confirm_delete_loop=True)
             )
             return
         self.dismiss(LoopActionRequest(action="delete", loop_id=loop.id))
@@ -2855,14 +2869,20 @@ class LoopManagerScreen(ModalScreen[Optional[LoopActionRequest]]):
         ) if loop is None else self._detail(loop)
         self.query_one("#loop_detail", Static).update(detail)
 
-    def _detail(self, loop: db.PromptLoop, *, confirm_delete: bool = False) -> str:
+    def _detail(
+        self,
+        loop: db.PromptLoop,
+        *,
+        confirm_delete_loop: bool = False,
+        confirm_delete_run: Optional[db.PromptLoopRun] = None,
+    ) -> str:
         run = self._selected_run()
         lines = [
             f"#{loop.id} {loop.name}",
             f"status {loop.status} · every {loops_mod.format_interval(loop.interval_seconds)} · next {loops_mod.format_due(loop.next_run_at)}",
             f"target {_loop_target_label(loop)} · command {loop.command}",
             f"prompt {loop.prompt}",
-            "keys tab loops/runs · enter/J join/resume selected run · e edit loop · o output · r run now",
+            "keys tab loops/runs · enter/J join/resume selected run · e edit loop · o output · r run now · d delete selected",
         ]
         runs = self.runs_by_loop.get(loop.id, [])
         if runs:
@@ -2881,7 +2901,12 @@ class LoopManagerScreen(ModalScreen[Optional[LoopActionRequest]]):
                 lines.append("run is starting; press o in a moment to inspect its output file")
             else:
                 lines.append("press r to run now; recurring runs still come from launchd/cron or `morpheus loops run-due`")
-        if confirm_delete:
+        if confirm_delete_run is not None:
+            lines.append("")
+            lines.append(
+                f"Press delete again to remove run #{confirm_delete_run.id} from history. Output files remain on disk."
+            )
+        elif confirm_delete_loop:
             lines.append("")
             lines.append("Press delete again to remove this loop. Output files remain on disk.")
         return "\n".join(lines)
@@ -3523,7 +3548,9 @@ class MorpheusApp(App):
             and memory.mission_id not in live_ids
             and memory.resume_command
             and memory.topic != "prd-run"
+            and memory.topic != "loop-run"
             and memory.source_kind != "prd"
+            and memory.source_kind != "loop-run"
         ][:20]
 
     def _prd_tree_context(self) -> tuple[list[db.MissionMemory], list[db.MissionEdge]]:
@@ -4321,6 +4348,26 @@ class MorpheusApp(App):
                         metadata={"loop_id": deleted.id, "target_tab_id": deleted.target_tab_id},
                     )
                 message = f"deleted loop [{deleted.name}]"
+            elif result.action == "delete-run":
+                if result.run_id is None:
+                    raise ValueError("no loop run selected")
+                run = db.get_loop_run(result.run_id)
+                if run is None or run.loop_id != loop.id:
+                    raise ValueError(f"loop run #{result.run_id} not found")
+                deleted_run = db.delete_loop_run(result.run_id)
+                if deleted_run is None:
+                    raise ValueError(f"loop run #{result.run_id} not found")
+                ledger_mod.log_action(
+                    "loop_run_delete",
+                    tab_id=deleted_run.target_tab_id,
+                    details={
+                        "loop_id": loop.id,
+                        "run_id": deleted_run.id,
+                        "mission_id": deleted_run.mission_id,
+                        "status": deleted_run.status,
+                    },
+                )
+                message = f"deleted loop run #{deleted_run.id} from [{loop.name}] history"
             else:
                 return
             ctx_mod.write_context_file()

@@ -215,6 +215,20 @@ class LoopsTest(unittest.TestCase):
                 )
                 self.assertEqual(db.loop_runs(loop.id), [run])
 
+                db.upsert_memory(db.MissionMemory(
+                    mission_id=run.mission_id,
+                    title="loop run memory",
+                    topic="loop-run",
+                    source_kind="loop-run",
+                    archived_at=4,
+                ))
+                db.add_event(run.mission_id, "loop_run_joined", "joined")
+                deleted_run = db.delete_loop_run(run.id)
+                self.assertIsNotNone(deleted_run)
+                self.assertEqual(deleted_run.id, run.id)
+                self.assertEqual(db.loop_runs(loop.id), [])
+                self.assertIsNone(db.get_memory(run.mission_id))
+
                 deleted = db.delete_loop(loop.id)
                 self.assertIsNotNone(deleted)
                 self.assertEqual(deleted.name, "market news")

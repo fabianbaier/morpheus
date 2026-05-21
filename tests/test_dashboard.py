@@ -1432,6 +1432,36 @@ class DashboardTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(list(app.alerts), [])
         self.assertEqual(final_row_count, 0)
 
+    def test_loop_run_memories_do_not_render_as_closed_dashboard_rows(self) -> None:
+        app = DashboardHarness()
+        loop_memory = dashboard.db.MissionMemory(
+            mission_id="looprun_2_11",
+            title="loop News run #11",
+            topic="loop-run",
+            source_kind="loop-run",
+            resume_command="cd /tmp/project && codex resume 019e4824-ec9a-7ce0-bf54-0b29e9b42f86",
+            resume_confidence="exact",
+            archived_at=10,
+            closed_at=10,
+        )
+        closed_memory = dashboard.db.MissionMemory(
+            mission_id="m_closed",
+            title="closed codex",
+            resume_command="codex resume 019e466d-0fd8-7441-aa1f-32a5db211a73",
+            resume_confidence="exact",
+            archived_at=10,
+            closed_at=10,
+        )
+
+        with patch.object(
+            app,
+            "_all_memory",
+            new=lambda include_archived=False: [loop_memory, closed_memory],
+        ):
+            rows = app._closed_resumable_memories([])
+
+        self.assertEqual([row.mission_id for row in rows], ["m_closed"])
+
     async def test_prune_archives_orphan_prd_parent_rows(self) -> None:
         app = DashboardHarness()
         orphan_parent = dashboard.db.MissionMemory(
@@ -2528,6 +2558,54 @@ class DashboardTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(captured["result"].loop_id, 7)
         self.assertEqual(captured["result"].run_id, 12)
 
+    async def test_loop_manager_delete_on_run_requests_history_delete(self) -> None:
+        app = DashboardHarness()
+        captured = {}
+        loop = dashboard.db.PromptLoop(
+            id=7,
+            name="market scan",
+            prompt="summarize catalysts",
+            interval_seconds=900,
+            command="codex exec",
+            next_run_at=0,
+        )
+        run = dashboard.db.PromptLoopRun(
+            id=12,
+            loop_id=loop.id,
+            started_at=1,
+            finished_at=2,
+            status="success",
+            exit_code=0,
+            output_path="/tmp/loop.txt",
+            summary="done",
+            mission_id="looprun_7_12",
+        )
+
+        with isolated_dashboard_runtime(), patch.object(
+            dashboard.db, "all_loops", new=lambda include_paused=True, tenant_id="": [loop]
+        ), patch.object(
+            dashboard.db, "loop_runs", new=lambda loop_id, limit=5: [run]
+        ), patch.object(
+            dashboard.db, "loop_run_count", new=lambda loop_id: 1
+        ), patch.object(
+            app,
+            "_handle_loop_action_result",
+            new=lambda result: captured.setdefault("result", result),
+        ):
+            async with app.run_test(size=(120, 40)) as pilot:
+                app.action_manage_loops()
+                await pilot.pause()
+
+                await pilot.press("d")
+                await pilot.pause()
+                self.assertIn("remove run #12", str(app.screen.query_one("#loop_detail", dashboard.Static).content))
+                await pilot.press("d")
+                await pilot.pause()
+
+        self.assertEqual(captured["result"].action, "delete-run")
+        self.assertEqual(captured["result"].loop_id, 7)
+        self.assertEqual(captured["result"].run_id, 12)
+
     async def test_join_loop_run_spawns_agent_session_and_links_run(self) -> None:
         app = DashboardHarness()
         captured = {}
@@ -2667,13 +2745,66 @@ class DashboardTest(unittest.IsolatedAsyncioTestCase):
                 async with app.run_test(size=(120, 40)):
                     await app._join_loop_run(loop.id, run.id)
 
-        self.assertIn(f"cd /tmp/project && codex resume {resume_id}", captured["spawn"][1])
-        self.assertIn("Resume this completed Morpheus loop run.", captured["spawn"][1])
+        self.assertEqual(captured["spawn"][1], f"cd /tmp/project && codex resume {resume_id}")
+        self.assertNotIn("Resume this completed Morpheus loop run.", captured["spawn"][1])
         self.assertEqual(captured["resume"][0], 12)
         self.assertEqual(captured["resume"][1]["resume_ref"], resume_id)
         self.assertEqual(captured["memory"].resume_ref, resume_id)
         self.assertEqual(captured["memory"].resume_command, f"cd /tmp/project && codex resume {resume_id}")
         self.assertEqual(captured["memory"].resume_confidence, "exact")
+
+    async def test_loop_run_delete_action_removes_history_row(self) -> None:
+        app = DashboardHarness()
+        done = asyncio.Event()
+        captured = {}
+        loop = dashboard.db.PromptLoop(
+            id=7,
+            name="market scan",
+            prompt="summarize catalysts",
+            interval_seconds=900,
+            command="codex exec",
+            target_tab_id="tab-target",
+            next_run_at=0,
+        )
+        run = dashboard.db.PromptLoopRun(
+            id=12,
+            loop_id=loop.id,
+            started_at=1,
+            finished_at=2,
+            status="success",
+            exit_code=0,
+            output_path="/tmp/loop.txt",
+            summary="done",
+            mission_id="looprun_7_12",
+            target_tab_id="tab-target",
+        )
+
+        def fake_delete_loop_run(run_id):
+            captured["delete"] = run_id
+            done.set()
+            return run
+
+        with patch.object(
+            dashboard.db, "get_loop", new=lambda loop_id: loop if loop_id == loop.id else None
+        ), patch.object(
+            dashboard.db, "get_loop_run", new=lambda run_id: run if run_id == run.id else None
+        ), patch.object(
+            dashboard.db, "delete_loop_run", new=fake_delete_loop_run
+        ), patch.object(
+            dashboard.ledger_mod, "log_action", new=lambda *args, **kwargs: captured.setdefault("ledger", (args, kwargs))
+        ), patch.object(
+            dashboard.ctx_mod, "write_context_file", new=lambda: None
+        ), patch.object(
+            dashboard.ctx_mod, "write_context_json", new=lambda: None
+        ), patch.object(
+            app, "_refresh_table", new=lambda: None
+        ):
+            app._handle_loop_action_result(LoopActionRequest(action="delete-run", loop_id=loop.id, run_id=run.id))
+            await asyncio.wait_for(done.wait(), timeout=1)
+
+        self.assertEqual(captured["delete"], 12)
+        self.assertEqual(captured["ledger"][0][0], "loop_run_delete")
+        self.assertIn("deleted loop run #12", app.alerts[0].text)
 
     async def test_loop_target_key_focuses_existing_target_when_no_candidate(self) -> None:
         app = DashboardHarness()
