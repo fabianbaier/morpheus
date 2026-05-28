@@ -9,12 +9,13 @@ VENV_PY := $(VENV)/bin/python
 MORPHEUS := $(VENV)/bin/morpheus
 LOCAL_MORPHEUS := $(LOCAL_BIN)/morpheus
 
-.PHONY: help bootstrap install install-cli uninstall-cli start up dashboard daemon daemon-start daemon-stop daemon-status status loop-runner loop-runner-stop loop-runner-status watch doctor logs loop-logs graph-status test clean
+.PHONY: help bootstrap install install-cli uninstall-cli start up dashboard desktop daemon daemon-start daemon-stop daemon-status status loop-runner loop-runner-stop loop-runner-status watch doctor logs loop-logs graph-status test clean
 
 help:
 	@printf "Morpheus dev commands\n\n"
 	@printf "  make start         Install/reload daemon, then open the Morpheus cockpit\n"
 	@printf "  make dashboard     Open the Morpheus cockpit without touching daemon state\n"
+	@printf "  make desktop       Launch the desktop chat-agent cockpit (browser/Electron)\n"
 	@printf "  make install-cli   Put a morpheus shim on your user PATH (default: ~/.local/bin)\n"
 	@printf "  make daemon        Install/reload the launchd daemon from this repo venv\n"
 	@printf "  make loop-runner   Install/reload launchd loop runner for due prompt loops\n"
@@ -74,6 +75,9 @@ start up: daemon
 
 dashboard: bootstrap
 	$(MORPHEUS)
+
+desktop: bootstrap
+	$(MORPHEUS) desktop
 
 watch: bootstrap
 	$(MORPHEUS) watch --poll $(POLL)

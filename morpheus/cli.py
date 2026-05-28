@@ -2489,6 +2489,68 @@ def mcp_serve():
     mcp_server.serve()
 
 
+# ───────── desktop app (chat-agent cockpit) ─────────
+
+desktop_app = typer.Typer(help="Morpheus desktop app — a Claude-Code-style chat cockpit.")
+app.add_typer(desktop_app, name="desktop")
+
+
+@desktop_app.callback(invoke_without_command=True)
+def _desktop_default(
+    ctx: typer.Context,
+    host: str = typer.Option("127.0.0.1", help="Bind address (loopback only)."),
+    port: int = typer.Option(0, help="Port (0 = OS-assigned)."),
+    no_browser: bool = typer.Option(False, "--no-browser", help="Don't open a browser window."),
+):
+    """Launch the desktop cockpit: start the bridge server and open the UI.
+
+    Same SQLite DB and config.toml as the CLI, so state stays in sync. On macOS
+    this is the window you keep open; the served SPA is a chat agent tailored to
+    Morpheus (mission graph, sessions, goals, loops, autonomous goals).
+    """
+    if ctx.invoked_subcommand is not None:
+        return
+    import webbrowser
+    from morpheus.desktop import server as desktop_server
+
+    def _on_ready(srv: "desktop_server.DesktopServer"):
+        console.print(f"[green]Morpheus desktop[/green] serving at [bold]{srv.url.split('?')[0]}[/bold]")
+        console.print(f"  token: [dim]{srv.cfg.token}[/dim]")
+        console.print("  (Ctrl-C to stop)")
+        if not no_browser:
+            try:
+                webbrowser.open(srv.url)
+            except Exception:
+                pass
+
+    desktop_server.serve(host=host, port=port, on_ready=_on_ready, block=True)
+
+
+@desktop_app.command("serve")
+def desktop_serve(
+    host: str = typer.Option("127.0.0.1", help="Bind address (loopback only)."),
+    port: int = typer.Option(0, help="Port (0 = OS-assigned)."),
+    handshake: bool = typer.Option(
+        False, "--handshake",
+        help="Print a single JSON line {host,port,token,url} on ready (for the Electron shell), then serve.",
+    ),
+):
+    """Run the desktop bridge server (REST + SSE) without opening a browser.
+
+    The Electron shell launches this with --handshake, reads the JSON line from
+    stdout to learn the port + auth token, then points its window at the URL.
+    """
+    from morpheus.desktop import server as desktop_server
+
+    def _on_ready(srv: "desktop_server.DesktopServer"):
+        if handshake:
+            print(json.dumps(srv.handshake()), flush=True)
+        else:
+            console.print(f"[green]bridge[/green] at [bold]{srv.url.split('?')[0]}[/bold]  token: [dim]{srv.cfg.token}[/dim]")
+
+    desktop_server.serve(host=host, port=port, on_ready=_on_ready, block=True)
+
+
 @app.command("daemon-status")
 def daemon_status():
     """Show launchd daemon status (loaded? PID? beacon age? log size?)."""

@@ -120,3 +120,8 @@ tempCodeRunnerFile.py
 .morpheus/
 morpheus.db
 *.morpheus.log
+
+# Electron desktop shell build artifacts
+morpheus/desktop/electron/node_modules/
+morpheus/desktop/electron/dist/
+morpheus/desktop/electron/package-lock.json
