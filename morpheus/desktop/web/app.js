@@ -72,6 +72,34 @@ export const SUGGESTIONS = [
   "/broadcast hold off on src/auth/*",
 ];
 
+// Parse a Server-Sent-Events text buffer into complete frames, returning any
+// trailing partial frame as `rest`. Used to read the streamed agent turn from a
+// fetch() response body. Pure → unit-tested in Node.
+export function parseSseBuffer(buf) {
+  const frames = [];
+  let idx;
+  while ((idx = buf.indexOf("\n\n")) >= 0) {
+    const raw = buf.slice(0, idx);
+    buf = buf.slice(idx + 2);
+    const ev = { event: "message", data: "" };
+    for (const line of raw.split("\n")) {
+      if (line.startsWith("event:")) ev.event = line.slice(6).trim();
+      else if (line.startsWith("data:")) ev.data += line.slice(5).trim();
+    }
+    frames.push(ev);
+  }
+  return { frames, rest: buf };
+}
+
+// Icon for a tool name so tool use reads like Claude Code / Codex.
+export function toolIcon(name) {
+  const map = {
+    Read: "📄", Edit: "✏️", Write: "✏️", MultiEdit: "✏️", NotebookEdit: "✏️",
+    Bash: "❯_", Grep: "🔍", Glob: "🔍", Task: "🤖", WebSearch: "🔎", WebFetch: "🌐",
+  };
+  return map[name] || "🔧";
+}
+
 // ───────────────────────── browser app ─────────────────────────
 
 if (typeof document !== "undefined") {
@@ -88,7 +116,14 @@ if (typeof document !== "undefined") {
     return res.json();
   }
 
-  const state = { fleet: null, view: "chat", selected: null, chat: [] };
+  const state = {
+    fleet: null, view: "chat", selected: null, chat: [],
+    agent: "ask",          // "ask" = Morpheus oracle; else a real CLI: claude/codex/gemini
+    agents: [],            // available agent CLIs
+    agentSession: {},      // per-agent session_id for multi-turn continuity
+    cwd: "",               // working directory agents operate in
+    permission: "default",
+  };
 
   // ── rendering ──
   function renderHealth(h) {
@@ -193,6 +228,10 @@ if (typeof document !== "undefined") {
   }
 
   async function sendChat(message) {
+    // A real agent CLI (claude/codex/gemini) is selected → drive it live.
+    if (state.agent !== "ask") {
+      return sendAgentTurn(message);
+    }
     const intent = parseCommand(message);
     addMessage("user", escapeHtml(message));
     const thinking = addMessage("morpheus", `<div class="thinking"><span></span><span></span><span></span></div>`);
@@ -216,6 +255,109 @@ if (typeof document !== "undefined") {
       thinking.querySelector(".msg-body").innerHTML = `<span style="color:var(--blocked)">Error: ${escapeHtml(e.message)}</span>`;
     }
     refresh();
+  }
+
+  // ── live agent turn (claude / codex / gemini under the hood) ──
+  async function* sseStream(response) {
+    const reader = response.body.getReader();
+    const dec = new TextDecoder();
+    let buf = "";
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      const { frames, rest } = parseSseBuffer(buf);
+      buf = rest;
+      for (const f of frames) yield f;
+    }
+  }
+
+  async function sendAgentTurn(message) {
+    addMessage("user", escapeHtml(message));
+    const label = (state.agents.find((a) => a.kind === state.agent) || {}).label || state.agent;
+    const msg = addMessage(state.agent, "");
+    const body = msg.querySelector(".msg-role");
+    body.textContent = label;
+    const container = msg.querySelector(".msg-body");
+    container.innerHTML = `<div class="agent-steps"></div>
+      <div class="agent-prose"></div>
+      <div class="agent-status"><span class="thinking"><span></span><span></span><span></span></span></div>`;
+    const steps = container.querySelector(".agent-steps");
+    const prose = container.querySelector(".agent-prose");
+    const status = container.querySelector(".agent-status");
+    let proseText = "";
+    let lastToolCard = null;
+    const scroll = () => { $("chat-scroll").scrollTop = $("chat-scroll").scrollHeight; };
+
+    const stepCard = (icon, title, sub, cls = "") => {
+      const card = el("div", "step-card " + cls);
+      card.innerHTML = `<div class="step-head"><span class="step-icon">${escapeHtml(icon)}</span>
+        <span class="step-title">${escapeHtml(title)}</span>
+        <span class="step-sub">${escapeHtml(sub || "")}</span></div>`;
+      steps.appendChild(card); scroll();
+      return card;
+    };
+
+    try {
+      const res = await fetch("/api/agent/turn", {
+        method: "POST", headers: authHeaders,
+        body: JSON.stringify({
+          agent: state.agent, message, cwd: state.cwd || undefined,
+          session_ref: state.agentSession[state.agent] || "",
+          permission_mode: state.permission,
+        }),
+      });
+      if (!res.ok || !res.body) throw new Error("agent HTTP " + res.status);
+      for await (const frame of sseStream(res)) {
+        let ev; try { ev = JSON.parse(frame.data); } catch { continue; }
+        if (ev.type === "session") {
+          if (ev.session_id) {
+            state.agentSession[state.agent] = ev.session_id;
+            renderAgentSessionChip();
+          }
+        } else if (ev.type === "thinking") {
+          status.innerHTML = `<span class="agent-thinking">✦ thinking…</span>`;
+        } else if (ev.type === "text") {
+          proseText += ev.text;
+          prose.innerHTML = renderMarkdown(proseText);
+          scroll();
+        } else if (ev.type === "tool_use") {
+          lastToolCard = stepCard(toolIcon(ev.name), ev.name, ev.summary);
+        } else if (ev.type === "web_search") {
+          stepCard("🔎", "Web search", ev.query, "step-web");
+        } else if (ev.type === "web_fetch") {
+          stepCard("🌐", "Fetch", ev.url, "step-web");
+        } else if (ev.type === "tool_result") {
+          if (lastToolCard) {
+            const out = el("div", "step-result" + (ev.is_error ? " error" : ""));
+            out.textContent = (ev.content || "").slice(0, 2000);
+            lastToolCard.appendChild(out);
+          }
+        } else if (ev.type === "result") {
+          status.innerHTML = ev.cost_usd
+            ? `<span class="agent-done">done · $${ev.cost_usd.toFixed(4)}${ev.web_searches ? ` · ${ev.web_searches} web` : ""}</span>`
+            : `<span class="agent-done">done</span>`;
+          if (ev.text && !proseText) prose.innerHTML = renderMarkdown(ev.text);
+        } else if (ev.type === "error") {
+          status.innerHTML = `<span style="color:var(--blocked)">Error: ${escapeHtml(ev.message)}</span>`;
+        }
+      }
+    } catch (e) {
+      status.innerHTML = `<span style="color:var(--blocked)">Error: ${escapeHtml(e.message)}</span>`;
+    }
+    scroll();
+    refresh();
+  }
+
+  function renderAgentSessionChip() {
+    const sid = state.agentSession[state.agent];
+    const chip = $("agent-session");
+    if (state.agent !== "ask" && sid) {
+      chip.textContent = "● " + sid.slice(0, 8);
+      chip.classList.remove("hidden");
+    } else {
+      chip.classList.add("hidden");
+    }
   }
 
   // ── views ──
@@ -357,8 +499,50 @@ if (typeof document !== "undefined") {
     document.addEventListener("keydown", (e) => {
       if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") { e.preventDefault(); openCmdk(); }
     });
+    // agent picker
+    $("agent-select").addEventListener("change", (e) => {
+      state.agent = e.target.value;
+      onAgentChanged();
+    });
+    $("perm-select").addEventListener("change", (e) => { state.permission = e.target.value; });
+    loadAgents();
     refresh();
     connectStream();
+  }
+
+  async function loadAgents() {
+    try {
+      const r = await api("/api/agents");
+      state.agents = r.agents || [];
+      state.cwd = r.cwd || "";
+    } catch { state.agents = []; }
+    const sel = $("agent-select");
+    sel.innerHTML = "";
+    const ask = el("option", null, "✦ Ask Morpheus");
+    ask.value = "ask"; sel.appendChild(ask);
+    for (const a of state.agents) {
+      const o = el("option", null, (a.available ? "" : "○ ") + a.label + (a.available ? "" : " (not installed)"));
+      o.value = a.kind; o.disabled = !a.available;
+      sel.appendChild(o);
+    }
+    sel.value = state.agent;
+    onAgentChanged();
+  }
+
+  function onAgentChanged() {
+    const isAgent = state.agent !== "ask";
+    $("cwd-chip").classList.toggle("hidden", !isAgent);
+    $("perm-select").classList.toggle("hidden", !(isAgent && state.agent === "claude"));
+    if (isAgent) {
+      const home = (state.cwd || "").replace(/^.*\//, "") || state.cwd;
+      $("cwd-chip").textContent = "📁 " + (home || "cwd");
+      $("cwd-chip").title = state.cwd;
+      const a = state.agents.find((x) => x.kind === state.agent);
+      $("composer-input").placeholder = `Message ${a ? a.label : state.agent}…  (real tool use + web search)`;
+    } else {
+      $("composer-input").placeholder = "Message Morpheus…  (try /spawn, /broadcast, or just ask)";
+    }
+    renderAgentSessionChip();
   }
 
   window.addEventListener("DOMContentLoaded", init);

@@ -1,7 +1,8 @@
 // Unit tests for the pure helpers in app.js. Run with: node app.test.mjs
 // (also invoked from tests/test_desktop_web.py so it runs under `make test`).
 import assert from "node:assert";
-import { renderMarkdown, parseCommand, escapeHtml, stateDotClass, SUGGESTIONS } from "./app.js";
+import { renderMarkdown, parseCommand, escapeHtml, stateDotClass, SUGGESTIONS,
+         parseSseBuffer, toolIcon } from "./app.js";
 
 // escapeHtml escapes the dangerous five
 assert.equal(escapeHtml('<b>&"x\''), "&lt;b&gt;&amp;&quot;x&#39;");
@@ -31,5 +32,22 @@ assert.equal(stateDotClass("working"), "dot-working");
 assert.equal(stateDotClass("weird"), "dot-unknown");
 
 assert.ok(SUGGESTIONS.length >= 3);
+
+// parseSseBuffer: splits complete frames, keeps a trailing partial as `rest`
+const sse = parseSseBuffer("event: text\ndata: {\"x\":1}\n\nevent: result\ndata: {\"y\":2}\n\nevent: partial\ndata: {");
+assert.equal(sse.frames.length, 2);
+assert.equal(sse.frames[0].event, "text");
+assert.equal(sse.frames[0].data, '{"x":1}');
+assert.equal(sse.frames[1].event, "result");
+assert.ok(sse.rest.startsWith("event: partial"), "partial frame retained");
+// a frame split across two reads is reassembled by feeding rest back in
+const cont = parseSseBuffer(sse.rest + '"z":3}\n\n');
+assert.equal(cont.frames.length, 1);
+assert.equal(cont.frames[0].data, '{"z":3}');
+
+// toolIcon
+assert.equal(typeof toolIcon("Read"), "string");
+assert.equal(toolIcon("WebSearch"), "🔎");
+assert.ok(toolIcon("SomethingUnknown").length >= 1);
 
 console.log("ok - app.js pure helper tests passed");

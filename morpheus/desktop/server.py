@@ -22,6 +22,7 @@ That lets the whole routing/auth layer be unit-tested without opening a socket;
 from __future__ import annotations
 
 import json
+import os
 import secrets
 import threading
 import time
@@ -30,7 +31,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 from urllib.parse import parse_qs, urlparse
 
-from morpheus.desktop import bridge
+from morpheus.desktop import agents, bridge
 
 WEB_ROOT = Path(__file__).resolve().parent / "web"
 
@@ -38,6 +39,10 @@ WEB_ROOT = Path(__file__).resolve().parent / "web"
 _MAX_SSE_CLIENTS = 8
 _SSE_HEARTBEAT_SECS = 15.0
 _SSE_POLL_SECS = 2.0
+
+# Limit concurrent live agent turns (each spawns a real claude/codex subprocess).
+_MAX_AGENT_TURNS = 4
+_agent_semaphore = threading.BoundedSemaphore(_MAX_AGENT_TURNS)
 
 _CONTENT_TYPES = {
     ".html": "text/html; charset=utf-8",
@@ -186,6 +191,8 @@ def _route_api_get(path: str, query: dict[str, list[str]]) -> tuple[int, dict[st
         return _json(200, bridge.spend())
     if path == "/api/projects":
         return _json(200, {"projects": bridge.projects()})
+    if path == "/api/agents":
+        return _json(200, {"agents": agents.available_agents(), "cwd": os.getcwd()})
     return _err(404, "not found")
 
 
@@ -272,8 +279,60 @@ def make_handler(cfg: Config) -> type[BaseHTTPRequestHandler]:
         def do_POST(self):
             length = int(self.headers.get("Content-Length", 0) or 0)
             body = self.rfile.read(length) if length else b""
+            parsed = urlparse(self.path)
+            if parsed.path == "/api/agent/turn":
+                self._agent_turn(body)
+                return
             status, hdrs, payload = dispatch(cfg, "POST", self.path, self._headers_dict(), body)
             self._send(status, hdrs, payload)
+
+        def _agent_turn(self, body: bytes):
+            """Stream a live agent turn (claude/codex/gemini) as SSE events."""
+            hdrs = {k.lower(): v for k, v in self.headers.items()}
+            if not _host_is_loopback(hdrs.get("host", "127.0.0.1")):
+                self._send(*_err(403, "bad host"))
+                return
+            if not _authorized(cfg, hdrs, {}):
+                self._send(*_err(401, "unauthorized"))
+                return
+            if not _agent_semaphore.acquire(blocking=False):
+                self._send(*_err(503, "too many concurrent agent turns"))
+                return
+            data = _read_json_body(body)
+            proc_box: dict[str, Any] = {}
+            gen = None
+            # A turn is a finite stream; close the connection at the end so the
+            # client's read returns instead of waiting on keep-alive for EOF.
+            self.close_connection = True
+            try:
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Cache-Control", "no-cache")
+                self.send_header("Connection", "close")
+                self.send_header("X-Accel-Buffering", "no")
+                self.end_headers()
+                gen = agents.run_turn(
+                    kind=str(data.get("agent", "claude")),
+                    message=str(data.get("message", "")),
+                    cwd=(data.get("cwd") or None),
+                    session_ref=str(data.get("session_ref", "")),
+                    permission_mode=str(data.get("permission_mode", "default")),
+                    allowed_tools=(data.get("allowed_tools") or None),
+                    model=str(data.get("model", "")),
+                    on_process=lambda p: proc_box.__setitem__("p", p),
+                )
+                for ev in gen:
+                    frame = f"event: {ev['type']}\ndata: {json.dumps(ev)}\n\n"
+                    self.wfile.write(frame.encode("utf-8"))
+                    self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                p = proc_box.get("p")
+                if p is not None:
+                    agents._safe_kill(p)
+            finally:
+                if gen is not None:
+                    gen.close()
+                _agent_semaphore.release()
 
         def _stream(self, parsed):
             query = parse_qs(parsed.query)

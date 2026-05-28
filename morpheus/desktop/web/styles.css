@@ -170,6 +170,33 @@ body {
 }
 .send-btn:disabled { opacity: .4; cursor: default; }
 
+/* Composer controls (agent picker / cwd / permission) */
+.composer-wrap { border-top: 1px solid var(--border); background: var(--surface-1); }
+.composer-wrap .composer { border-top: 0; }
+.composer-controls { display: flex; align-items: center; gap: 10px; padding: 8px 24px 0; }
+.ctl-select {
+  background: var(--surface-2); color: var(--text-2); border: 1px solid var(--border);
+  border-radius: 8px; padding: 4px 8px; font-size: 12px; font-family: var(--font-ui); cursor: pointer;
+}
+.ctl-select:focus { outline: none; border-color: var(--accent-dim); }
+.cwd-chip { font-size: 11px; font-family: var(--font-mono); color: var(--text-2); background: var(--surface-2); border: 1px solid var(--border); border-radius: 8px; padding: 4px 8px; }
+.agent-session { font-size: 11px; font-family: var(--font-mono); color: var(--accent); margin-left: auto; }
+
+/* Live agent turn: step cards + streamed prose */
+.agent-steps { display: flex; flex-direction: column; gap: 6px; margin-bottom: 10px; }
+.step-card { background: #0d120f; border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; }
+.step-card.step-web { border-color: var(--accent-dim); }
+.step-head { display: flex; align-items: center; gap: 8px; font-size: 12px; }
+.step-icon { font-family: var(--font-mono); width: 20px; flex: 0 0 auto; }
+.step-title { color: var(--accent); font-weight: 600; }
+.step-sub { color: var(--text-2); font-family: var(--font-mono); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.step-result { margin-top: 6px; padding: 6px 8px; background: var(--bg); border-radius: 6px; font-family: var(--font-mono); font-size: 11.5px; color: var(--text-2); white-space: pre-wrap; max-height: 160px; overflow: auto; }
+.step-result.error { color: var(--blocked); }
+.agent-prose { font-size: 14px; }
+.agent-status { margin-top: 8px; font-size: 12px; color: var(--muted); }
+.agent-thinking { color: var(--accent); }
+.agent-done { color: var(--text-2); font-family: var(--font-mono); }
+
 /* Session transcript */
 .session-head { padding: 16px 24px; border-bottom: 1px solid var(--border); }
 .session-head h2 { margin: 0 0 4px; font-size: 16px; }

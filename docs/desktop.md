@@ -73,8 +73,12 @@ and notarization.
 
 ## The chat agent
 
-The hero is **"Chat with Morpheus"** — a GUI over `morpheus ask`. It answers from
-the live fleet snapshot + mission graph, and routes slash-commands to actions:
+The composer has an **agent picker**. Two modes:
+
+### 1. Ask Morpheus (the oracle)
+
+A GUI over `morpheus ask`. It answers from the live fleet snapshot + mission
+graph, and routes slash-commands to actions:
 
 | You type | What happens |
 | --- | --- |
@@ -86,6 +90,35 @@ the live fleet snapshot + mission graph, and routes slash-commands to actions:
 
 When no `claude`/`codex` CLI is available, chat falls back to the raw state
 snapshot, so it always returns something useful.
+
+### 2. Live agent (Claude / Codex / Gemini)
+
+Pick **Claude Code**, **Codex**, or **Gemini** from the picker and you're chatting
+with the *real CLI* — but it feels native, like Claude Code's own desktop app.
+Under the hood `morpheus/desktop/agents.py` spawns the CLI in its streaming mode
+(`claude -p --output-format stream-json`, `codex exec --json`, …), normalises the
+output into one event schema, and streams it to the UI over SSE. You see, live:
+
+* **streamed prose** as the model writes,
+* **tool-use cards** (Read / Edit / Bash / Grep / Task …) with their inputs and
+  collapsible results,
+* **web search / web fetch** chips when the agent goes to the web,
+* a **thinking** indicator, and a final **cost** + web-search count.
+
+Conversations are multi-turn: the agent's `session_id` is captured and replayed
+(`claude --resume`) so context carries across turns. A working-directory chip and
+a permission-mode selector (default / plan / acceptEdits / bypass) let you control
+what the agent may do. Each turn's cost is logged to the same ledger as the rest
+of Morpheus.
+
+Only installed CLIs are selectable (the picker greys out the rest). `claude` is
+the most fully supported; the `codex`/`gemini` adapters map their known event
+shapes and degrade any unrecognised line to streamed text.
+
+| Endpoint | Purpose |
+| --- | --- |
+| `GET /api/agents` | which agent CLIs are installed + the current working dir |
+| `POST /api/agent/turn` | `{agent, message, cwd?, session_ref?, permission_mode?}` → an SSE stream of `session`/`thinking`/`text`/`tool_use`/`tool_result`/`web_search`/`result` events |
 
 ## HTTP API
 
@@ -109,8 +142,14 @@ SSE stream). `/healthz` is unauthenticated.
 ## Tests
 
 ```bash
-python -m unittest tests.test_desktop_bridge tests.test_desktop_server tests.test_desktop_web
+python -m unittest tests.test_desktop_bridge tests.test_desktop_server \
+                   tests.test_desktop_agents tests.test_desktop_web
 ```
+
+`test_desktop_agents` checks the agent runner against a real captured
+`claude --output-format stream-json` fixture (`tests/fixtures/claude_stream.jsonl`)
+and exercises `run_turn` end-to-end against a fake agent that replays it — so it
+needs no network, credits, or installed CLI.
 
 `test_desktop_web` runs the front-end JS unit tests via Node and is skipped
 automatically when Node isn't installed.

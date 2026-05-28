@@ -71,10 +71,23 @@
             </div>
           </div>
         </div>
-        <form class="composer" id="composer" autocomplete="off">
-          <textarea id="composer-input" rows="1" placeholder="Message Morpheus…  (try /spawn, /broadcast, or just ask)"></textarea>
-          <button type="submit" class="send-btn" id="send-btn" title="Send (⌘↵)">↑</button>
-        </form>
+        <div class="composer-wrap">
+          <div class="composer-controls">
+            <select id="agent-select" class="ctl-select" title="Who answers"></select>
+            <span class="cwd-chip hidden" id="cwd-chip" title="Working directory the agent operates in"></span>
+            <select id="perm-select" class="ctl-select hidden" title="Permission mode">
+              <option value="default">default</option>
+              <option value="plan">plan</option>
+              <option value="acceptEdits">accept edits</option>
+              <option value="bypassPermissions">bypass</option>
+            </select>
+            <span class="agent-session hidden" id="agent-session" title="Conversation continues across turns"></span>
+          </div>
+          <form class="composer" id="composer" autocomplete="off">
+            <textarea id="composer-input" rows="1" placeholder="Message Morpheus…  (try /spawn, /broadcast, or just ask)"></textarea>
+            <button type="submit" class="send-btn" id="send-btn" title="Send (⌘↵)">↑</button>
+          </form>
+        </div>
       </section>
 
       <!-- Session transcript view -->

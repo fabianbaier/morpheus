@@ -15,7 +15,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from morpheus import db
-from morpheus.desktop import server
+from morpheus.desktop import agents, server
 
 
 class _TempDB:
@@ -119,8 +119,17 @@ class DispatchRouteTest(unittest.TestCase):
     def test_goals_loops_notes_activity_routes(self):
         with _TempDB():
             for path in ("/api/goals", "/api/loops", "/api/notes", "/api/activity",
-                         "/api/spend", "/api/projects", "/api/sessions"):
+                         "/api/spend", "/api/projects", "/api/sessions", "/api/agents"):
                 self.assertEqual(_get(path, AUTH)[0], 200, path)
+
+    def test_agents_route_lists_clis(self):
+        with _TempDB():
+            status, _, body = _get("/api/agents", AUTH)
+            self.assertEqual(status, 200)
+            data = json.loads(body)
+            kinds = {a["kind"] for a in data["agents"]}
+            self.assertEqual(kinds, {"claude", "codex", "gemini"})
+            self.assertIn("cwd", data)
 
     def test_post_note_route(self):
         with _TempDB():
@@ -177,6 +186,60 @@ class LiveServerTest(unittest.TestCase):
                 self.assertEqual(hs["port"], srv.cfg.port)
                 self.assertEqual(hs["token"], "tk")
                 self.assertIn("url", hs)
+            finally:
+                srv.stop()
+
+    def test_agent_turn_streams_sse_events(self):
+        def fake_run_turn(**kwargs):
+            yield {"type": "session", "session_id": "sess-1", "model": "m", "tools": [], "cwd": "/"}
+            yield {"type": "text", "text": "hello"}
+            yield {"type": "result", "text": "hello", "cost_usd": 0.01, "web_searches": 0,
+                   "session_id": "sess-1", "is_error": False}
+
+        with _TempDB(), patch.object(agents, "run_turn", fake_run_turn):
+            srv = server.DesktopServer(server.Config(host="127.0.0.1", port=0, token="tk")).start()
+            try:
+                req = urllib.request.Request(
+                    f"http://127.0.0.1:{srv.cfg.port}/api/agent/turn",
+                    data=json.dumps({"agent": "claude", "message": "hi"}).encode(),
+                    headers={"Authorization": "Bearer tk", "Content-Type": "application/json"},
+                )
+                with urllib.request.urlopen(req, timeout=5) as r:
+                    raw = r.read().decode()
+                self.assertIn("event: session", raw)
+                self.assertIn("event: text", raw)
+                self.assertIn("event: result", raw)
+                self.assertIn("sess-1", raw)
+            finally:
+                srv.stop()
+
+    def test_agent_turn_requires_auth(self):
+        with _TempDB():
+            srv = server.DesktopServer(server.Config(host="127.0.0.1", port=0, token="tk")).start()
+            try:
+                req = urllib.request.Request(
+                    f"http://127.0.0.1:{srv.cfg.port}/api/agent/turn",
+                    data=b"{}", headers={"Content-Type": "application/json"})
+                with self.assertRaises(urllib.error.HTTPError) as ctx:
+                    urllib.request.urlopen(req, timeout=5)
+                self.assertEqual(ctx.exception.code, 401)
+            finally:
+                srv.stop()
+
+    def test_agent_turn_concurrency_cap(self):
+        import threading
+        busy = threading.BoundedSemaphore(1)
+        busy.acquire()  # fully consumed → next turn must be rejected
+        with _TempDB(), patch.object(server, "_agent_semaphore", busy):
+            srv = server.DesktopServer(server.Config(host="127.0.0.1", port=0, token="tk")).start()
+            try:
+                req = urllib.request.Request(
+                    f"http://127.0.0.1:{srv.cfg.port}/api/agent/turn",
+                    data=json.dumps({"agent": "claude", "message": "hi"}).encode(),
+                    headers={"Authorization": "Bearer tk", "Content-Type": "application/json"})
+                with self.assertRaises(urllib.error.HTTPError) as ctx:
+                    urllib.request.urlopen(req, timeout=5)
+                self.assertEqual(ctx.exception.code, 503)
             finally:
                 srv.stop()
 
