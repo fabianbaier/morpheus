@@ -5,6 +5,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 import { createBridge } from "../src/server.mjs";
+import { G2BridgeClient } from "../simulator/src/bridge-client.js";
 
 const TOKEN = "test-token-123456";
 const FIXTURE = fileURLToPath(new URL("./fixtures/mock-morpheus.mjs", import.meta.url));
@@ -336,7 +337,7 @@ test("selects a project and then lists project sessions", async (t) => {
   assert.equal(body.selectedProject.id, "p_alpha");
 });
 
-test("opening a project row history returns the project session menu", async (t) => {
+test("opening a project row history returns project session rows without menu transcript", async (t) => {
   const { baseUrl } = await withBridge(t, { showProjectsFirst: true });
 
   const projectHistory = await request(baseUrl, "/api/sessions/project:p_alpha/history");
@@ -349,9 +350,7 @@ test("opening a project row history returns the project session menu", async (t)
   assert.equal(body.selectedSession, null);
   assert.equal(body.sessions[0].id, "nav:projects");
   assert.equal(body.sessions[1].id, "abc123");
-  assert.equal(body.history.length, 1);
-  assert.match(body.history[0].text, /Sessions in alpha:/);
-  assert.match(body.history[0].text, /G2: Test Morpheus session/);
+  assert.deepEqual(body.history, []);
 });
 
 test("codex app-server project menu includes Morpheus snapshot sessions after bridge restart", async (t) => {
@@ -368,9 +367,7 @@ test("codex app-server project menu includes Morpheus snapshot sessions after br
   assert.equal(historyBody.mode, "sessions");
   assert.equal(historyBody.sessions[0].id, "nav:projects");
   assert.equal(historyBody.sessions[1].id, "abc123");
-  assert.match(historyBody.history[0].text, /Sessions in alpha:/);
-  assert.match(historyBody.history[0].text, /G2: Test Morpheus session/);
-  assert.doesNotMatch(historyBody.history[0].text, /No sessions in alpha/);
+  assert.deepEqual(historyBody.history, []);
 
   const sessions = await request(baseUrl, `/api/sessions?token=${TOKEN}`, { token: null });
   assert.equal(sessions.status, 200);
@@ -1897,4 +1894,40 @@ test("keeps approvals blocked", async (t) => {
   });
   assert.equal(res.status, 403);
   assert.equal((await res.json()).code, "action_blocked");
+});
+
+test("simulator client can create a Morpheus project session and read the stream", async (t) => {
+  const { baseUrl } = await withBridge(t, {
+    agentBackend: "codex_app_server",
+    createCodexAgentProvider: fakeCodexAgentProvider({ asyncResultMs: 20 }),
+    mirrorCodexTui: false,
+    showProjectsFirst: true,
+  });
+  const logs = [];
+  const client = new G2BridgeClient({
+    bridgeUrl: baseUrl,
+    token: TOKEN,
+    eventSourceFactory: () => null,
+    onLog: (line) => logs.push(line),
+  });
+
+  const connected = await client.connect();
+  assert.equal(connected.mode, "projects");
+  assert.match(connected.glassesText, /alpha/);
+
+  const sessions = await client.activateSelected();
+  assert.equal(sessions.mode, "sessions");
+  assert.equal(sessions.selectedProject.id, "p_alpha");
+
+  const submitted = await client.submitTranscript("local simulator smoke");
+  assert.equal(submitted.mode, "session");
+  assert.equal(submitted.activeSessionId, "codex-thread-1");
+  assert.equal(submitted.displaySessionId, "project-session:p_alpha");
+
+  const streamed = await client.waitForText(/answer for: local simulator smoke/, {
+    timeoutMs: 2000,
+    intervalMs: 50,
+  });
+  assert.match(streamed.glassesText, /answer for: local simulator smoke/);
+  assert.ok(logs.some((line) => line.includes("EventSource unavailable")));
 });

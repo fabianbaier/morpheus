@@ -1,0 +1,177 @@
+:root {
+  color-scheme: dark;
+  font-family:
+    Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI",
+    sans-serif;
+  background: #101415;
+  color: #eef4ec;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  min-width: 320px;
+  margin: 0;
+}
+
+button,
+input,
+textarea {
+  font: inherit;
+}
+
+button {
+  min-height: 38px;
+  border: 1px solid #49624d;
+  border-radius: 6px;
+  background: #1c2a20;
+  color: #e9f5e4;
+  cursor: pointer;
+}
+
+button:focus-visible,
+input:focus-visible,
+textarea:focus-visible {
+  outline: 2px solid #7bdc79;
+  outline-offset: 2px;
+}
+
+button:hover {
+  background: #26392b;
+}
+
+button:disabled {
+  cursor: wait;
+  opacity: 0.55;
+}
+
+.simulator-shell {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 360px;
+  gap: 24px;
+  min-height: 100vh;
+  padding: 24px;
+}
+
+.glasses-panel,
+.control-panel {
+  min-width: 0;
+}
+
+.glasses-panel {
+  display: grid;
+  align-content: center;
+  gap: 16px;
+}
+
+.glasses-frame {
+  width: min(100%, 1152px);
+  aspect-ratio: 2 / 1;
+  border: 1px solid #2d5634;
+  border-radius: 8px;
+  background:
+    radial-gradient(circle at 50% 50%, rgba(83, 184, 90, 0.14), transparent 65%),
+    #020403;
+  box-shadow:
+    inset 0 0 38px rgba(73, 255, 91, 0.1),
+    0 18px 44px rgba(0, 0, 0, 0.32);
+  overflow: hidden;
+}
+
+.glasses-text {
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  padding: 20px 24px;
+  color: #7dff7a;
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  font-size: 18px;
+  line-height: 1.34;
+  white-space: pre-wrap;
+  overflow: hidden;
+  text-shadow: 0 0 10px rgba(93, 255, 104, 0.35);
+}
+
+.gesture-row,
+.command-row {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.control-panel {
+  display: grid;
+  align-content: start;
+  gap: 14px;
+  padding: 18px;
+  border-left: 1px solid #25342b;
+  background: #151b18;
+}
+
+.field-row {
+  display: grid;
+  gap: 7px;
+}
+
+.field-row label {
+  color: #a9b7ab;
+  font-size: 13px;
+}
+
+.field-row input,
+.field-row textarea {
+  width: 100%;
+  border: 1px solid #3d5142;
+  border-radius: 6px;
+  background: #0d120f;
+  color: #f1f7ef;
+}
+
+.field-row input {
+  min-height: 38px;
+  padding: 0 10px;
+}
+
+.field-row textarea {
+  min-height: 108px;
+  padding: 10px;
+  resize: vertical;
+}
+
+.control-panel .command-row {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.debug-log {
+  min-height: 180px;
+  max-height: 34vh;
+  margin: 0;
+  padding: 12px;
+  border: 1px solid #2a382f;
+  border-radius: 6px;
+  background: #080b09;
+  color: #b9c6ba;
+  font-size: 12px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  overflow: auto;
+}
+
+@media (max-width: 900px) {
+  .simulator-shell {
+    grid-template-columns: 1fr;
+    padding: 16px;
+  }
+
+  .control-panel {
+    border-left: 0;
+    border-top: 1px solid #25342b;
+  }
+
+  .glasses-text {
+    padding: 14px;
+    font-size: 14px;
+  }
+}

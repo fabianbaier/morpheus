@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Morpheus G2 Simulator</title>
+  </head>
+  <body>
+    <main class="simulator-shell">
+      <section class="glasses-panel" aria-label="Simulated G2 display">
+        <div class="glasses-frame">
+          <pre id="glassesText" class="glasses-text">Morpheus G2 simulator booting...</pre>
+        </div>
+        <div class="gesture-row" aria-label="G2 gesture controls">
+          <button id="upButton" type="button">Up</button>
+          <button id="clickButton" type="button">Click</button>
+          <button id="downButton" type="button">Down</button>
+          <button id="backButton" type="button">Back</button>
+        </div>
+      </section>
+
+      <section class="control-panel" aria-label="Bridge controls">
+        <div class="field-row">
+          <label for="bridgeUrl">Bridge</label>
+          <input id="bridgeUrl" autocomplete="off" spellcheck="false" />
+        </div>
+        <div class="field-row">
+          <label for="bridgeToken">Token</label>
+          <input id="bridgeToken" autocomplete="off" spellcheck="false" type="password" />
+        </div>
+        <div class="command-row">
+          <button id="connectButton" type="button">Connect</button>
+          <button id="refreshButton" type="button">Refresh</button>
+        </div>
+        <div class="field-row transcript-field">
+          <label for="transcriptText">Transcript</label>
+          <textarea id="transcriptText" rows="4" spellcheck="true">please summarize this Morpheus project</textarea>
+        </div>
+        <div class="command-row">
+          <button id="sendTranscriptButton" type="button">Send Transcript</button>
+        </div>
+        <pre id="debugLog" class="debug-log" aria-label="Debug log"></pre>
+      </section>
+    </main>
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>

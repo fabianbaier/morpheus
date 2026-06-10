@@ -39,6 +39,66 @@ npm start
 
 By default the bridge binds to `127.0.0.1:3456`.
 
+### Local Simulator Development
+
+The `simulator/` app is a local Even Hub-style G2 client for developing without
+physical glasses. It can run as an ordinary browser preview or inside the
+official `evenhub-simulator`.
+
+Fast mock loop:
+
+```bash
+cd plugins/g2-bridge
+npm install
+npm --prefix simulator install
+npm run sim:mock
+```
+
+In another shell:
+
+```bash
+cd plugins/g2-bridge
+npm run sim:dev
+```
+
+Open:
+
+```text
+http://127.0.0.1:5173/?bridge=http://127.0.0.1:3456&token=dev-token
+```
+
+The mock bridge exposes Morpheus project rows and a fake Codex provider, so the
+simulator can select a project, submit a final transcript, create a session, and
+watch streamed answer events locally.
+
+Real bridge loop:
+
+```bash
+cd plugins/g2-bridge
+export MORPHEUS_G2_TOKEN="$(openssl rand -hex 24)"
+export MORPHEUS_G2_ALLOWED_ORIGINS="http://127.0.0.1:5173,http://localhost:5173"
+MORPHEUS_G2_PUBLIC_URL="http://127.0.0.1:3456" npm start
+```
+
+Then run the simulator dev server and open the same URL with your real token.
+
+Official Even simulator:
+
+```bash
+cd plugins/g2-bridge
+npm run sim:dev
+npm run sim:even
+```
+
+`sim:even` launches `evenhub-simulator "http://127.0.0.1:5173/?even=1"
+--automation-port 9898`. The browser preview is still useful for transcript
+entry and debug logs; the official simulator validates the G2 framebuffer and
+input path.
+
+Automated smoke coverage lives in `test/server.test.mjs` and drives the same
+simulator client module against the bridge: project selection, transcript
+submission, session creation, and streamed result polling.
+
 Expose it privately to a phone on your tailnet:
 
 ```bash

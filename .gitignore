@@ -122,7 +122,9 @@ morpheus.db
 *.morpheus.log
 
 # JavaScript plugin dependencies
+node_modules/
 plugins/*/node_modules/
+plugins/*/*/node_modules/
 
 # Electron desktop shell build artifacts
 morpheus/desktop/electron/node_modules/

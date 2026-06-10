@@ -7,6 +7,10 @@
   "scripts": {
     "start": "node src/server.mjs",
     "dev": "node src/server.mjs",
+    "sim:mock": "node simulator/scripts/mock-bridge.mjs",
+    "sim:dev": "npm --prefix simulator run dev",
+    "sim:build": "npm --prefix simulator run build",
+    "sim:even": "npm --prefix simulator run even",
     "check": "node --check src/server.mjs",
     "test": "node --test test/*.test.mjs"
   },

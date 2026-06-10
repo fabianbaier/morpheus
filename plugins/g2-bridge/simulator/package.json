@@ -1,0 +1,22 @@
+{
+  "name": "@morpheus/g2-bridge-simulator",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Local Even G2 simulator client for the Morpheus G2 bridge.",
+  "scripts": {
+    "dev": "vite --host 127.0.0.1 --port 5173",
+    "build": "vite build",
+    "preview": "vite preview --host 127.0.0.1 --port 5173",
+    "even": "evenhub-simulator \"http://127.0.0.1:5173/?even=1\" --automation-port 9898",
+    "pack": "vite build && evenhub pack app.json dist -o morpheus-g2-simulator.ehpk"
+  },
+  "dependencies": {
+    "@evenrealities/even_hub_sdk": "^0.0.10"
+  },
+  "devDependencies": {
+    "@evenrealities/evenhub-cli": "^0.1.13",
+    "@evenrealities/evenhub-simulator": "^0.7.3",
+    "vite": "^7.2.6"
+  }
+}
