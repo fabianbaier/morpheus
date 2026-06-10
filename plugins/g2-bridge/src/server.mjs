@@ -247,7 +247,9 @@ function pushMessageForSession(state, sessionId, msg) {
 function rememberSessionAliases(state, sessionId, { project, requestSessionId } = {}) {
   addSessionAlias(state, sessionId, "morpheus");
   if (requestSessionId) addSessionAlias(state, sessionId, requestSessionId);
-  if (project) addSessionAlias(state, sessionId, activeProjectSessionId(project));
+  if (project) {
+    addSessionAlias(state, sessionId, activeProjectSessionId(project));
+  }
 }
 
 function rememberActiveProjectSession(state, project, session) {
@@ -814,8 +816,33 @@ function activeProjectSessionRow(state, project) {
       projectActiveSessionId: id,
       morpheusProject: project,
     },
-    { promoteAssistantToTitle: true, preferredSessionIds: [activeSession.id] },
+    { preferredSessionIds: [activeSession.id] },
   );
+}
+
+async function projectSessionMenuRows(provider, state, config, project, limit) {
+  const result = await provider.listSessions(limit, {
+    projectId: project?.id || project?.tenant_id || "",
+  });
+  const providerSessions = Array.isArray(result) ? result : result.sessions || [];
+  const activeProjectRow = activeProjectSessionRow(state, project);
+  const hydratedSessions = providerSessions.map((session) =>
+    hydrateSessionRowWithBufferedHistory(state, session),
+  );
+  const sessions = activeProjectRow
+    ? [
+        ...(config.showBackToProjectsRow ? [projectMenuRow(project)] : []),
+        activeProjectRow,
+        ...hydratedSessions.filter((session) => session.id !== activeProjectRow.activeSessionId),
+      ]
+    : [
+        ...(config.showBackToProjectsRow && project ? [projectMenuRow(project)] : []),
+        ...hydratedSessions,
+      ];
+  return {
+    sessions,
+    snapshot: Array.isArray(result) ? undefined : result.snapshot,
+  };
 }
 
 function toEvenStatus(state) {
@@ -1443,13 +1470,21 @@ function createCodexAppServerBridgeProvider(options = {}) {
           { cwd, clock: config.clock },
         ),
       );
-      const mirrorResult = await mirrorSessionToMorpheus({ sessionId, project, goal });
+      const mirrorPending = Boolean(config.mirrorCodexTui);
+      mirrorSessionToMorpheus({ sessionId, project, goal }).catch((err) => {
+        audit("codex_tui_mirror_failed", {
+          sessionId,
+          projectId: project?.id || project?.tenant_id || "",
+          reason: safeJsonError(err),
+        });
+      });
       return {
         ok: true,
         provider: "codex",
         sessionId,
         evenSession,
-        mirrorResult,
+        mirrorPending,
+        mirrorResult: null,
         result,
       };
     },
@@ -2370,28 +2405,16 @@ function createBridge(options = {}) {
         });
         return;
       }
-      const result = await provider.listSessions(limit, {
-        projectId: state.selectedProject?.id || state.selectedProject?.tenant_id || "",
-      });
-      const activeProjectRow = activeProjectSessionRow(state, state.selectedProject);
-      const hydratedSessions = result.sessions.map((session) =>
-        hydrateSessionRowWithBufferedHistory(state, session),
+      const { sessions, snapshot } = await projectSessionMenuRows(
+        provider,
+        state,
+        config,
+        state.selectedProject,
+        limit,
       );
-      const sessions = activeProjectRow
-        ? [
-            ...(config.showBackToProjectsRow ? [projectMenuRow(state.selectedProject)] : []),
-            activeProjectRow,
-            ...hydratedSessions.filter((session) => session.id !== activeProjectRow.activeSessionId),
-          ]
-        : [
-            ...(config.showBackToProjectsRow && state.selectedProject
-              ? [projectMenuRow(state.selectedProject)]
-              : []),
-            ...hydratedSessions,
-          ];
       res.json({
         sessions,
-        snapshot: result.snapshot,
+        snapshot,
         selectedProject: state.selectedProject,
         selectedSession: state.selectedSession,
         mode: "sessions",
@@ -2875,13 +2898,23 @@ function createBridge(options = {}) {
         state.selectedSession = null;
         const activeSession = state.projectActiveSessions.get(projectId) || null;
         bumpNavigationEpoch(state);
+        const { sessions, snapshot } = await projectSessionMenuRows(
+          provider,
+          state,
+          config,
+          state.selectedProject,
+          limit,
+        );
         res.json({
           history: [],
+          sessions,
+          snapshot,
+          mode: "sessions",
           selectedProject: state.selectedProject,
           selectedSession: null,
           activeSessionId: activeSession?.id || null,
           projectActiveSessionId: activeSession ? `${PROJECT_ACTIVE_SESSION_PREFIX}${projectId}` : null,
-          navigation: navigationPayload(state, { action: "select_project" }),
+          navigation: navigationPayload(state, { action: "select_project", mode: "sessions" }),
         });
         return;
       }
