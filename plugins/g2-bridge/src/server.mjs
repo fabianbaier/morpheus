@@ -335,6 +335,7 @@ function rememberSessionAliases(state, sessionId, { project, requestSessionId } 
   addSessionAlias(state, sessionId, "morpheus");
   if (requestSessionId) addSessionAlias(state, sessionId, requestSessionId);
   if (project) {
+    addSessionAlias(state, sessionId, projectSessionId(project));
     addSessionAlias(state, sessionId, activeProjectSessionId(project));
   }
 }
@@ -354,6 +355,7 @@ function rememberActiveProjectSession(state, project, session) {
   if (!activeProjectId || !session?.id) return;
   rememberProjectContext(state, project);
   state.projectActiveSessions.set(activeProjectId, session);
+  addSessionAlias(state, session.id, projectSessionId(project));
   addSessionAlias(state, session.id, activeProjectSessionId(project));
 }
 
@@ -955,6 +957,7 @@ function activeProjectSessionRow(state, project) {
       cwd: String(project.root_path || activeSession.cwd || ""),
       provider: activeSession.provider || "codex",
       status,
+      codex: activeSession.codex ? { ...activeSession.codex, status } : activeSession.codex,
       allowedActions: ["select_session", "send_prompt", "interrupt"],
       promptBehavior: "send_prompt",
       activeSessionId: activeSession.id,
@@ -965,6 +968,56 @@ function activeProjectSessionRow(state, project) {
     },
     { preferredSessionIds: [activeSession.id] },
   );
+}
+
+function selectedSessionResponse(state) {
+  if (!state.selectedSession) {
+    return {
+      selectedSession: null,
+      activeSessionId: null,
+      displaySessionId: "",
+      projectActiveSessionId: "",
+      state: "idle",
+      history: [],
+      messages: [],
+      text: "",
+    };
+  }
+
+  const activeRow = state.selectedProject
+    ? activeProjectSessionRow(state, state.selectedProject)
+    : null;
+  const selected = activeRow &&
+      (sessionMatches(state.selectedSession, activeRow.activeSessionId) ||
+        sessionMatches(state.selectedSession, activeRow.realSessionId))
+    ? activeRow
+    : hydrateSessionRowWithBufferedHistory(state, state.selectedSession);
+  const activeSessionId =
+    selected.activeSessionId ||
+    selected.realSessionId ||
+    state.selectedSession.id ||
+    selected.id;
+  const displaySessionId = selected.projectActiveSessionId || selected.id || activeSessionId;
+  const displayMessages = getMessages(state, displaySessionId, 0);
+  const activeMessages =
+    activeSessionId && activeSessionId !== displaySessionId
+      ? getMessages(state, activeSessionId, 0)
+      : [];
+  const messages = displayMessages.length ? displayMessages : activeMessages;
+  const history = selected.history || bufferedHistoryForRow(state, displaySessionId, 10, {
+    preferredSessionIds: [activeSessionId],
+  });
+  const text = selected.latestOutput || latestHistoryText(history, "assistant") || "";
+  return {
+    selectedSession: selected,
+    activeSessionId,
+    displaySessionId,
+    projectActiveSessionId: selected.projectActiveSessionId || "",
+    state: selected.status || statusFromBufferedMessages(state, activeSessionId, "idle"),
+    history,
+    messages,
+    text,
+  };
 }
 
 async function projectSessionMenuRows(provider, state, config, project, limit) {
@@ -2886,12 +2939,26 @@ function createBridge(options = {}) {
         state.selectedProject,
         limit,
       );
+      const selected = selectedSessionResponse(state);
+      const responseText = selected.text;
       res.json({
         sessions,
         snapshot,
         selectedProject: state.selectedProject,
-        selectedSession: state.selectedSession,
+        selectedSession: selected.selectedSession || state.selectedSession,
+        activeSessionId: selected.activeSessionId || undefined,
+        displaySessionId: selected.displaySessionId || undefined,
+        projectActiveSessionId: selected.projectActiveSessionId || undefined,
+        state: selected.state,
+        history: selected.history,
+        messages: selected.messages,
+        text: responseText,
+        answer: responseText,
+        message: responseText,
+        response: responseText,
+        output: responseText ? { text: responseText } : undefined,
         mode: "sessions",
+        view: navigationView(state),
         stale,
         error: error || undefined,
       });
@@ -2910,6 +2977,8 @@ function createBridge(options = {}) {
       } else if (state.selectedProject) {
         const activeRow = activeProjectSessionRow(state, state.selectedProject);
         const pendingRow = pendingProjectPromptForProject(state, state.selectedProject);
+        const selected = selectedSessionResponse(state);
+        const responseText = selected.text;
         const rows = [
           ...(config.showBackToProjectsRow ? [projectMenuRow(state.selectedProject)] : []),
           ...(activeRow ? [activeRow] : []),
@@ -2932,8 +3001,20 @@ function createBridge(options = {}) {
               },
             },
             selectedProject: state.selectedProject,
-            selectedSession: state.selectedSession,
+            selectedSession: selected.selectedSession || state.selectedSession,
+            activeSessionId: selected.activeSessionId || undefined,
+            displaySessionId: selected.displaySessionId || undefined,
+            projectActiveSessionId: selected.projectActiveSessionId || undefined,
+            state: selected.state,
+            history: selected.history,
+            messages: selected.messages,
+            text: responseText,
+            answer: responseText,
+            message: responseText,
+            response: responseText,
+            output: responseText ? { text: responseText } : undefined,
             mode: "sessions",
+            view: navigationView(state),
             stale: true,
             error: message,
           });
@@ -3628,8 +3709,12 @@ function createBridge(options = {}) {
       await refreshSessionOutput({ provider, state, config, sessionId: activeSession.id });
     } else if (!projectId) {
       await refreshSessionOutput({ provider, state, config, sessionId });
-	    }
+    }
     const projectActiveSession = projectId ? activeSessionForProject(state, projectId) : null;
+    if (projectActiveSession?.id) {
+      addSessionAlias(state, projectActiveSession.id, sessionId);
+      await refreshSessionOutput({ provider, state, config, sessionId: projectActiveSession.id });
+    }
     const pendingProjectRow = projectId && !projectActiveSession
       ? pendingProjectPromptForProject(state, projectId)
       : null;
@@ -3640,24 +3725,24 @@ function createBridge(options = {}) {
       bufferedStatusTarget,
       activeSession?.status || projectActiveSession?.status || pendingProjectRow?.status || selected?.status || "idle",
     );
-	    const projectRowIsLiveRequest =
-	      projectId &&
-	      projectActiveSession &&
-	      state.selectedSession &&
-	      sessionMatches(state.selectedSession, projectActiveSession.id);
-	    if (projectId && !projectRowIsLiveRequest) {
-	      res.json({
+    const projectRowIsLiveRequest =
+      projectId &&
+      projectActiveSession &&
+      state.selectedSession &&
+      sessionMatches(state.selectedSession, projectActiveSession.id);
+    if (projectId && !projectRowIsLiveRequest) {
+      res.json({
         messages: [],
         state: directStatus?.state || bufferedStatus,
-	        sessionId,
-	        activeSessionId: projectActiveSession?.id || undefined,
-	        pendingSessionId: pendingProjectRow?.id || undefined,
-	        projectActiveSessionId: projectActiveSession ? `${PROJECT_ACTIVE_SESSION_PREFIX}${projectId}` : undefined,
-	        provider: directStatus?.provider || projectActiveSession?.provider || provider.name,
-	      });
-	      return;
-	    }
-	    res.json({
+        sessionId,
+        activeSessionId: projectActiveSession?.id || undefined,
+        pendingSessionId: pendingProjectRow?.id || undefined,
+        projectActiveSessionId: projectActiveSession ? `${PROJECT_ACTIVE_SESSION_PREFIX}${projectId}` : undefined,
+        provider: directStatus?.provider || provider.name,
+      });
+      return;
+    }
+    res.json({
       messages: getMessages(state, sessionId, Number.isFinite(after) ? after : 0),
       state:
         directStatus?.state ||
@@ -3681,6 +3766,11 @@ function createBridge(options = {}) {
     const activeProjectEventsId = projectIdFromActiveSessionId(sessionId);
     if (activeProjectEventsId) {
       const activeSession = activeSessionForProject(state, activeProjectEventsId);
+      if (activeSession?.id) addSessionAlias(state, activeSession.id, sessionId);
+    }
+    const projectEventsId = projectIdFromSessionId(sessionId);
+    if (projectEventsId) {
+      const activeSession = activeSessionForProject(state, projectEventsId);
       if (activeSession?.id) addSessionAlias(state, activeSession.id, sessionId);
     }
     res.setHeader("Content-Type", "text/event-stream");

@@ -2192,7 +2192,8 @@ test("stale active history from another project does not replace current session
   const sessions = await request(baseUrl, `/api/sessions?token=${TOKEN}`, { token: null });
   const sessionsBody = await sessions.json();
   assert.equal(sessionsBody.selectedProject.id, "p_beta");
-  assert.equal(sessionsBody.selectedSession.id, "codex-thread-2");
+  assert.equal(sessionsBody.selectedSession.id, "project-session:p_beta");
+  assert.equal(sessionsBody.selectedSession.activeSessionId, "codex-thread-2");
   assert.equal(sessionsBody.sessions[1].id, "project-session:p_beta");
 });
 
@@ -2237,6 +2238,81 @@ test("simulator client sees delayed result from prompt response without EventSou
   assert.equal(submitted.mode, "session");
   assert.equal(submitted.status, "idle");
   assert.match(submitted.glassesText, /answer for: what is 2 plus 2 plus 2/);
+});
+
+test("sessions poll includes active session result for glasses session view", async (t) => {
+  const { baseUrl } = await withBridge(t, {
+    agentBackend: "codex_app_server",
+    createCodexAgentProvider: fakeCodexAgentProvider({ asyncResultMs: 40 }),
+    mirrorCodexTui: false,
+    showProjectsFirst: true,
+  });
+
+  await request(baseUrl, "/api/sessions/project:p_alpha/history");
+  const prompt = await request(baseUrl, "/api/prompt", {
+    body: {
+      sessionId: "project:p_alpha",
+      text: "what does 3 + 2",
+      clientRequestId: "codex-sessions-poll-result",
+    },
+  });
+  assert.equal(prompt.status, 202);
+
+  const sessions = await request(baseUrl, `/api/sessions?token=${TOKEN}`, { token: null });
+  const body = await sessions.json();
+
+  assert.equal(body.view, "session");
+  assert.equal(body.state, "idle");
+  assert.equal(body.selectedSession.id, "project-session:p_alpha");
+  assert.equal(body.selectedSession.activeSessionId, "codex-thread-1");
+  assert.equal(body.selectedSession.status, "idle");
+  assert.equal(body.selectedSession.codex.status, "idle");
+  assert.equal(body.selectedSession.latestOutput, "answer for: what does 3 + 2");
+  assert.equal(body.text, "answer for: what does 3 + 2");
+  assert.equal(body.output.text, "answer for: what does 3 + 2");
+  assert.equal(body.history.at(-1).text, "answer for: what does 3 + 2");
+  assert.equal(
+    body.messages.find((message) => message.type === "result")?.text,
+    "answer for: what does 3 + 2",
+  );
+});
+
+test("project row polling exposes active codex result without re-entering session", async (t) => {
+  const { baseUrl } = await withBridge(t, {
+    agentBackend: "codex_app_server",
+    createCodexAgentProvider: fakeCodexAgentProvider({
+      asyncResultMs: 10,
+      promptReturnDelayMs: 60,
+    }),
+    mirrorCodexTui: false,
+    showProjectsFirst: true,
+  });
+
+  await request(baseUrl, "/api/sessions/project:p_alpha/history");
+  const prompt = await request(baseUrl, "/api/prompt", {
+    body: {
+      sessionId: "project:p_alpha",
+      text: "project row answer race",
+      clientRequestId: "codex-project-row-answer-race",
+    },
+  });
+  assert.equal(prompt.status, 202);
+
+  const projectMessages = await request(baseUrl, "/api/messages?sessionId=project:p_alpha");
+  const projectMessagesBody = await projectMessages.json();
+  assert.equal(projectMessagesBody.state, "idle");
+  assert.equal(projectMessagesBody.activeSessionId, "codex-thread-1");
+  assert.equal(
+    projectMessagesBody.messages.find((message) => message.type === "result")?.text,
+    "answer for: project row answer race",
+  );
+
+  const activeMessages = await request(baseUrl, "/api/messages?sessionId=project-session:p_alpha");
+  const activeMessagesBody = await activeMessages.json();
+  assert.equal(
+    activeMessagesBody.messages.find((message) => message.type === "result")?.text,
+    "answer for: project row answer race",
+  );
 });
 
 test("simulator client can create a Morpheus project session and read the stream", async (t) => {
