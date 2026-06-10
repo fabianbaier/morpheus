@@ -903,18 +903,6 @@ async function projectSessionMenuRows(provider, state, config, project, limit) {
   };
 }
 
-function projectSessionMenuHistory(project, sessions) {
-  const projectName = String(project?.name || project?.id || project?.tenant_id || "project");
-  const visibleSessions = (Array.isArray(sessions) ? sessions : [])
-    .filter((session) => !isProjectMenuSessionId(session?.id))
-    .slice(0, 8);
-  const text = visibleSessions.length
-    ? [`Sessions in ${projectName}:`, ...visibleSessions.map((session) => `/ ${session.title || session.id}`)].join("\n")
-    : `No sessions in ${projectName} yet. Use Add session to start one.`;
-
-  return [{ role: "assistant", text }];
-}
-
 function pendingProjectPromptHistory(pendingRow) {
   const title = String(pendingRow?.title || "").replace(/^G2:\s*/i, "").trim();
   return title ? [{ role: "user", text: title }] : [];
