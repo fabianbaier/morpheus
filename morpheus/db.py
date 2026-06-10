@@ -2525,12 +2525,9 @@ def all_loops(include_paused: bool = True, tenant_id: str = "") -> list[PromptLo
                 ("tenant_id", [tenant_id]),
                 ("id", loop_ids),
             ])
-            legacy_scope = "(tenant_id = '' AND target_mission_id = '' AND target_tab_id IS NULL)"
             if loop_scope:
-                conditions.append(f"({loop_scope} OR {legacy_scope})")
+                conditions.append(f"({loop_scope})")
                 params.extend(loop_params)
-            else:
-                conditions.append(legacy_scope)
         query = "SELECT * FROM prompt_loops"
         if conditions:
             query += " WHERE " + " AND ".join(conditions)
@@ -2545,17 +2542,30 @@ def get_loop(loop_id: int) -> Optional[PromptLoop]:
     return _row_to_prompt_loop(row) if row else None
 
 
-def due_loops(now: Optional[float] = None, limit: int = 10) -> list[PromptLoop]:
+def due_loops(now: Optional[float] = None, limit: int = 10, tenant_id: str = "") -> list[PromptLoop]:
     ts = now or time.time()
     with _connect() as conn:
+        params: list[Any] = [ts]
+        conditions = ["status = 'active'", "next_run_at <= ?"]
+        if tenant_id:
+            mission_ids, tab_ids, _session_ids = _project_tenant_related_ids(conn, tenant_id)
+            loop_ids = _project_tenant_loop_ids(conn, mission_ids, tab_ids, tenant_id=tenant_id)
+            loop_scope, loop_params = _or_in_conditions([
+                ("tenant_id", [tenant_id]),
+                ("id", loop_ids),
+            ])
+            if loop_scope:
+                conditions.append(f"({loop_scope})")
+                params.extend(loop_params)
+        params.append(limit)
         rows = conn.execute(
-            """
+            f"""
             SELECT * FROM prompt_loops
-             WHERE status = 'active' AND next_run_at <= ?
+             WHERE {" AND ".join(conditions)}
              ORDER BY next_run_at ASC
              LIMIT ?
             """,
-            (ts, limit),
+            tuple(params),
         ).fetchall()
     return [_row_to_prompt_loop(row) for row in rows]
 

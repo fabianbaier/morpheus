@@ -29,13 +29,16 @@ DURATION_RE = re.compile(
     re.IGNORECASE,
 )
 CONCLUSION_RE = re.compile(
-    r"\b(answer|summary|bottom line|recommend|done|fixed|shipped|implemented|next step)\b",
+    r"\b(answer|summary|headline|bottom line|recommend|done|fixed|shipped|implemented|next step)\b",
     re.IGNORECASE,
 )
 NOISE_PREFIXES = (
+    "reading additional input from stdin",
+    "openai codex",
     "searching the web",
     "thinking",
     "working",
+    "web search:",
     "sources:",
     "source:",
     "use /skills to list",
@@ -46,6 +49,18 @@ NOISE_PREFIXES = (
     "cwd:",
     "[loop ",
 )
+CODEX_CHROME_PREFIXES = (
+    "workdir:",
+    "model:",
+    "provider:",
+    "approval:",
+    "sandbox:",
+    "reasoning effort:",
+    "reasoning summaries:",
+    "session id:",
+    "token usage:",
+)
+CODEX_ROLE_MARKERS = {"assistant", "developer", "system", "user"}
 CODEX_EXEC_RE = re.compile(r"^codex\s+exec(?=\s|$)")
 
 
@@ -116,13 +131,10 @@ def normalize_command(command: str) -> str:
     return command
 
 
-def summarize_output(stdout: str, stderr: str = "", width: int = 160) -> str:
-    body = stdout.strip() or stderr.strip()
+def summarize_output(stdout: str, stderr: str = "", width: int = 160, prompt: str = "") -> str:
+    lines = visible_output_lines(stdout, prompt=prompt) or visible_output_lines(stderr, prompt=prompt)
     candidates: list[tuple[int, str]] = []
-    for index, raw in enumerate(body.splitlines()):
-        line = _clean_line(raw)
-        if not line or _is_noise(line):
-            continue
+    for index, line in enumerate(lines):
         score = index
         if CONCLUSION_RE.search(line):
             score += 100
@@ -136,15 +148,31 @@ def summarize_output(stdout: str, stderr: str = "", width: int = 160) -> str:
     return line if len(line) <= width else line[: width - 1] + "…"
 
 
+def visible_output_lines(output: str, *, prompt: str = "") -> list[str]:
+    """Return human-visible result lines from a loop output transcript."""
+    prompt_text = _clean_line(prompt)
+    assistant_lines = _latest_codex_assistant_lines(output.splitlines(), prompt=prompt_text)
+    if assistant_lines:
+        return assistant_lines
+    lines: list[str] = []
+    for raw in output.splitlines():
+        line = _clean_line(raw)
+        if not line or _is_noise(line, prompt=prompt_text):
+            continue
+        lines.append(line)
+    return lines
+
+
 def run_due(
     *,
     limit: int = 5,
     timeout: int = DEFAULT_TIMEOUT_SECONDS,
     now: Optional[float] = None,
     cwd: Optional[Path] = None,
+    tenant_id: str = "",
 ) -> list[db.PromptLoopRun]:
     runs: list[db.PromptLoopRun] = []
-    for loop in db.due_loops(now=now, limit=limit):
+    for loop in db.due_loops(now=now, limit=limit, tenant_id=tenant_id):
         runs.append(run_loop(loop, timeout=timeout, cwd=cwd))
     return runs
 
@@ -191,7 +219,7 @@ def run_loop(
         exit_code = completed.returncode
         if completed.returncode != 0:
             status = "failed"
-        summary = summarize_output(_read_output(output_path))
+        summary = summarize_output(_read_output(output_path), prompt=loop.prompt)
     except subprocess.TimeoutExpired:
         status = "timeout"
         exit_code = None
@@ -342,12 +370,43 @@ def _clean_line(value: str) -> str:
     return " ".join(value.strip().split())
 
 
-def _is_noise(line: str) -> bool:
+def _latest_codex_assistant_lines(raw_lines: list[str], *, prompt: str = "") -> list[str]:
+    sections: list[list[str]] = []
+    current: Optional[list[str]] = None
+    for raw in raw_lines:
+        line = _clean_line(raw)
+        lowered = line.lower()
+        if lowered == "assistant":
+            if current:
+                sections.append(current)
+            current = []
+            continue
+        if lowered in CODEX_ROLE_MARKERS:
+            if current:
+                sections.append(current)
+            current = None
+            continue
+        if current is not None and not _is_noise(line, prompt=prompt):
+            current.append(line)
+    if current:
+        sections.append(current)
+    return sections[-1] if sections else []
+
+
+def _is_noise(line: str, *, prompt: str = "") -> bool:
     lowered = line.lower()
     if len(line) < 3:
         return True
+    if lowered in CODEX_ROLE_MARKERS:
+        return True
     if any(lowered.startswith(prefix) for prefix in NOISE_PREFIXES):
         return True
+    if any(lowered.startswith(prefix) for prefix in CODEX_CHROME_PREFIXES):
+        return True
+    if prompt:
+        prompt_lower = prompt.lower()
+        if len(line) > 20 and (lowered in prompt_lower or prompt_lower in lowered):
+            return True
     if lowered.startswith("searched "):
         return True
     if "http://" in lowered or "https://" in lowered:

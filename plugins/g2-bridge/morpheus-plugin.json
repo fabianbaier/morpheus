@@ -1,0 +1,36 @@
+{
+  "id": "g2-bridge",
+  "name": "Even Realities G2 Bridge",
+  "version": "0.1.0",
+  "description": "Even Terminal-inspired bridge for controlling Morpheus from Even Realities G2 glasses.",
+  "runtime": {
+    "type": "node",
+    "entry": "src/server.mjs"
+  },
+  "upstream_inspiration": {
+    "name": "@evenrealities/even-terminal",
+    "version_checked": "0.8.1",
+    "url": "https://www.npmjs.com/package/@evenrealities/even-terminal"
+  },
+  "capabilities": {
+    "read_status": true,
+    "stage_note": true,
+    "list_projects": true,
+    "select_project": true,
+    "spawn_session": "project_gated",
+    "submit_prompt": "spawn_or_stage_note",
+    "interrupt": "selected_session_only",
+    "approval_response": false,
+    "terminal_keystrokes": false,
+    "spawn": false,
+    "kill": false,
+    "push": false,
+    "merge": false,
+    "external_send": false
+  },
+  "transport": {
+    "default_bind_host": "127.0.0.1",
+    "recommended_exposure": "tailscale-serve",
+    "public_tunnel_default": false
+  }
+}

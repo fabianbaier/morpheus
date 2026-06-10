@@ -43,6 +43,7 @@ class DaemonTest(unittest.TestCase):
             self.assertIn("<string>7</string>", text)
             self.assertIn("<string>--timeout</string>", text)
             self.assertIn("<string>42</string>", text)
+            self.assertIn("<string>--all-projects</string>", text)
             self.assertIn("<key>StartInterval</key>", text)
             self.assertIn("<integer>60</integer>", text)
             self.assertIn(["launchctl", "load", "-w", str(plist)], calls)

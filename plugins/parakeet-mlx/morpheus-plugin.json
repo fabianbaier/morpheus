@@ -1,0 +1,22 @@
+{
+  "id": "parakeet-mlx",
+  "name": "Parakeet MLX ASR",
+  "version": "0.1.0",
+  "description": "Local Apple Silicon speech-to-text adapter using senstella/parakeet-mlx.",
+  "runtime": {
+    "type": "python",
+    "entry": "morpheus_parakeet.stream_jsonl:main"
+  },
+  "upstream": {
+    "name": "senstella/parakeet-mlx",
+    "version_checked": "0.5.2",
+    "url": "https://github.com/senstella/parakeet-mlx"
+  },
+  "capabilities": {
+    "audio_pcm16le_16khz_mono": true,
+    "streaming_transcription": true,
+    "local_only": true,
+    "submits_prompts": false,
+    "approval_response": false
+  }
+}

@@ -102,6 +102,95 @@ class TenantTest(unittest.TestCase):
 
         self.assertEqual([loop.name for loop in loops_a], ["project a loop"])
 
+    def test_tenant_scoped_loops_hide_legacy_targetless_loops(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            db_dir = root / "db"
+            project = db.ProjectTenant(
+                tenant_id=tenant.tenant_id_for_root(root / "a"),
+                name="a",
+                root_path=str(root / "a"),
+                root_kind="cwd",
+            )
+
+            with patch.object(db, "DB_DIR", db_dir), patch.object(db, "DB_PATH", db_dir / "morpheus.db"):
+                project = db.upsert_project_tenant(project)
+                db.create_loop(
+                    "legacy global loop",
+                    "prompt",
+                    60,
+                    "codex exec",
+                )
+                db.create_loop(
+                    "project loop",
+                    "prompt",
+                    60,
+                    "codex exec",
+                    tenant_id=project.tenant_id,
+                    project_root=project.root_path,
+                )
+
+                scoped = db.all_loops(tenant_id=project.tenant_id)
+                global_rows = db.all_loops()
+
+        self.assertEqual([loop.name for loop in scoped], ["project loop"])
+        self.assertEqual({loop.name for loop in global_rows}, {"legacy global loop", "project loop"})
+
+    def test_due_loops_can_be_filtered_by_project_tenant(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            db_dir = root / "db"
+            project_a = db.ProjectTenant(
+                tenant_id=tenant.tenant_id_for_root(root / "a"),
+                name="a",
+                root_path=str(root / "a"),
+                root_kind="cwd",
+            )
+            project_b = db.ProjectTenant(
+                tenant_id=tenant.tenant_id_for_root(root / "b"),
+                name="b",
+                root_path=str(root / "b"),
+                root_kind="cwd",
+            )
+
+            with patch.object(db, "DB_DIR", db_dir), patch.object(db, "DB_PATH", db_dir / "morpheus.db"):
+                project_a = db.upsert_project_tenant(project_a)
+                project_b = db.upsert_project_tenant(project_b)
+                db.create_loop(
+                    "legacy global loop",
+                    "prompt",
+                    60,
+                    "printf legacy",
+                    next_run_at=1,
+                )
+                db.create_loop(
+                    "project a loop",
+                    "prompt",
+                    60,
+                    "printf a",
+                    tenant_id=project_a.tenant_id,
+                    project_root=project_a.root_path,
+                    next_run_at=1,
+                )
+                db.create_loop(
+                    "project b loop",
+                    "prompt",
+                    60,
+                    "printf b",
+                    tenant_id=project_b.tenant_id,
+                    project_root=project_b.root_path,
+                    next_run_at=1,
+                )
+
+                due_a = db.due_loops(now=2, limit=5, tenant_id=project_a.tenant_id)
+                due_global = db.due_loops(now=2, limit=5)
+
+        self.assertEqual([loop.name for loop in due_a], ["project a loop"])
+        self.assertEqual(
+            {loop.name for loop in due_global},
+            {"legacy global loop", "project a loop", "project b loop"},
+        )
+
     def test_db_backfills_legacy_loop_project_from_target_memory(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

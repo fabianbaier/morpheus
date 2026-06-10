@@ -120,3 +120,6 @@ tempCodeRunnerFile.py
 .morpheus/
 morpheus.db
 *.morpheus.log
+
+# JavaScript plugin dependencies
+plugins/*/node_modules/

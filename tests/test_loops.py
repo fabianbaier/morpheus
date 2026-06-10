@@ -27,6 +27,40 @@ class LoopsTest(unittest.TestCase):
 
         self.assertEqual(command, "codex exec --skip-git-repo-check ok")
 
+    def test_summarize_output_prefers_codex_assistant_headline_over_prompt(self) -> None:
+        prompt = "Can you give me a brief headline summary on current worldwide news?"
+        output = "\n".join(
+            [
+                "$ codex exec --skip-git-repo-check 'news'",
+                "started: 2026-05-21 09:57:00",
+                "Reading additional input from stdin...",
+                "OpenAI Codex v0.132.0",
+                "--------",
+                "workdir: /tmp/project",
+                "model: gpt-5.5",
+                "provider: openai",
+                "approval: never",
+                "sandbox: danger-full-access",
+                "reasoning effort: xhigh",
+                "session id: 019e4824-ec9a-7ce0-bf54-0b29e9b42f86",
+                "--------",
+                "user",
+                prompt,
+                "assistant",
+                "Headline: global markets are watching central-bank signals and AI earnings.",
+                "Sources: https://example.com/news",
+                "[loop success; exit=0]",
+            ]
+        )
+
+        summary = loops.summarize_output(output, prompt=prompt)
+
+        self.assertEqual(
+            summary,
+            "Headline: global markets are watching central-bank signals and AI earnings.",
+        )
+        self.assertNotIn("Can you give me", summary)
+
     def test_create_loop_defaults_first_run_due_immediately(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)

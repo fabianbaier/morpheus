@@ -244,6 +244,22 @@ Runtime pieces:
   see sibling sessions.
 - `morpheus/mcp_server.py` exposes sessions, mission graph read/update tools,
   notes/claims, spend, and action history to Claude Code / Codex via MCP.
+- `morpheus/remote.py` emits compact ChatGPT/mobile/glasses-ready snapshots,
+  attention cards, and a bounded operator-note write surface.
+
+### ChatGPT / Remote App Draft
+
+```bash
+morpheus remote snapshot
+morpheus remote cards
+morpheus remote manifest
+morpheus remote widget --preview --out /tmp/morpheus-live-card.html
+```
+
+The remote surface is designed for ChatGPT Apps/voice and eventual device
+bridges. It exposes crisp read tools plus a bounded Morpheus note write, and
+does not expose spawn, kill, push, merge, approve, or external-send actions
+until a confirmation gateway exists. See [`docs/chatgpt-app.md`](docs/chatgpt-app.md).
 
 ## Mission Graph
 

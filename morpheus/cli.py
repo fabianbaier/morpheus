@@ -31,6 +31,8 @@ app = typer.Typer(
 console = Console()
 projects_app = typer.Typer(help="List, prune, and delete project tenants.")
 app.add_typer(projects_app, name="projects")
+remote_app = typer.Typer(help="ChatGPT Apps / remote-device bridge helpers.")
+app.add_typer(remote_app, name="remote")
 
 
 # ───────── default entry: launch dashboard ─────────
@@ -108,6 +110,52 @@ def _resolve_project_ref(ref: str) -> tuple[Optional[db.ProjectTenant], str]:
         return None, f"ambiguous project id prefix '{ref}' ({ids})"
 
     return None, f"unknown project '{ref}'"
+
+
+def _remote_tenant_id(all_projects: bool = False, project_ref: Optional[str] = None) -> Optional[str]:
+    tenant_mod.backfill_known_tenants()
+    if project_ref:
+        project, error = _resolve_project_ref(project_ref)
+        if project is None:
+            console.print(f"[red]{escape(error)}[/red]")
+            raise typer.Exit(1)
+        return project.tenant_id
+    if all_projects:
+        return None
+    return tenant_mod.ensure_project_tenant(Path.cwd()).tenant_id
+
+
+def _project_usage_dict(usage: db.ProjectTenantUsage) -> dict:
+    return {
+        "live_sessions": usage.live_sessions,
+        "memories": usage.memories,
+        "active_memories": usage.active_memories,
+        "archived_memories": usage.archived_memories,
+        "events": usage.events,
+        "artifacts": usage.artifacts,
+        "edges": usage.edges,
+        "notes": usage.notes,
+        "goal_runs": usage.goal_runs,
+        "goal_tasks": usage.goal_tasks,
+        "loops": usage.loops,
+        "loop_runs": usage.loop_runs,
+        "graph_rows": usage.graph_rows,
+    }
+
+
+def _remote_project_row(project: db.ProjectTenant) -> dict:
+    usage = db.project_tenant_usage(project.tenant_id)
+    return {
+        "id": project.tenant_id,
+        "tenant_id": project.tenant_id,
+        "name": project.name or project.tenant_id,
+        "root_path": project.root_path,
+        "root_kind": project.root_kind,
+        "created_at": project.created_at,
+        "last_seen_at": project.last_seen_at,
+        "archived": bool(project.archived_at),
+        "usage": _project_usage_dict(usage),
+    }
 
 
 def _usage_cell(usage: db.ProjectTenantUsage) -> str:
@@ -765,9 +813,12 @@ def loops_add(
 @loops_app.command("list")
 def loops_list(
     all_statuses: bool = typer.Option(False, "--all", "-a", help="Include paused loops."),
+    all_projects: bool = typer.Option(False, "--all-projects", help="Show loops from every project tenant."),
 ):
     """List configured prompt loops."""
-    rows = db.all_loops(include_paused=all_statuses)
+    project = None if all_projects else tenant_mod.ensure_project_tenant(Path.cwd())
+    tenant_id = "" if project is None else project.tenant_id
+    rows = db.all_loops(include_paused=all_statuses, tenant_id=tenant_id)
     if not rows:
         console.print("[dim]no loops configured yet[/dim]")
         return
@@ -827,9 +878,12 @@ def loops_run_due(
     limit: int = typer.Option(5, "--limit", "-n", help="Maximum due loops to run."),
     timeout: int = typer.Option(loops_mod.DEFAULT_TIMEOUT_SECONDS, "--timeout", help="Seconds before one loop run times out."),
     dry_run: bool = typer.Option(False, "--dry-run", help="Show due loops without running them."),
+    all_projects: bool = typer.Option(False, "--all-projects", help="Run due loops from every project tenant."),
 ):
     """Run due loops once. Put this command behind cron/launchd."""
-    due = db.due_loops(limit=limit)
+    project = None if all_projects else tenant_mod.ensure_project_tenant(Path.cwd())
+    tenant_id = "" if project is None else project.tenant_id
+    due = db.due_loops(limit=limit, tenant_id=tenant_id)
     if dry_run:
         if not due:
             console.print("[dim]no loops due[/dim]")
@@ -838,7 +892,7 @@ def loops_run_due(
             console.print(f"#{loop.id} {loop.name} due now")
         return
     daemon_mod.write_loop_runner_beacon()
-    runs = loops_mod.run_due(limit=limit, timeout=timeout)
+    runs = loops_mod.run_due(limit=limit, timeout=timeout, tenant_id=tenant_id)
     daemon_mod.write_loop_runner_beacon()
     if not runs:
         console.print("[dim]no loops due[/dim]")
@@ -1703,6 +1757,383 @@ def context(
         md = ctx_mod.build_markdown(self_tab, self_session, tenant_id=tenant_id)
         # Render with Rich's markdown for terminal display.
         console.print(Markdown(md))
+
+
+@remote_app.command("snapshot")
+def remote_snapshot(
+    limit: int = typer.Option(8, "--limit", min=1, max=12, help="Maximum attention cards to include."),
+    all_projects: bool = typer.Option(False, "--all", help="Show the global fleet instead of the cwd project."),
+    project: Optional[str] = typer.Option(None, "--project", help="Project tenant id, name, or path."),
+    compact: bool = typer.Option(False, "--compact", help="Print compact JSON."),
+):
+    """Print the compact remote snapshot ChatGPT/mobile/glasses surfaces should read."""
+    from morpheus import remote as remote_mod
+
+    tenant_id = _remote_tenant_id(all_projects=all_projects, project_ref=project)
+    snapshot = remote_mod.fleet_snapshot(limit=limit, tenant_id=tenant_id)
+    if compact:
+        sys.stdout.write(json.dumps(snapshot, separators=(",", ":")) + "\n")
+    else:
+        console.print_json(json.dumps(snapshot))
+
+
+@remote_app.command("projects")
+def remote_projects(
+    limit: int = typer.Option(12, "--limit", min=1, max=50, help="Maximum projects to include."),
+    include_archived: bool = typer.Option(False, "--include-archived", help="Include archived project tenants."),
+    compact: bool = typer.Option(False, "--compact", help="Print compact JSON."),
+):
+    """Print project tenants for compact remote/glasses navigation."""
+    tenant_mod.backfill_known_tenants()
+    current = tenant_mod.ensure_project_tenant(Path.cwd())
+    projects = db.all_project_tenants(include_archived=include_archived)[:limit]
+    result = {
+        "current_project_id": current.tenant_id,
+        "projects": [_remote_project_row(project) for project in projects],
+    }
+    if compact:
+        sys.stdout.write(json.dumps(result, separators=(",", ":")) + "\n")
+    else:
+        console.print_json(json.dumps(result))
+
+
+@remote_app.command("cards")
+def remote_cards(
+    limit: int = typer.Option(8, "--limit", min=1, max=12, help="Maximum attention cards to include."),
+    all_projects: bool = typer.Option(False, "--all", help="Show the global fleet instead of the cwd project."),
+    project: Optional[str] = typer.Option(None, "--project", help="Project tenant id, name, or path."),
+    compact: bool = typer.Option(False, "--compact", help="Print compact JSON."),
+):
+    """Print only push-worthy attention cards."""
+    from morpheus import remote as remote_mod
+
+    tenant_id = _remote_tenant_id(all_projects=all_projects, project_ref=project)
+    cards = remote_mod.attention_cards(limit=limit, tenant_id=tenant_id)
+    if compact:
+        sys.stdout.write(json.dumps(cards, separators=(",", ":")) + "\n")
+    else:
+        console.print_json(json.dumps(cards))
+
+
+@remote_app.command("brief")
+def remote_brief(
+    ref: str = typer.Argument(..., help="Session tab_ref or mission_ref."),
+    event_limit: int = typer.Option(5, "--events", min=0, max=12, help="Recent graph events to include."),
+    all_projects: bool = typer.Option(False, "--all", help="Search the global fleet instead of the cwd project."),
+    project: Optional[str] = typer.Option(None, "--project", help="Project tenant id, name, or path."),
+):
+    """Print a raw-buffer-free brief for one remote-visible session."""
+    from morpheus import remote as remote_mod
+
+    tenant_id = _remote_tenant_id(all_projects=all_projects, project_ref=project)
+    result = remote_mod.session_brief(ref, tenant_id=tenant_id, event_limit=event_limit)
+    if not result.get("found"):
+        console.print(f"[red]{escape(str(result.get('error', 'not found')))}[/red]")
+        raise typer.Exit(1)
+        console.print_json(json.dumps(result))
+
+
+@remote_app.command("spawn")
+def remote_spawn(
+    goal: str = typer.Argument(..., help="One-line goal for the new remote-started session."),
+    command: str = typer.Option("codex", "--cmd", "-c", help="Command to run, e.g. codex."),
+    prompt: Optional[str] = typer.Option(
+        None,
+        "--prompt",
+        help="Initial user prompt to pass to prompt-aware commands like codex.",
+    ),
+    project: Optional[str] = typer.Option(None, "--project", help="Project tenant id, name, or path."),
+    compact: bool = typer.Option(False, "--compact", help="Print compact JSON."),
+):
+    """Spawn a new Morpheus/iTerm session for a remote surface."""
+    tenant_mod.backfill_known_tenants()
+    if project:
+        resolved, error = _resolve_project_ref(project)
+        if resolved is None:
+            console.print(f"[red]{escape(error)}[/red]")
+            raise typer.Exit(1)
+    else:
+        resolved = tenant_mod.ensure_project_tenant(Path.cwd())
+
+    initial_prompt = goal if prompt is None else prompt
+    launch_command = tenant_mod.command_with_prompt_in_project(command, resolved.root_path, initial_prompt)
+    payload: dict = {}
+
+    async def _do(connection):
+        nonlocal payload
+        info = await iterm_client.spawn_tab(connection, command=launch_command, goal=goal)
+        if info is None:
+            payload = {"ok": False, "error": "failed to spawn tab"}
+            return
+        now = time.time()
+        mission = db.Mission(
+            tab_id=info.tab_id,
+            session_id=info.session_id,
+            tenant_id=resolved.tenant_id,
+            project_root=resolved.root_path,
+            goal=goal,
+            state="working",
+            cmd=launch_command,
+            linked_worktree=resolved.root_path,
+            buffer_changed_at=now,
+            last_event_at=now,
+            created_at=now,
+        )
+        db.upsert(mission)
+        ledger_mod.log_action(
+            "remote_spawn_session",
+            tab_id=mission.tab_id,
+            details={
+                "goal": goal,
+                "cmd": command,
+                "tenant_id": resolved.tenant_id,
+                "project_root": resolved.root_path,
+                "prompt_chars": len(initial_prompt),
+            },
+        )
+        payload = {
+            "ok": True,
+            "session": {
+                "tab_ref": mission.tab_id.split("-")[0],
+                "mission_ref": mission.mission_id[:12] if mission.mission_id else "",
+                "tab_id": mission.tab_id,
+                "mission_id": mission.mission_id,
+                "session_id": mission.session_id,
+                "state": mission.state,
+                "goal": mission.goal,
+                "cmd": command,
+                "launch_cmd": launch_command,
+                "prompt_chars": len(initial_prompt),
+                "project": _remote_project_row(resolved),
+            },
+        }
+
+    iterm_client.run(_do)
+    if not payload.get("ok"):
+        if compact:
+            sys.stdout.write(json.dumps(payload, separators=(",", ":")) + "\n")
+        else:
+            console.print_json(json.dumps(payload))
+        raise typer.Exit(1)
+    if compact:
+        sys.stdout.write(json.dumps(payload, separators=(",", ":")) + "\n")
+    else:
+        console.print_json(json.dumps(payload))
+
+
+@remote_app.command("note")
+def remote_note(
+    text: str = typer.Argument(..., help="Short operator note text."),
+    target: Optional[str] = typer.Option(None, "--target", help="Optional session tab_ref or mission_ref."),
+    kind: str = typer.Option("note", "--kind", help="note | broadcast | claim"),
+    all_projects: bool = typer.Option(False, "--all", help="Search the global fleet instead of the cwd project."),
+    project: Optional[str] = typer.Option(None, "--project", help="Project tenant id, name, or path."),
+):
+    """Stage a bounded operator note through the remote-control surface."""
+    from morpheus import remote as remote_mod
+
+    tenant_id = _remote_tenant_id(all_projects=all_projects, project_ref=project)
+    result = remote_mod.stage_operator_note(text, target_ref=target, kind=kind, tenant_id=tenant_id)
+    if not result.get("ok"):
+        console.print(f"[red]{escape(str(result.get('error', 'note failed')))}[/red]")
+        raise typer.Exit(1)
+    console.print_json(json.dumps(result))
+
+
+def _remote_ref_to_mission(ref: str, *, tenant_id: Optional[str] = None) -> tuple[Optional[db.Mission], str]:
+    from morpheus import remote as remote_mod
+
+    return remote_mod._find_mission(ref, tenant_id=tenant_id)
+
+
+def _remote_prompt_allowed(mission: db.Mission) -> bool:
+    cmd = (mission.cmd or "").lower()
+    return "codex" in cmd
+
+
+@remote_app.command("prompt")
+def remote_prompt(
+    text: str = typer.Argument(..., help="Bounded prompt text to submit to a managed Codex session."),
+    target: str = typer.Option(..., "--target", help="Session tab_ref or mission_ref."),
+    project: Optional[str] = typer.Option(None, "--project", help="Project tenant id, name, or path."),
+    compact: bool = typer.Option(False, "--compact", help="Print compact JSON."),
+):
+    """Submit prompt text to an existing Morpheus-managed Codex/iTerm session."""
+    from morpheus import remote as remote_mod
+
+    clean_text = " ".join(str(text or "").split())
+    if not clean_text:
+        payload = {"ok": False, "error": "empty prompt"}
+        if compact:
+            sys.stdout.write(json.dumps(payload, separators=(",", ":")) + "\n")
+        else:
+            console.print_json(json.dumps(payload))
+        raise typer.Exit(1)
+    if len(clean_text) > 2000:
+        payload = {"ok": False, "error": "prompt too long"}
+        if compact:
+            sys.stdout.write(json.dumps(payload, separators=(",", ":")) + "\n")
+        else:
+            console.print_json(json.dumps(payload))
+        raise typer.Exit(1)
+
+    tenant_id = _remote_tenant_id(project_ref=project)
+    mission, error = _remote_ref_to_mission(target, tenant_id=tenant_id)
+    if mission is None:
+        payload = {"ok": False, "error": error}
+        if compact:
+            sys.stdout.write(json.dumps(payload, separators=(",", ":")) + "\n")
+        else:
+            console.print_json(json.dumps(payload))
+        raise typer.Exit(1)
+    if not _remote_prompt_allowed(mission):
+        payload = {"ok": False, "error": "target is not a managed Codex session"}
+        if compact:
+            sys.stdout.write(json.dumps(payload, separators=(",", ":")) + "\n")
+        else:
+            console.print_json(json.dumps(payload))
+        raise typer.Exit(1)
+
+    submitted: dict = {}
+
+    async def _do(connection):
+        nonlocal submitted
+        results = await iterm_client.send_text_to_tabs(
+            connection,
+            [mission.tab_id],
+            iterm_client.text_with_enter(clean_text),
+        )
+        result = results[0] if results else None
+        submitted = {
+            "ok": bool(result and result.ok),
+            "error": "" if result and result.ok else (result.error if result else "send returned no result"),
+        }
+
+    iterm_client.run(_do)
+    if not submitted.get("ok"):
+        payload = {"ok": False, "error": submitted.get("error", "send failed")}
+        if compact:
+            sys.stdout.write(json.dumps(payload, separators=(",", ":")) + "\n")
+        else:
+            console.print_json(json.dumps(payload))
+        raise typer.Exit(1)
+
+    note_id = db.add_note(
+        text=remote_mod._shorten(clean_text, 240),
+        tab_id=mission.tab_id,
+        session_id=mission.session_id,
+        kind="prompt",
+    )
+    ledger_mod.log_action(
+        "remote_prompt_sent",
+        tab_id=mission.tab_id,
+        details={"target": target, "text_chars": len(clean_text), "note_id": note_id},
+    )
+    payload = {
+        "ok": True,
+        "target": {
+            "tab_ref": mission.tab_id.split("-")[0],
+            "mission_ref": mission.mission_id[:12] if mission.mission_id else "",
+            "state": mission.state,
+        },
+        "text_chars": len(clean_text),
+        "note_id": note_id,
+    }
+    if compact:
+        sys.stdout.write(json.dumps(payload, separators=(",", ":")) + "\n")
+    else:
+        console.print_json(json.dumps(payload))
+
+
+@remote_app.command("output")
+def remote_output(
+    ref: str = typer.Argument(..., help="Session tab_ref or mission_ref."),
+    project: Optional[str] = typer.Option(None, "--project", help="Project tenant id, name, or path."),
+    lines: int = typer.Option(10, "--lines", min=1, max=30, help="Clean output lines to return."),
+    compact: bool = typer.Option(False, "--compact", help="Print compact JSON."),
+):
+    """Return a cleaned latest-output view for one remote-visible session."""
+    from morpheus import remote as remote_mod
+
+    tenant_id = _remote_tenant_id(project_ref=project)
+    mission, error = _remote_ref_to_mission(ref, tenant_id=tenant_id)
+
+    payload: dict = {}
+
+    async def _do(connection):
+        nonlocal payload
+        tabs = await iterm_client.enumerate_tabs(connection)
+        ref_text = str(ref or "").strip()
+        target_tab_id = mission.tab_id if mission is not None else ref_text
+        tab = next((candidate for candidate in tabs if candidate.tab_id == target_tab_id), None)
+        if tab is None and ref_text:
+            tab = next(
+                (
+                    candidate
+                    for candidate in tabs
+                    if candidate.tab_id.startswith(ref_text)
+                    or ref_text in (candidate.current_name or "")
+                    or ref_text == candidate.session_id
+                ),
+                None,
+            )
+        if tab is None:
+            payload = {"ok": False, "error": error if mission is None else "tab not found"}
+            return
+        cleaned = remote_mod.clean_terminal_output(tab.buffer, line_limit=lines)
+        payload = {
+            "ok": True,
+            "session": {
+                "tab_ref": (mission.tab_id if mission is not None else tab.tab_id).split("-")[0],
+                "mission_ref": mission.mission_id[:12] if mission is not None and mission.mission_id else "",
+                "state": mission.state if mission is not None else "unknown",
+                "goal": mission.goal if mission is not None else tab.current_name,
+            },
+            "output": cleaned,
+        }
+
+    iterm_client.run(_do)
+    if not payload.get("ok"):
+        if compact:
+            sys.stdout.write(json.dumps(payload, separators=(",", ":")) + "\n")
+        else:
+            console.print_json(json.dumps(payload))
+        raise typer.Exit(1)
+    if compact:
+        sys.stdout.write(json.dumps(payload, separators=(",", ":")) + "\n")
+    else:
+        console.print_json(json.dumps(payload))
+
+
+@remote_app.command("manifest")
+def remote_manifest(
+    compact: bool = typer.Option(False, "--compact", help="Print compact JSON."),
+):
+    """Print the draft Apps/MCP manifest and tool descriptors."""
+    from morpheus import remote as remote_mod
+
+    manifest = remote_mod.app_manifest()
+    if compact:
+        sys.stdout.write(json.dumps(manifest, separators=(",", ":")) + "\n")
+    else:
+        console.print_json(json.dumps(manifest))
+
+
+@remote_app.command("widget")
+def remote_widget(
+    out: Optional[Path] = typer.Option(None, "--out", help="Write HTML to this path."),
+    preview: bool = typer.Option(False, "--preview", help="Render a standalone preview page."),
+):
+    """Print or write the ChatGPT Apps live-card widget template."""
+    from morpheus import remote as remote_mod
+
+    html_text = remote_mod.html_preview() if preview else remote_mod.widget_html()
+    if out:
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(html_text, encoding="utf-8")
+        console.print(f"[green]wrote[/green] {out}")
+        return
+    console.print(html_text, markup=False)
 
 
 @app.command("activity")

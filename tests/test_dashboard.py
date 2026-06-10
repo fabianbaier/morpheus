@@ -233,8 +233,19 @@ class DashboardTest(unittest.IsolatedAsyncioTestCase):
                 "$ codex exec 'summarize tomorrow'\n"
                 "started: 2026-05-20 21:00:00\n"
                 "cwd: /tmp/project\n"
+                "Reading additional input from stdin...\n"
+                "OpenAI Codex v0.132.0\n"
+                "--------\n"
+                "workdir: /tmp/project\n"
+                "model: gpt-5.5\n"
+                "provider: openai\n"
+                "reasoning effort: xhigh\n"
+                "session id: 019e4824-ec9a-7ce0-bf54-0b29e9b42f86\n"
+                "--------\n"
+                "user\n"
                 "\n"
                 "summarize tomorrow's market catalysts and blockers\n"
+                "assistant\n"
                 "Result headline: WMT remains in the disciplined zone.\n"
                 "Second result line with a catalyst.\n"
                 "\n"
@@ -269,6 +280,8 @@ class DashboardTest(unittest.IsolatedAsyncioTestCase):
             self.assertIn("LATEST RESULT", rendered)
             self.assertIn("Result headline: WMT remains", rendered)
             self.assertIn("Second result line", rendered)
+            self.assertNotIn("OpenAI Codex", rendered)
+            self.assertNotIn("workdir:", rendered)
             self.assertNotIn("PROMPT", rendered)
             self.assertNotIn("RUNS", rendered)
             self.assertNotIn("summarize tomorrow's market catalysts", rendered)
@@ -313,6 +326,46 @@ class DashboardTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(app.alerts), 0)
         self.assertEqual(app.last_seen_tabs, {"tab-python-14"})
         self.assertIn("tab-python-14", app.flashing)
+
+    def test_all_missions_hides_passive_python_spawn_noise(self) -> None:
+        app = DashboardHarness()
+        python_spawn = dashboard.db.Mission(
+            tab_id="tab-python-14",
+            goal='Python"',
+            state="working",
+            cmd="",
+        )
+        real_session = dashboard.db.Mission(
+            tab_id="tab-codex",
+            goal="codex task",
+            state="working",
+            cmd="codex",
+        )
+
+        with patch.object(dashboard.db, "all_missions", new=lambda tenant_id=None: [python_spawn, real_session]):
+            missions = app._all_missions()
+
+        self.assertEqual([mission.tab_id for mission in missions], ["tab-codex"])
+
+    async def test_passive_python_spawn_does_not_fill_live_buffer(self) -> None:
+        app = DashboardHarness()
+        mission = dashboard.db.Mission(
+            tab_id="tab-python-14",
+            goal='Python"',
+            state="working",
+            cmd="",
+        )
+        tab = dashboard.iterm_client.TabInfo(
+            tab_id=mission.tab_id,
+            session_id="session-python-14",
+            window_id="window-123",
+            current_name='Python"',
+            buffer="",
+        )
+
+        await app._on_tab_observed(tab, mission, SimpleNamespace(last_event="active output"))
+
+        self.assertNotIn("tab-python-14", app.live_buffers)
 
     def test_edit_mission_screen_parses_claims_and_pr(self) -> None:
         memory = dashboard.db.MissionMemory(
@@ -3050,51 +3103,62 @@ class DashboardTest(unittest.IsolatedAsyncioTestCase):
 
     def test_scan_new_loop_runs_posts_white_rabbit_alert(self) -> None:
         app = DashboardHarness()
-        loop = dashboard.db.PromptLoop(
-            id=7,
-            name="market scan",
-            prompt="summarize catalysts",
-            interval_seconds=900,
-            command="codex exec",
-            next_run_at=0,
-        )
-        running = dashboard.db.PromptLoopRun(
-            id=4,
-            loop_id=loop.id,
-            started_at=1,
-            finished_at=0,
-            status="running",
-            exit_code=None,
-            output_path="/tmp/running.txt",
-            summary="run started",
-        )
-        finished = dashboard.db.PromptLoopRun(
-            id=5,
-            loop_id=loop.id,
-            started_at=2,
-            finished_at=3,
-            status="success",
-            exit_code=0,
-            output_path="/tmp/done.txt",
-            summary="WMT disciplined zone",
-        )
+        with tempfile.TemporaryDirectory() as tmp:
+            output_path = Path(tmp) / "done.txt"
+            output_path.write_text(
+                "OpenAI Codex v0.132.0\n"
+                "user\n"
+                "summarize catalysts\n"
+                "assistant\n"
+                "Headline: WMT disciplined zone.\n",
+                encoding="utf-8",
+            )
+            loop = dashboard.db.PromptLoop(
+                id=7,
+                name="market scan",
+                prompt="summarize catalysts",
+                interval_seconds=900,
+                command="codex exec",
+                next_run_at=0,
+            )
+            running = dashboard.db.PromptLoopRun(
+                id=4,
+                loop_id=loop.id,
+                started_at=1,
+                finished_at=0,
+                status="running",
+                exit_code=None,
+                output_path="/tmp/running.txt",
+                summary="run started",
+            )
+            finished = dashboard.db.PromptLoopRun(
+                id=5,
+                loop_id=loop.id,
+                started_at=2,
+                finished_at=3,
+                status="success",
+                exit_code=0,
+                output_path=str(output_path),
+                summary="summarize catalysts",
+            )
 
-        with patch.object(app, "_visible_loops", new=lambda: [loop]), patch.object(
-            dashboard.db, "loop_runs", new=lambda loop_id, limit=5: [running]
-        ):
-            app._scan_new_loop_runs()
-        self.assertEqual(list(app.alerts), [])
-        self.assertNotIn(running.id, app.alerted_loop_run_ids)
+            with patch.object(app, "_visible_loops", new=lambda: [loop]), patch.object(
+                dashboard.db, "loop_runs", new=lambda loop_id, limit=5: [running]
+            ):
+                app._scan_new_loop_runs()
+            self.assertEqual(list(app.alerts), [])
+            self.assertNotIn(running.id, app.alerted_loop_run_ids)
 
-        with patch.object(app, "_visible_loops", new=lambda: [loop]), patch.object(
-            dashboard.db, "loop_runs", new=lambda loop_id, limit=5: [finished, running]
-        ):
-            app._scan_new_loop_runs()
+            with patch.object(app, "_visible_loops", new=lambda: [loop]), patch.object(
+                dashboard.db, "loop_runs", new=lambda loop_id, limit=5: [finished, running]
+            ):
+                app._scan_new_loop_runs()
 
         self.assertIn(finished.id, app.alerted_loop_run_ids)
         self.assertNotIn(running.id, app.alerted_loop_run_ids)
         self.assertEqual(app.alerts[0].kind, "summary")
-        self.assertIn("↻ loop [market scan] success: WMT disciplined zone", app.alerts[0].text)
+        self.assertIn("↻ loop [market scan] success: Headline: WMT disciplined zone.", app.alerts[0].text)
+        self.assertNotIn("success: summarize catalysts", app.alerts[0].text)
 
         with patch.object(app, "_visible_loops", new=lambda: [loop]), patch.object(
             dashboard.db, "loop_runs", new=lambda loop_id, limit=5: [finished, running]

@@ -1,0 +1,18 @@
+{
+  "name": "@morpheus/g2-bridge",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Even Terminal-compatible G2 bridge for Morpheus.",
+  "scripts": {
+    "start": "node src/server.mjs",
+    "dev": "node src/server.mjs",
+    "check": "node --check src/server.mjs",
+    "test": "node --test test/*.test.mjs"
+  },
+  "dependencies": {
+    "@evenrealities/even-terminal": "0.8.1",
+    "express": "^5.2.1",
+    "qrcode-terminal": "^0.12.0"
+  }
+}

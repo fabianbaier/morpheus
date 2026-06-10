@@ -116,6 +116,12 @@ PASSIVE_SPAWN_GOALS = {
     "terminal",
     "iterm2",
 }
+TRANSIENT_SPAWN_GOALS = {
+    "python",
+    "python\"",
+    "python3",
+    "python3\"",
+}
 
 # Stock-ticker row background colors (entire row paints this color for ~3s
 # after a state change, then settles back to default).
@@ -738,6 +744,20 @@ def _is_passive_spawn_noise(mission: db.Mission) -> bool:
         return False
     goal = _clean_terminal_line(mission.goal or "").strip().lower()
     return goal in PASSIVE_SPAWN_GOALS
+
+
+def _is_transient_spawn_noise(mission: db.Mission) -> bool:
+    if mission.cmd:
+        return False
+    goal = _clean_terminal_line(mission.goal or "").strip().lower()
+    return goal in TRANSIENT_SPAWN_GOALS
+
+
+def _is_visible_session_mission(mission: db.Mission) -> bool:
+    return (
+        not db.is_loop_run_mission_id(mission.mission_id)
+        and not _is_transient_spawn_noise(mission)
+    )
 
 
 def _session_headline(
@@ -2999,17 +3019,18 @@ class LoopManagerScreen(ModalScreen[Optional[LoopActionRequest]]):
 
 def _loop_run_response_lines(run: db.PromptLoopRun, *, fallback: str = "", prompt: str = "") -> list[str]:
     text = _loop_run_output_text(run)
-    prompt_text = _clean_terminal_line(prompt)
-    lines: list[str] = []
-    for raw in text.splitlines():
-        line = _clean_terminal_line(raw)
-        if not line or _is_loop_output_noise(line, prompt=prompt_text):
-            continue
-        lines.append(line)
+    lines = loops_mod.visible_output_lines(text, prompt=prompt)
     if not lines:
         fallback_text = fallback or ("run is still writing output" if run.status == "running" else "no visible response recorded")
         lines = [fallback_text]
     return lines
+
+
+def _loop_run_alert_summary(loop: db.PromptLoop, run: db.PromptLoopRun) -> str:
+    output = _loop_run_output_text(run)
+    if output.strip():
+        return loops_mod.summarize_output(output, prompt=loop.prompt)
+    return run.summary or "loop completed with no summary"
 
 
 def _loop_run_output_text(run: db.PromptLoopRun) -> str:
@@ -3019,17 +3040,6 @@ def _loop_run_output_text(run: db.PromptLoopRun) -> str:
         return Path(run.output_path).read_text(encoding="utf-8", errors="replace")
     except Exception:
         return ""
-
-
-def _is_loop_output_noise(line: str, *, prompt: str = "") -> bool:
-    lowered = line.lower()
-    return (
-        lowered.startswith("$ ")
-        or lowered.startswith("started:")
-        or lowered.startswith("cwd:")
-        or lowered.startswith("[loop ")
-        or (bool(prompt) and len(line) > 20 and line in prompt)
-    )
 
 
 class LoopOutputScreen(ModalScreen[None]):
@@ -3513,7 +3523,7 @@ class MorpheusApp(App):
             missions = db.all_missions()
         return [
             mission for mission in missions
-            if not db.is_loop_run_mission_id(mission.mission_id)
+            if _is_visible_session_mission(mission)
         ]
 
     def _all_memory(self, include_archived: bool = False) -> list[db.MissionMemory]:
@@ -3529,7 +3539,7 @@ class MorpheusApp(App):
         return db.recent_notes(limit=limit)
 
     def _mission_in_scope(self, mission: db.Mission) -> bool:
-        if db.is_loop_run_mission_id(mission.mission_id):
+        if not _is_visible_session_mission(mission):
             return False
         tenant_id = self._tenant_filter()
         return not tenant_id or mission.tenant_id == tenant_id
@@ -4026,7 +4036,7 @@ class MorpheusApp(App):
         fresh.sort(key=lambda item: item[1].finished_at or item[1].started_at)
         for loop, run in fresh:
             self.alerted_loop_run_ids.add(run.id)
-            summary = run.summary or "loop completed with no summary"
+            summary = _loop_run_alert_summary(loop, run)
             kind = "summary" if run.status == "success" else "error"
             self._push_alert(Alert(
                 run.finished_at or time.time(),

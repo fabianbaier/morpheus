@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "morpheus-plugin-parakeet-mlx"
+version = "0.1.0"
+description = "Morpheus plugin adapter for local Parakeet MLX streaming transcription."
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+dependencies = [
+    "numpy>=2.2.5",
+    "parakeet-mlx>=0.5.2",
+]
+
+[project.scripts]
+morpheus-parakeet-stream = "morpheus_parakeet.stream_jsonl:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["morpheus_parakeet*"]

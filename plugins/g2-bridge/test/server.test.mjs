@@ -1,0 +1,1545 @@
+import assert from "node:assert/strict";
+import fs from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import test from "node:test";
+import { createBridge } from "../src/server.mjs";
+
+const TOKEN = "test-token-123456";
+const FIXTURE = fileURLToPath(new URL("./fixtures/mock-morpheus.mjs", import.meta.url));
+
+function silentLogger() {
+  return {
+    log() {},
+    warn() {},
+    error() {},
+  };
+}
+
+function fixtureAuditPath(name) {
+  return path.join(tmpdir(), `morpheus-g2-${process.pid}-${name}.jsonl`);
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function withBridge(t, options = {}) {
+  fs.chmodSync(FIXTURE, 0o755);
+  const auditPath = fixtureAuditPath(t.name.replace(/[^A-Za-z0-9_-]/g, "_"));
+  fs.rmSync(auditPath, { force: true });
+  const bridge = createBridge({
+    token: TOKEN,
+    morpheusBin: FIXTURE,
+    allowedOrigins: ["https://phone.example"],
+    publicUrl: "https://mac.tailnet.ts.net",
+    agentBackend: "morpheus",
+    showProjectsFirst: false,
+    auditPath,
+    logger: silentLogger(),
+    ...options,
+  });
+  const server = await new Promise((resolve) => {
+    const started = bridge.app.listen(0, "127.0.0.1", () => resolve(started));
+  });
+  t.after(() => {
+    server.close();
+    fs.rmSync(auditPath, { force: true });
+  });
+  const port = server.address().port;
+  return { ...bridge, baseUrl: `http://127.0.0.1:${port}`, auditPath };
+}
+
+function fakeCodexAgentProvider({
+  seedSessions = [],
+  history = null,
+  asyncResultMs = 0,
+  promptReturnDelayMs = 0,
+  throwOnProjectHistory = false,
+} = {}) {
+  const sessions = [...seedSessions];
+  let nextId = 1;
+
+  return (emit) => ({
+    async getInfo() {
+      return { provider: "codex", model: "Codex", version: "test" };
+    },
+
+    async listSessions(_limit, cwd) {
+      return sessions.filter((session) => !cwd || session.cwd === cwd);
+    },
+
+    getStatus(sessionId) {
+      const session = sessions.find((item) => item.id === sessionId);
+      return session ? { state: session.status, provider: "codex" } : null;
+    },
+
+    async getSessionStatus(sessionId) {
+      return sessions.find((item) => item.id === sessionId)?.status || "idle";
+    },
+
+    async getHistory(sessionId, limit) {
+      if (throwOnProjectHistory && String(sessionId).startsWith("project:")) {
+        throw new Error("thread not found");
+      }
+      const entries = history?.[sessionId] || [];
+      return entries.slice(-Math.max(1, limit || 10));
+    },
+
+    async prompt(sessionId, text, cwd) {
+      const id = sessionId || `codex-thread-${nextId++}`;
+      let session = sessions.find((item) => item.id === id);
+      if (!session) {
+        session = {
+          id,
+          title: `G2: ${text}`,
+          timestamp: new Date(1_779_999_999_000).toISOString(),
+          cwd,
+          status: "busy",
+        };
+        sessions.unshift(session);
+      }
+      session.status = "busy";
+      emit(id, { type: "status", state: "busy", provider: "codex", sessionId: id });
+      const finish = () => {
+        emit(id, {
+          type: "result",
+          success: true,
+          text: `answer for: ${text}`,
+          provider: "codex",
+          sessionId: id,
+        });
+        session.status = "idle";
+        emit(id, { type: "status", state: "idle", provider: "codex", sessionId: id });
+      };
+      const resultDelayMs = typeof asyncResultMs === "function" ? asyncResultMs(text, id) : asyncResultMs;
+      if (resultDelayMs > 0) {
+        const timer = setTimeout(finish, resultDelayMs);
+        if (typeof timer.unref === "function") timer.unref();
+      } else {
+        finish();
+      }
+      if (promptReturnDelayMs > 0) {
+        await new Promise((resolve) => setTimeout(resolve, promptReturnDelayMs));
+      }
+      return { sessionId: id, provider: "codex" };
+    },
+  });
+}
+
+async function request(baseUrl, pathname, options = {}) {
+  const headers = { ...(options.headers || {}) };
+  if (options.token !== null) {
+    headers.Authorization = `Bearer ${options.token || TOKEN}`;
+  }
+  if (options.origin) {
+    headers.Origin = options.origin;
+  }
+  let body;
+  if (options.body !== undefined) {
+    headers["Content-Type"] = "application/json";
+    body = JSON.stringify(options.body);
+  }
+  return fetch(`${baseUrl}${pathname}`, {
+    method: options.method || (body ? "POST" : "GET"),
+    headers,
+    body,
+  });
+}
+
+async function readStreamUntil(body, needle, timeoutMs = 1000) {
+  const reader = body.getReader();
+  const decoder = new TextDecoder();
+  let text = "";
+  try {
+    while (!text.includes(needle)) {
+      let timer;
+      const timeout = new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`Timed out waiting for ${needle}`)), Math.max(1, timeoutMs));
+        if (typeof timer.unref === "function") timer.unref();
+      });
+      const chunk = await Promise.race([reader.read(), timeout]).finally(() => clearTimeout(timer));
+      if (chunk.done) break;
+      text += decoder.decode(chunk.value, { stream: true });
+    }
+    return text;
+  } finally {
+    await reader.cancel().catch(() => {});
+  }
+}
+
+async function readStreamFor(body, durationMs = 100) {
+  const reader = body.getReader();
+  const decoder = new TextDecoder();
+  let text = "";
+  const until = Date.now() + Math.max(1, durationMs);
+  try {
+    while (Date.now() < until) {
+      let timer;
+      const timeout = new Promise((resolve) => {
+        timer = setTimeout(() => resolve({ done: true, value: null }), Math.max(1, until - Date.now()));
+        if (typeof timer.unref === "function") timer.unref();
+      });
+      const chunk = await Promise.race([reader.read(), timeout]).finally(() => clearTimeout(timer));
+      if (chunk.done) break;
+      text += decoder.decode(chunk.value, { stream: true });
+    }
+    return text;
+  } finally {
+    await reader.cancel().catch(() => {});
+  }
+}
+
+test("rejects unauthenticated API reads", async (t) => {
+  const { baseUrl } = await withBridge(t);
+  const res = await request(baseUrl, "/api/sessions", { token: null });
+  assert.equal(res.status, 401);
+});
+
+test("accepts Even app query-token authentication", async (t) => {
+  const { baseUrl } = await withBridge(t);
+  const res = await request(baseUrl, `/api/sessions?token=${TOKEN}`, { token: null });
+  assert.equal(res.status, 200);
+  const body = await res.json();
+  assert.equal(body.sessions[0].id, "abc123");
+});
+
+test("exposes Even Terminal compatible status endpoint", async (t) => {
+  const { baseUrl } = await withBridge(t);
+  const res = await request(baseUrl, `/api/status?token=${TOKEN}`, { token: null });
+  assert.equal(res.status, 200);
+  const body = await res.json();
+  assert.equal(body.state, "idle");
+  assert.equal(body.provider, "morpheus");
+});
+
+test("refreshes status for a requested session id without selecting it", async (t) => {
+  const { baseUrl } = await withBridge(t);
+  const res = await request(baseUrl, `/api/status?sessionId=abc123&token=${TOKEN}`, {
+    token: null,
+  });
+  assert.equal(res.status, 200);
+  const body = await res.json();
+  assert.equal(body.sessionId, "abc123");
+  assert.equal(body.state, "idle");
+  assert.equal(body.provider, "codex");
+  assert.equal(body.selectedSession, null);
+});
+
+test("can expose projects as G2 session rows first", async (t) => {
+  const { baseUrl } = await withBridge(t, { showProjectsFirst: true });
+  const res = await request(baseUrl, `/api/sessions?token=${TOKEN}`, { token: null });
+  assert.equal(res.status, 200);
+  const body = await res.json();
+  assert.equal(body.mode, "projects");
+  assert.equal(body.sessions[0].id, "project:p_alpha");
+  assert.equal(body.sessions[0].title, "alpha");
+  assert.equal(body.sessions[0].provider, "codex");
+  assert.equal(body.sessions[0].status, "idle");
+  assert.equal(body.sessions[0].cwd, "/tmp/morpheus-alpha");
+});
+
+test("selects a project and then lists project sessions", async (t) => {
+  const { baseUrl } = await withBridge(t, { showProjectsFirst: true });
+  const select = await request(baseUrl, "/api/select-project", {
+    body: { projectId: "p_alpha" },
+  });
+  assert.equal(select.status, 200);
+  assert.equal((await select.json()).selectedProject.id, "p_alpha");
+
+  const sessions = await request(baseUrl, `/api/sessions?token=${TOKEN}`, { token: null });
+  assert.equal(sessions.status, 200);
+  const body = await sessions.json();
+  assert.equal(body.mode, "sessions");
+  assert.equal(body.sessions[0].id, "nav:projects");
+  assert.equal(body.sessions[0].title, "Back to projects");
+  assert.equal(body.sessions[1].id, "abc123");
+  assert.equal(body.sessions[1].provider, "codex");
+  assert.equal(body.selectedProject.id, "p_alpha");
+});
+
+test("rejects unlisted browser origins before processing API requests", async (t) => {
+  const { baseUrl } = await withBridge(t);
+  const res = await request(baseUrl, "/api/info", { origin: "https://evil.example" });
+  assert.equal(res.status, 403);
+  assert.equal((await res.json()).code, "origin_not_allowed");
+});
+
+test("allows listed origins and returns policy metadata", async (t) => {
+  const { baseUrl } = await withBridge(t);
+  const res = await request(baseUrl, "/api/info", { origin: "https://phone.example" });
+  assert.equal(res.status, 200);
+  assert.equal(res.headers.get("access-control-allow-origin"), "https://phone.example");
+  const body = await res.json();
+  assert.equal(body.publicUrl, "https://mac.tailnet.ts.net");
+  assert.equal(body.policy.rawTerminalKeystrokes, false);
+  assert.equal(body.policy.remoteApprovals, false);
+  assert.equal(body.policy.promptBehavior, "spawn_or_send_prompt");
+  assert.equal(body.policy.interruptNavigatesBack, true);
+});
+
+test("spawns a session for prompt submission without an existing selected session", async (t) => {
+  const { baseUrl } = await withBridge(t);
+  await request(baseUrl, "/api/select-project", {
+    body: { projectId: "p_beta", clientRequestId: "select-empty-project" },
+  });
+  const res = await request(baseUrl, "/api/prompt", {
+    body: { text: "hello", clientRequestId: "prompt-0001" },
+  });
+  assert.equal(res.status, 202);
+  const body = await res.json();
+  assert.equal(body.action, "spawn_session");
+  assert.equal(body.sessionId, "g2spawn");
+  assert.equal(body.result.session.prompt, "hello");
+
+  const messages = await request(baseUrl, "/api/messages?sessionId=g2spawn");
+  const messageBody = await messages.json();
+  const resultMessage = messageBody.messages.find((message) => message.type === "result");
+  assert.match(resultMessage.text, /current directory tree/);
+});
+
+test("rejects prompt without selected project or session context", async (t) => {
+  const { baseUrl } = await withBridge(t);
+  const res = await request(baseUrl, "/api/prompt", {
+    body: { text: "follow up please", clientRequestId: "prompt-followup-0001" },
+  });
+  assert.equal(res.status, 409);
+  const body = await res.json();
+  assert.equal(body.code, "project_not_selected");
+});
+
+test("continues selected session when app posts the project row again", async (t) => {
+  const { baseUrl } = await withBridge(t, { showProjectsFirst: true });
+  await request(baseUrl, "/api/select-project", {
+    body: { projectId: "p_alpha", clientRequestId: "project-followup-select-project" },
+  });
+  await request(baseUrl, "/api/select-session", {
+    body: { sessionId: "abc123", clientRequestId: "project-followup-select-session" },
+  });
+
+  const res = await request(baseUrl, "/api/prompt", {
+    body: {
+      sessionId: "project:p_alpha",
+      text: "same session please",
+      clientRequestId: "project-followup-prompt",
+    },
+  });
+  assert.equal(res.status, 202);
+  const body = await res.json();
+  assert.equal(body.action, "send_prompt");
+  assert.equal(body.sessionId, "abc123");
+});
+
+test("selects a session and sends bounded prompt text idempotently", async (t) => {
+  const { baseUrl, auditPath } = await withBridge(t);
+  const select = await request(baseUrl, "/api/select-session", {
+    body: { sessionId: "abc123", clientRequestId: "select-0001" },
+  });
+  assert.equal(select.status, 200);
+  assert.equal((await select.json()).selectedSession.id, "abc123");
+
+  const prompt = await request(baseUrl, "/api/prompt", {
+    body: {
+      sessionId: "abc123",
+      text: "put this in the Morpheus operator notes",
+      clientRequestId: "prompt-0002",
+    },
+  });
+  assert.equal(prompt.status, 202);
+  const promptBody = await prompt.json();
+  assert.equal(promptBody.action, "send_prompt");
+  assert.equal(promptBody.result.ok, true);
+  assert.equal(promptBody.result.text_chars, 39);
+
+  const replay = await request(baseUrl, "/api/prompt", {
+    body: {
+      sessionId: "abc123",
+      text: "put this in the Morpheus operator notes",
+      clientRequestId: "prompt-0002",
+    },
+  });
+  assert.equal(replay.status, 202);
+  assert.equal((await replay.json()).duplicate, true);
+
+  const messages = await request(baseUrl, "/api/messages?sessionId=abc123");
+  const messageBody = await messages.json();
+  const promptMessage = messageBody.messages.find((message) => message.type === "prompt_submitted");
+  assert.equal(promptMessage.text, undefined);
+  assert.equal(promptMessage.textChars, 39);
+  assert.match(promptMessage.textHash, /^[a-f0-9]{64}$/);
+
+  const audit = fs.readFileSync(auditPath, "utf8");
+  assert.match(audit, /remote_prompt_sent/);
+  assert.doesNotMatch(audit, /put this in the Morpheus operator notes/);
+});
+
+test("accepts finalized transcript through the same safe prompt path", async (t) => {
+  const { baseUrl } = await withBridge(t);
+  await request(baseUrl, "/api/select-session", {
+    body: { sessionId: "missionalpha", clientRequestId: "select-0002" },
+  });
+  const res = await request(baseUrl, "/api/transcript/finalize", {
+    body: {
+      text: "voice final transcript only",
+      clientRequestId: "utterance-0001",
+    },
+  });
+  assert.equal(res.status, 202);
+  const body = await res.json();
+  assert.equal(body.action, "send_prompt");
+  assert.equal(body.sessionId, "abc123");
+});
+
+test("navigates back from a G2 session directly to projects by default", async (t) => {
+  const { baseUrl } = await withBridge(t, { showProjectsFirst: true });
+  await request(baseUrl, "/api/select-project", {
+    body: { projectId: "p_alpha", clientRequestId: "nav-select-project" },
+  });
+  await request(baseUrl, "/api/select-session", {
+    body: { sessionId: "abc123", clientRequestId: "nav-select-session" },
+  });
+
+  const selected = await request(baseUrl, "/api/navigation");
+  assert.equal((await selected.json()).view, "session");
+
+  const backOne = await request(baseUrl, "/api/back", {
+    body: { clientRequestId: "nav-back-1" },
+  });
+  assert.equal(backOne.status, 200);
+  const backOneBody = await backOne.json();
+  assert.equal(backOneBody.from, "session");
+  assert.equal(backOneBody.to, "projects");
+  assert.equal(backOneBody.selectedProject, null);
+  assert.equal(backOneBody.selectedSession, null);
+
+  const projects = await request(baseUrl, `/api/sessions?token=${TOKEN}`, { token: null });
+  const projectsBody = await projects.json();
+  assert.equal(projectsBody.mode, "projects");
+  assert.equal(projectsBody.sessions[0].id, "project:p_alpha");
+});
+
+test("two-step back navigation remains available when direct mode is disabled", async (t) => {
+  const { baseUrl } = await withBridge(t, {
+    showProjectsFirst: true,
+    directBackToProjects: false,
+  });
+  await request(baseUrl, "/api/select-project", {
+    body: { projectId: "p_alpha", clientRequestId: "nav-two-step-select-project-2" },
+  });
+  await request(baseUrl, "/api/select-session", {
+    body: { sessionId: "abc123", clientRequestId: "nav-two-step-select-session-2" },
+  });
+
+  const backOne = await request(baseUrl, "/api/back", {
+    body: { clientRequestId: "nav-two-step-back-one" },
+  });
+  const backOneBody = await backOne.json();
+  assert.equal(backOneBody.from, "session");
+  assert.equal(backOneBody.to, "sessions");
+  assert.equal(backOneBody.selectedProject.id, "p_alpha");
+  assert.equal(backOneBody.selectedSession, null);
+
+  const sessions = await request(baseUrl, `/api/sessions?token=${TOKEN}`, { token: null });
+  const sessionsBody = await sessions.json();
+  assert.equal(sessionsBody.mode, "sessions");
+  assert.equal(sessionsBody.sessions[0].id, "nav:projects");
+  assert.equal(sessionsBody.sessions[1].id, "abc123");
+
+  const backTwo = await request(baseUrl, "/api/interrupt", {
+    body: { clientRequestId: "nav-two-step-back-two" },
+  });
+  const backTwoBody = await backTwo.json();
+  assert.equal(backTwoBody.from, "sessions");
+  assert.equal(backTwoBody.to, "projects");
+});
+
+test("duplicate in-flight back gesture replays instead of navigating twice", async (t) => {
+  const { baseUrl } = await withBridge(t, {
+    agentBackend: "codex_app_server",
+    createCodexAgentProvider: fakeCodexAgentProvider(),
+    directBackToProjects: false,
+    mirrorCodexTui: false,
+    showProjectsFirst: true,
+  });
+  await request(baseUrl, "/api/select-project", {
+    body: { projectId: "p_alpha", clientRequestId: "nav-duplicate-back-select-project" },
+  });
+  await request(baseUrl, "/api/prompt", {
+    body: { text: "session for duplicate back", clientRequestId: "nav-duplicate-back-prompt" },
+  });
+
+  const [one, two] = await Promise.all([
+    request(baseUrl, "/api/back", {
+      body: { clientRequestId: "nav-duplicate-back-same-id" },
+    }),
+    request(baseUrl, "/api/back", {
+      body: { clientRequestId: "nav-duplicate-back-same-id" },
+    }),
+  ]);
+  assert.equal(one.status, 200);
+  assert.equal(two.status, 200);
+  const bodies = [await one.json(), await two.json()];
+  assert.equal(bodies.every((body) => body.to === "sessions"), true);
+  assert.equal(bodies.some((body) => body.duplicate === true), true);
+
+  const navigation = await request(baseUrl, "/api/navigation");
+  assert.equal((await navigation.json()).view, "sessions");
+});
+
+test("project menu row returns from sessions to projects", async (t) => {
+  const { baseUrl } = await withBridge(t, { showProjectsFirst: true });
+  await request(baseUrl, "/api/select-project", {
+    body: { projectId: "p_alpha", clientRequestId: "nav-row-select-project" },
+  });
+
+  const sessions = await request(baseUrl, `/api/sessions?token=${TOKEN}`, { token: null });
+  const sessionsBody = await sessions.json();
+  assert.equal(sessionsBody.sessions[0].id, "nav:projects");
+
+  const selectNav = await request(baseUrl, "/api/select-session", {
+    body: { sessionId: "nav:projects", clientRequestId: "nav-row-select" },
+  });
+  assert.equal(selectNav.status, 200);
+  const selectNavBody = await selectNav.json();
+  assert.equal(selectNavBody.view, "projects");
+  assert.equal(selectNavBody.selectedProject, null);
+
+  const projects = await request(baseUrl, `/api/sessions?token=${TOKEN}`, { token: null });
+  const projectsBody = await projects.json();
+  assert.equal(projectsBody.mode, "projects");
+  assert.equal(projectsBody.sessions[0].id, "project:p_alpha");
+});
+
+test("project menu history request returns to projects for stock Even row opens", async (t) => {
+  const { baseUrl } = await withBridge(t, { showProjectsFirst: true });
+  await request(baseUrl, "/api/select-project", {
+    body: { projectId: "p_alpha", clientRequestId: "nav-history-select-project" },
+  });
+
+  const history = await request(baseUrl, "/api/sessions/nav:projects/history");
+  assert.equal(history.status, 200);
+  const historyBody = await history.json();
+  assert.equal(historyBody.navigation.view, "projects");
+
+  const projects = await request(baseUrl, `/api/sessions?token=${TOKEN}`, { token: null });
+  const projectsBody = await projects.json();
+  assert.equal(projectsBody.mode, "projects");
+  assert.equal(projectsBody.sessions[0].id, "project:p_alpha");
+});
+
+test("spawns a local Morpheus session when prompting a project row", async (t) => {
+  const { baseUrl } = await withBridge(t, { showProjectsFirst: true });
+  const res = await request(baseUrl, "/api/prompt", {
+    body: {
+      sessionId: "project:p_beta",
+      text: "hey can you hear me",
+    },
+  });
+  assert.equal(res.status, 202);
+  const body = await res.json();
+  assert.equal(body.action, "spawn_session");
+  assert.equal(body.sessionId, "g2spawn");
+  assert.equal(body.selectedProject.id, "p_beta");
+  assert.equal(body.result.session.cmd, "codex");
+  assert.equal(body.result.session.prompt, "hey can you hear me");
+});
+
+test("codex app-server backend emits final results without terminal polling", async (t) => {
+  const { baseUrl } = await withBridge(t, {
+    agentBackend: "codex_app_server",
+    createCodexAgentProvider: fakeCodexAgentProvider(),
+    mirrorCodexTui: false,
+  });
+  await request(baseUrl, "/api/select-project", {
+    body: { projectId: "p_beta", clientRequestId: "codex-select-project" },
+  });
+
+  const res = await request(baseUrl, "/api/prompt", {
+    body: { text: "list the directory", clientRequestId: "codex-prompt-0001" },
+  });
+  assert.equal(res.status, 202);
+  const body = await res.json();
+  assert.equal(body.action, "spawn_session");
+  assert.equal(body.provider, "codex");
+  assert.equal(body.sessionId, "codex-thread-1");
+  assert.equal(body.text, "answer for: list the directory");
+  assert.equal(body.output.text, "answer for: list the directory");
+  assert.equal(body.state, "idle");
+  assert.equal(body.selectedSession.status, "idle");
+  assert.equal(body.selectedSession.promptBehavior, "send_prompt");
+
+  const messages = await request(baseUrl, "/api/messages?sessionId=codex-thread-1");
+  const messageBody = await messages.json();
+  const resultMessage = messageBody.messages.find((message) => message.type === "result");
+  assert.equal(resultMessage.text, "answer for: list the directory");
+  assert.equal(messageBody.state, "idle");
+
+  const history = await request(baseUrl, "/api/sessions/codex-thread-1/history");
+  const historyBody = await history.json();
+  assert.deepEqual(historyBody.history.at(-1), {
+    role: "assistant",
+    text: "answer for: list the directory",
+  });
+});
+
+test("codex app-server prompt response waits for delayed final result", async (t) => {
+  const { baseUrl } = await withBridge(t, {
+    agentBackend: "codex_app_server",
+    createCodexAgentProvider: fakeCodexAgentProvider({ asyncResultMs: 25 }),
+    mirrorCodexTui: false,
+    promptWaitForResultMs: 1000,
+  });
+  await request(baseUrl, "/api/select-project", {
+    body: { projectId: "p_beta", clientRequestId: "codex-delayed-select-project" },
+  });
+
+  const res = await request(baseUrl, "/api/prompt", {
+    body: { text: "delayed answer", clientRequestId: "codex-delayed-prompt" },
+  });
+  assert.equal(res.status, 202);
+  const body = await res.json();
+  assert.equal(body.sessionId, "codex-thread-1");
+  assert.equal(body.state, "idle");
+  assert.equal(body.text, "answer for: delayed answer");
+  assert.equal(body.history.at(-1).text, "answer for: delayed answer");
+});
+
+test("codex app-server backend mirrors results to project row and default message targets", async (t) => {
+  const { baseUrl } = await withBridge(t, {
+    agentBackend: "codex_app_server",
+    createCodexAgentProvider: fakeCodexAgentProvider(),
+    mirrorCodexTui: false,
+    showProjectsFirst: true,
+  });
+  await request(baseUrl, "/api/select-project", {
+    body: { projectId: "p_beta", clientRequestId: "codex-alias-select-project" },
+  });
+
+  const res = await request(baseUrl, "/api/prompt", {
+    body: {
+      sessionId: "project:p_beta",
+      text: "alias target please",
+      clientRequestId: "codex-alias-prompt",
+    },
+  });
+  assert.equal(res.status, 202);
+  const body = await res.json();
+  assert.equal(body.sessionId, "codex-thread-1");
+  assert.equal(body.activeSessionId, "codex-thread-1");
+  assert.equal(body.displaySessionId, "project-session:p_beta");
+
+  const actual = await request(baseUrl, "/api/messages?sessionId=codex-thread-1");
+  const actualBody = await actual.json();
+  assert.equal(actualBody.messages.find((message) => message.type === "result").text, "answer for: alias target please");
+
+  const projectAlias = await request(baseUrl, "/api/messages?sessionId=project:p_beta");
+  const projectAliasBody = await projectAlias.json();
+  assert.equal(
+    projectAliasBody.messages.find((message) => message.type === "result").text,
+    "answer for: alias target please",
+  );
+
+  const projectStatus = await request(baseUrl, "/api/status?sessionId=project:p_beta");
+  const projectStatusBody = await projectStatus.json();
+  assert.equal(projectStatusBody.sessionId, "project:p_beta");
+  assert.equal(projectStatusBody.activeSessionId, "codex-thread-1");
+  assert.equal(projectStatusBody.state, "idle");
+  assert.equal(projectStatusBody.selectedSession, null);
+
+  const projectHistory = await request(baseUrl, "/api/sessions/project:p_beta/history");
+  const projectHistoryBody = await projectHistory.json();
+  assert.deepEqual(projectHistoryBody.history, []);
+  assert.equal(projectHistoryBody.navigation.view, "sessions");
+  assert.equal(projectHistoryBody.selectedSession, null);
+
+  const activeHistory = await request(baseUrl, "/api/sessions/project-session:p_beta/history");
+  const activeHistoryBody = await activeHistory.json();
+  assert.equal(activeHistoryBody.history.at(-1).role, "assistant");
+  assert.equal(activeHistoryBody.history.at(-1).text, "answer for: alias target please");
+
+  const sessions = await request(baseUrl, `/api/sessions?token=${TOKEN}`, { token: null });
+  const sessionsBody = await sessions.json();
+  assert.equal(sessionsBody.sessions[0].id, "nav:projects");
+  assert.equal(sessionsBody.sessions[1].id, "project-session:p_beta");
+  assert.equal(sessionsBody.sessions[1].activeSessionId, "codex-thread-1");
+  assert.equal(sessionsBody.sessions[1].latestOutput, "answer for: alias target please");
+  assert.equal(sessionsBody.sessions[1].title, "answer for: alias target please");
+  assert.equal(sessionsBody.sessions.some((session) => session.id === "codex-thread-1"), false);
+
+  const defaultMessages = await request(baseUrl, "/api/messages");
+  const defaultBody = await defaultMessages.json();
+  assert.equal(
+    defaultBody.messages.find((message) => message.type === "result").text,
+    "answer for: alias target please",
+  );
+});
+
+test("project row messages stop exposing transcript output after leaving the session", async (t) => {
+  const { baseUrl } = await withBridge(t, {
+    agentBackend: "codex_app_server",
+    createCodexAgentProvider: fakeCodexAgentProvider(),
+    mirrorCodexTui: false,
+    showProjectsFirst: true,
+  });
+  await request(baseUrl, "/api/prompt", {
+    body: {
+      sessionId: "project:p_alpha",
+      text: "visible only while live",
+      clientRequestId: "codex-project-live-only",
+    },
+  });
+
+  const liveProjectMessages = await request(baseUrl, "/api/messages?sessionId=project:p_alpha");
+  const liveProjectBody = await liveProjectMessages.json();
+  assert.equal(
+    liveProjectBody.messages.find((message) => message.type === "result").text,
+    "answer for: visible only while live",
+  );
+
+  await request(baseUrl, "/api/sessions/nav:projects/history");
+
+  const staleProjectMessages = await request(baseUrl, "/api/messages?sessionId=project:p_alpha");
+  const staleProjectBody = await staleProjectMessages.json();
+  assert.deepEqual(staleProjectBody.messages, []);
+
+  const activeMessages = await request(baseUrl, "/api/messages?sessionId=project-session:p_alpha");
+  const activeBody = await activeMessages.json();
+  assert.equal(
+    activeBody.messages.find((message) => message.type === "result").text,
+    "answer for: visible only while live",
+  );
+});
+
+test("concurrent project row prompts do not spawn duplicate codex sessions", async (t) => {
+  const { baseUrl } = await withBridge(t, {
+    agentBackend: "codex_app_server",
+    createCodexAgentProvider: fakeCodexAgentProvider({ promptReturnDelayMs: 25 }),
+    mirrorCodexTui: false,
+    showProjectsFirst: true,
+  });
+
+  const [first, second] = await Promise.all([
+    request(baseUrl, "/api/prompt", {
+      body: {
+        sessionId: "project:p_alpha",
+        text: "first concurrent turn",
+        clientRequestId: "codex-concurrent-project-1",
+      },
+    }),
+    request(baseUrl, "/api/prompt", {
+      body: {
+        sessionId: "project:p_alpha",
+        text: "second concurrent turn",
+        clientRequestId: "codex-concurrent-project-2",
+      },
+    }),
+  ]);
+
+  assert.equal(first.status, 202);
+  assert.equal(second.status, 202);
+  const firstBody = await first.json();
+  const secondBody = await second.json();
+  assert.equal(firstBody.sessionId, "codex-thread-1");
+  assert.equal(secondBody.sessionId, "codex-thread-1");
+
+  const sessions = await request(baseUrl, `/api/sessions?token=${TOKEN}`, { token: null });
+  const sessionsBody = await sessions.json();
+  assert.equal(sessionsBody.sessions.some((session) => session.activeSessionId === "codex-thread-2"), false);
+  assert.equal(sessionsBody.sessions[1].activeSessionId, "codex-thread-1");
+});
+
+test("duplicate in-flight prompt request id replays original response", async (t) => {
+  const { baseUrl } = await withBridge(t, {
+    agentBackend: "codex_app_server",
+    createCodexAgentProvider: fakeCodexAgentProvider({ promptReturnDelayMs: 25 }),
+    mirrorCodexTui: false,
+    showProjectsFirst: true,
+  });
+
+  const body = {
+    sessionId: "project:p_alpha",
+    text: "same request should only spawn once",
+    clientRequestId: "codex-duplicate-in-flight",
+  };
+  const [first, second] = await Promise.all([
+    request(baseUrl, "/api/prompt", { body }),
+    request(baseUrl, "/api/prompt", { body }),
+  ]);
+
+  assert.equal(first.status, 202);
+  assert.equal(second.status, 202);
+  const firstBody = await first.json();
+  const secondBody = await second.json();
+  assert.equal(firstBody.sessionId, "codex-thread-1");
+  assert.equal(secondBody.sessionId, "codex-thread-1");
+  assert.equal(secondBody.duplicate, true);
+
+  const sessions = await request(baseUrl, `/api/sessions?token=${TOKEN}`, { token: null });
+  const sessionsBody = await sessions.json();
+  assert.equal(sessionsBody.sessions.some((session) => session.activeSessionId === "codex-thread-2"), false);
+});
+
+test("missing request id still dedupes identical in-flight prompt for stock clients", async (t) => {
+  const { baseUrl } = await withBridge(t, {
+    agentBackend: "codex_app_server",
+    createCodexAgentProvider: fakeCodexAgentProvider({ promptReturnDelayMs: 25 }),
+    mirrorCodexTui: false,
+    showProjectsFirst: true,
+  });
+
+  const body = {
+    sessionId: "project:p_alpha",
+    text: "stock client omitted request id",
+  };
+  const [first, second] = await Promise.all([
+    request(baseUrl, "/api/prompt", { body }),
+    request(baseUrl, "/api/prompt", { body }),
+  ]);
+
+  assert.equal(first.status, 202);
+  assert.equal(second.status, 202);
+  const firstBody = await first.json();
+  const secondBody = await second.json();
+  assert.equal(firstBody.sessionId, "codex-thread-1");
+  assert.equal(secondBody.sessionId, "codex-thread-1");
+  assert.equal(secondBody.duplicate, true);
+
+  const repeat = await request(baseUrl, "/api/prompt", { body });
+  assert.equal(repeat.status, 202);
+  const repeatBody = await repeat.json();
+  assert.equal(repeatBody.sessionId, "codex-thread-1");
+  assert.equal(repeatBody.duplicate, undefined);
+});
+
+test("prompt failure after idempotency reservation resolves duplicate waiters", async (t) => {
+  const { baseUrl } = await withBridge(t, {
+    provider: {
+      name: "codex",
+      agentBackend: "codex_app_server",
+      async getInfo() {
+        return { provider: "codex" };
+      },
+      async listSessions() {
+        return { sessions: [] };
+      },
+      async listProjects() {
+        throw new Error("project list down");
+      },
+    },
+    mirrorCodexTui: false,
+    showProjectsFirst: true,
+  });
+
+  const body = {
+    sessionId: "project:p_alpha",
+    text: "trigger project list failure",
+    clientRequestId: "prompt-fails-after-reserve",
+  };
+  const [first, second] = await Promise.all([
+    request(baseUrl, "/api/prompt", { body }),
+    request(baseUrl, "/api/prompt", { body }),
+  ]);
+  assert.equal(first.status, 500);
+  assert.equal(second.status, 500);
+  const bodies = [await first.json(), await second.json()];
+  assert.equal(bodies.every((item) => item.code === "prompt_failed"), true);
+  assert.equal(bodies.some((item) => item.duplicate === true), true);
+});
+
+test("fast follow-up results are not followed by a stale busy status", async (t) => {
+  const { baseUrl } = await withBridge(t, {
+    agentBackend: "codex_app_server",
+    createCodexAgentProvider: fakeCodexAgentProvider(),
+    mirrorCodexTui: false,
+  });
+  await request(baseUrl, "/api/select-project", {
+    body: { projectId: "p_alpha", clientRequestId: "codex-fast-order-select" },
+  });
+  await request(baseUrl, "/api/prompt", {
+    body: { text: "initial fast order", clientRequestId: "codex-fast-order-first" },
+  });
+  await request(baseUrl, "/api/prompt", {
+    body: { text: "fast follow-up order", clientRequestId: "codex-fast-order-second" },
+  });
+
+  const messages = await request(baseUrl, "/api/messages?sessionId=codex-thread-1");
+  const messageBody = await messages.json();
+  const resultIndex = messageBody.messages.findIndex(
+    (message) => message.type === "result" && message.text === "answer for: fast follow-up order",
+  );
+  const busyIndex = messageBody.messages.findIndex(
+    (message, index) => index < resultIndex && message.type === "status" && message.state === "busy",
+  );
+  assert.ok(busyIndex >= 0);
+  assert.ok(busyIndex < resultIndex);
+  const lastStatus = messageBody.messages.filter((message) => message.type === "status").at(-1);
+  assert.equal(lastStatus.state, "idle");
+
+  const sessions = await request(baseUrl, `/api/sessions?token=${TOKEN}`, { token: null });
+  const sessionsBody = await sessions.json();
+  assert.equal(sessionsBody.selectedSession.status, "idle");
+  assert.equal(
+    sessionsBody.sessions.find((session) => session.id === "project-session:p_alpha").status,
+    "idle",
+  );
+});
+
+test("history prefers buffered assistant result over user-only persisted history", async (t) => {
+  const { baseUrl } = await withBridge(t, {
+    agentBackend: "codex_app_server",
+    createCodexAgentProvider: fakeCodexAgentProvider({
+      history: {
+        "codex-thread-1": [{ role: "user", text: "alias target please" }],
+      },
+    }),
+    mirrorCodexTui: false,
+  });
+  await request(baseUrl, "/api/select-project", {
+    body: { projectId: "p_beta", clientRequestId: "codex-history-buffer-select" },
+  });
+  await request(baseUrl, "/api/prompt", {
+    body: {
+      text: "alias target please",
+      clientRequestId: "codex-history-buffer-prompt",
+    },
+  });
+
+  const historyRes = await request(baseUrl, "/api/sessions/codex-thread-1/history");
+  const historyBody = await historyRes.json();
+  assert.equal(historyBody.history.at(-1).role, "assistant");
+  assert.equal(historyBody.history.at(-1).text, "answer for: alias target please");
+});
+
+test("codex app-server backend keeps follow-ups in the selected session", async (t) => {
+  const { baseUrl } = await withBridge(t, {
+    agentBackend: "codex_app_server",
+    createCodexAgentProvider: fakeCodexAgentProvider(),
+    mirrorCodexTui: false,
+  });
+  await request(baseUrl, "/api/select-project", {
+    body: { projectId: "p_alpha", clientRequestId: "codex-follow-select-project" },
+  });
+  await request(baseUrl, "/api/prompt", {
+    body: { text: "first turn", clientRequestId: "codex-follow-first" },
+  });
+
+  const follow = await request(baseUrl, "/api/prompt", {
+    body: { text: "same session follow up", clientRequestId: "codex-follow-second" },
+  });
+  assert.equal(follow.status, 202);
+  const followBody = await follow.json();
+  assert.equal(followBody.action, "send_prompt");
+  assert.equal(followBody.sessionId, "codex-thread-1");
+
+  const sessions = await request(baseUrl, "/api/sessions?token=test-token-123456", { token: null });
+  const sessionsBody = await sessions.json();
+  assert.equal(sessionsBody.sessions.filter((session) => session.id === "codex-thread-1").length, 0);
+  assert.equal(sessionsBody.sessions[0].id, "nav:projects");
+  assert.equal(sessionsBody.sessions[1].id, "project-session:p_alpha");
+  assert.equal(sessionsBody.sessions[1].activeSessionId, "codex-thread-1");
+  assert.equal(sessionsBody.sessions[1].latestOutput, "answer for: same session follow up");
+
+  const messages = await request(baseUrl, "/api/messages?sessionId=codex-thread-1");
+  const messageBody = await messages.json();
+  const results = messageBody.messages.filter((message) => message.type === "result");
+  assert.equal(results.at(-1).text, "answer for: same session follow up");
+
+  const projectMessages = await request(baseUrl, "/api/messages?sessionId=project-session:p_alpha");
+  const projectMessageBody = await projectMessages.json();
+  const projectResults = projectMessageBody.messages.filter((message) => message.type === "result");
+  assert.equal(projectResults.at(-1).text, "answer for: same session follow up");
+});
+
+test("project row follow-up reuses remembered active session after back and reopen", async (t) => {
+  const { baseUrl } = await withBridge(t, {
+    agentBackend: "codex_app_server",
+    createCodexAgentProvider: fakeCodexAgentProvider(),
+    mirrorCodexTui: false,
+    showProjectsFirst: true,
+  });
+  await request(baseUrl, "/api/select-project", {
+    body: { projectId: "p_alpha", clientRequestId: "codex-reopen-select-project" },
+  });
+  await request(baseUrl, "/api/prompt", {
+    body: {
+      sessionId: "project:p_alpha",
+      text: "first reopened turn",
+      clientRequestId: "codex-reopen-first",
+    },
+  });
+
+  await request(baseUrl, "/api/sessions/nav:projects/history");
+  const projectHistory = await request(baseUrl, "/api/sessions/project:p_alpha/history");
+  const projectHistoryBody = await projectHistory.json();
+  assert.deepEqual(projectHistoryBody.history, []);
+  assert.equal(projectHistoryBody.navigation.view, "sessions");
+  assert.equal(projectHistoryBody.selectedSession, null);
+
+  const activeHistory = await request(baseUrl, "/api/sessions/project-session:p_alpha/history");
+  const activeHistoryBody = await activeHistory.json();
+  assert.equal(activeHistoryBody.history.at(-1).text, "answer for: first reopened turn");
+
+  const follow = await request(baseUrl, "/api/prompt", {
+    body: {
+      sessionId: "project:p_alpha",
+      text: "same reopened session",
+      clientRequestId: "codex-reopen-follow",
+    },
+  });
+  assert.equal(follow.status, 202);
+  const followBody = await follow.json();
+  assert.equal(followBody.action, "send_prompt");
+  assert.equal(followBody.sessionId, "codex-thread-1");
+  assert.equal(followBody.text, "answer for: same reopened session");
+
+  const sessions = await request(baseUrl, `/api/sessions?token=${TOKEN}`, { token: null });
+  const sessionsBody = await sessions.json();
+  assert.equal(sessionsBody.sessions.some((session) => session.id === "codex-thread-2"), false);
+  assert.equal(sessionsBody.sessions[1].id, "project-session:p_alpha");
+  assert.equal(sessionsBody.sessions[1].activeSessionId, "codex-thread-1");
+  assert.equal(sessionsBody.sessions[1].latestOutput, "answer for: same reopened session");
+
+  const projectMessages = await request(baseUrl, "/api/messages?sessionId=project-session:p_alpha");
+  const projectMessageBody = await projectMessages.json();
+  const projectResults = projectMessageBody.messages.filter((message) => message.type === "result");
+  assert.equal(projectResults.at(-1).text, "answer for: same reopened session");
+});
+
+test("concurrent active project-session follow-ups serialize per project", async (t) => {
+  const { baseUrl } = await withBridge(t, {
+    agentBackend: "codex_app_server",
+    createCodexAgentProvider: fakeCodexAgentProvider({ asyncResultMs: 40 }),
+    mirrorCodexTui: false,
+    showProjectsFirst: true,
+  });
+  await request(baseUrl, "/api/prompt", {
+    body: {
+      sessionId: "project:p_alpha",
+      text: "first active session turn",
+      clientRequestId: "codex-active-concurrent-first",
+    },
+  });
+
+  const [first, second] = await Promise.all([
+    request(baseUrl, "/api/prompt", {
+      body: {
+        sessionId: "project-session:p_alpha",
+        text: "active followup A",
+        clientRequestId: "codex-active-concurrent-a",
+      },
+    }),
+    request(baseUrl, "/api/prompt", {
+      body: {
+        sessionId: "project-session:p_alpha",
+        text: "active followup B",
+        clientRequestId: "codex-active-concurrent-b",
+      },
+    }),
+  ]);
+  assert.equal(first.status, 202);
+  assert.equal(second.status, 202);
+  const firstBody = await first.json();
+  const secondBody = await second.json();
+  assert.equal(firstBody.sessionId, "codex-thread-1");
+  assert.equal(secondBody.sessionId, "codex-thread-1");
+  assert.equal(firstBody.text, "answer for: active followup A");
+  assert.equal(secondBody.text, "answer for: active followup B");
+});
+
+test("project row history stays navigation-only while active project-session history resolves codex thread", async (t) => {
+  const { baseUrl } = await withBridge(t, {
+    agentBackend: "codex_app_server",
+    createCodexAgentProvider: fakeCodexAgentProvider({ throwOnProjectHistory: true }),
+    mirrorCodexTui: false,
+    showProjectsFirst: true,
+  });
+  await request(baseUrl, "/api/select-project", {
+    body: { projectId: "p_alpha", clientRequestId: "codex-project-history-select" },
+  });
+  await request(baseUrl, "/api/prompt", {
+    body: {
+      sessionId: "project:p_alpha",
+      text: "answer visible through project history",
+      clientRequestId: "codex-project-history-prompt",
+    },
+  });
+
+  const projectHistory = await request(baseUrl, "/api/sessions/project:p_alpha/history");
+  assert.equal(projectHistory.status, 200);
+  const projectHistoryBody = await projectHistory.json();
+  assert.deepEqual(projectHistoryBody.history, []);
+  assert.equal(projectHistoryBody.navigation.view, "sessions");
+
+  const history = await request(baseUrl, "/api/sessions/project-session:p_alpha/history");
+  assert.equal(history.status, 200);
+  const historyBody = await history.json();
+  assert.equal(historyBody.history.at(-1).role, "assistant");
+  assert.equal(historyBody.history.at(-1).text, "answer for: answer visible through project history");
+});
+
+test("project row event stream receives codex final result via query-token auth", async (t) => {
+  const { baseUrl } = await withBridge(t, {
+    agentBackend: "codex_app_server",
+    createCodexAgentProvider: fakeCodexAgentProvider({ asyncResultMs: 25 }),
+    mirrorCodexTui: false,
+    showProjectsFirst: true,
+    acceptQueryToken: false,
+  });
+
+  const events = await fetch(`${baseUrl}/api/events?sessionId=project:p_alpha&token=${TOKEN}`);
+  assert.equal(events.status, 200);
+  assert.match(events.headers.get("content-type") || "", /text\/event-stream/);
+
+  const streamed = readStreamUntil(events.body, "answer for: stream this answer", 1000);
+  const prompt = await request(baseUrl, "/api/prompt", {
+    body: {
+      sessionId: "project:p_alpha",
+      text: "stream this answer",
+      clientRequestId: "codex-stream-project-row-prompt",
+    },
+  });
+  assert.equal(prompt.status, 202);
+  assert.match(await streamed, /"type":"result"/);
+});
+
+test("stale project row event stream does not replay transcript after leaving session", async (t) => {
+  const { baseUrl } = await withBridge(t, {
+    agentBackend: "codex_app_server",
+    createCodexAgentProvider: fakeCodexAgentProvider(),
+    mirrorCodexTui: false,
+    showProjectsFirst: true,
+  });
+  await request(baseUrl, "/api/prompt", {
+    body: {
+      sessionId: "project:p_alpha",
+      text: "do not replay this after back",
+      clientRequestId: "codex-stale-event-prompt",
+    },
+  });
+  await request(baseUrl, "/api/sessions/nav:projects/history");
+
+  const events = await fetch(`${baseUrl}/api/events?sessionId=project:p_alpha&token=${TOKEN}`);
+  assert.equal(events.status, 200);
+  const initial = await readStreamFor(events.body, 100);
+  assert.doesNotMatch(initial, /do not replay this after back/);
+  assert.doesNotMatch(initial, /"type":"result"/);
+});
+
+test("project row event stream opened before prompt stops after back navigation", async (t) => {
+  const { baseUrl } = await withBridge(t, {
+    agentBackend: "codex_app_server",
+    createCodexAgentProvider: fakeCodexAgentProvider({ asyncResultMs: 80 }),
+    mirrorCodexTui: false,
+    showProjectsFirst: true,
+  });
+
+  const events = await fetch(`${baseUrl}/api/events?sessionId=project:p_alpha&token=${TOKEN}`);
+  assert.equal(events.status, 200);
+  const prompt = request(baseUrl, "/api/prompt", {
+    body: {
+      sessionId: "project:p_alpha",
+      text: "late result must not paint stale view",
+      clientRequestId: "codex-project-stream-late-back",
+    },
+  });
+
+  let enteredSession = false;
+  for (let attempt = 0; attempt < 80; attempt += 1) {
+    const navigation = await request(baseUrl, "/api/navigation");
+    if ((await navigation.json()).view === "session") {
+      enteredSession = true;
+      break;
+    }
+    await sleep(5);
+  }
+  assert.equal(enteredSession, true);
+
+  const back = await request(baseUrl, "/api/back", {
+    body: { clientRequestId: "codex-project-stream-late-back-nav" },
+  });
+  assert.equal((await back.json()).to, "projects");
+
+  const promptRes = await prompt;
+  assert.equal(promptRes.status, 202);
+  assert.equal((await promptRes.json()).text, "answer for: late result must not paint stale view");
+
+  const streamed = await readStreamFor(events.body, 120);
+  assert.doesNotMatch(streamed, /late result must not paint stale view/);
+  assert.doesNotMatch(streamed, /"type":"result"/);
+
+  await request(baseUrl, "/api/sessions/project:p_alpha/history");
+  const history = await request(baseUrl, "/api/sessions/project-session:p_alpha/history");
+  const historyBody = await history.json();
+  assert.equal(historyBody.history.at(-1).text, "answer for: late result must not paint stale view");
+});
+
+test("default event stream opened before prompt stops after back navigation", async (t) => {
+  const { baseUrl } = await withBridge(t, {
+    agentBackend: "codex_app_server",
+    createCodexAgentProvider: fakeCodexAgentProvider({ asyncResultMs: 80 }),
+    mirrorCodexTui: false,
+    showProjectsFirst: true,
+  });
+
+  const events = await fetch(`${baseUrl}/api/events?token=${TOKEN}`);
+  assert.equal(events.status, 200);
+  const prompt = request(baseUrl, "/api/prompt", {
+    body: {
+      sessionId: "project:p_alpha",
+      text: "default stream must not paint stale view",
+      clientRequestId: "codex-default-stream-late-back",
+    },
+  });
+
+  let enteredSession = false;
+  for (let attempt = 0; attempt < 80; attempt += 1) {
+    const navigation = await request(baseUrl, "/api/navigation");
+    if ((await navigation.json()).view === "session") {
+      enteredSession = true;
+      break;
+    }
+    await sleep(5);
+  }
+  assert.equal(enteredSession, true);
+
+  const back = await request(baseUrl, "/api/back", {
+    body: { clientRequestId: "codex-default-stream-late-back-nav" },
+  });
+  assert.equal((await back.json()).to, "projects");
+
+  const promptRes = await prompt;
+  assert.equal(promptRes.status, 202);
+
+  const streamed = await readStreamFor(events.body, 120);
+  assert.doesNotMatch(streamed, /default stream must not paint stale view/);
+  assert.doesNotMatch(streamed, /"type":"result"/);
+});
+
+test("default event stream suppresses late results from a previously selected session", async (t) => {
+  const { baseUrl } = await withBridge(t, {
+    agentBackend: "codex_app_server",
+    createCodexAgentProvider: fakeCodexAgentProvider({
+      asyncResultMs: (text) => (text.includes("alpha slow") ? 350 : 20),
+    }),
+    mirrorCodexTui: false,
+    showProjectsFirst: true,
+  });
+
+  const events = await fetch(`${baseUrl}/api/events?token=${TOKEN}`);
+  assert.equal(events.status, 200);
+  const alphaPrompt = request(baseUrl, "/api/prompt", {
+    body: {
+      sessionId: "project:p_alpha",
+      text: "alpha slow result",
+      clientRequestId: "codex-default-stream-alpha-slow",
+    },
+  });
+
+  let enteredAlpha = false;
+  for (let attempt = 0; attempt < 80; attempt += 1) {
+    const navigation = await request(baseUrl, "/api/navigation");
+    const body = await navigation.json();
+    if (body.view === "session" && body.selectedProject?.id === "p_alpha") {
+      enteredAlpha = true;
+      break;
+    }
+    await sleep(5);
+  }
+  assert.equal(enteredAlpha, true);
+
+  const betaPrompt = request(baseUrl, "/api/prompt", {
+    body: {
+      sessionId: "project:p_beta",
+      text: "beta fast result",
+      clientRequestId: "codex-default-stream-beta-fast",
+    },
+  });
+  assert.equal((await betaPrompt).status, 202);
+  assert.equal((await alphaPrompt).status, 202);
+
+  const streamed = await readStreamFor(events.body, 220);
+  assert.match(streamed, /beta fast result/);
+  assert.doesNotMatch(streamed, /answer for: alpha slow result/);
+});
+
+test("default event stream does not replay transcript after leaving session", async (t) => {
+  const { baseUrl } = await withBridge(t, {
+    agentBackend: "codex_app_server",
+    createCodexAgentProvider: fakeCodexAgentProvider(),
+    mirrorCodexTui: false,
+    showProjectsFirst: true,
+  });
+  await request(baseUrl, "/api/prompt", {
+    body: {
+      sessionId: "project:p_alpha",
+      text: "do not replay through default stream",
+      clientRequestId: "codex-default-event-prompt",
+    },
+  });
+  await request(baseUrl, "/api/back", {
+    body: { clientRequestId: "codex-default-event-back" },
+  });
+
+  const events = await fetch(`${baseUrl}/api/events?token=${TOKEN}`);
+  assert.equal(events.status, 200);
+  const initial = await readStreamFor(events.body, 100);
+  assert.doesNotMatch(initial, /do not replay through default stream/);
+  assert.doesNotMatch(initial, /"type":"result"/);
+});
+
+test("selecting an active project-session row reopens its real codex session", async (t) => {
+  const { baseUrl } = await withBridge(t, {
+    agentBackend: "codex_app_server",
+    createCodexAgentProvider: fakeCodexAgentProvider(),
+    mirrorCodexTui: false,
+    showProjectsFirst: true,
+  });
+  await request(baseUrl, "/api/prompt", {
+    body: {
+      sessionId: "project:p_alpha",
+      text: "first selected project row turn",
+      clientRequestId: "codex-select-project-row-first",
+    },
+  });
+  await request(baseUrl, "/api/sessions/nav:projects/history");
+
+  const select = await request(baseUrl, "/api/select-session", {
+    body: {
+      sessionId: "project-session:p_alpha",
+      clientRequestId: "codex-select-project-row-reopen",
+    },
+  });
+  assert.equal(select.status, 200);
+  const selectBody = await select.json();
+  assert.equal(selectBody.activeSessionId, "codex-thread-1");
+  assert.equal(selectBody.selectedSession.activeSessionId, "codex-thread-1");
+
+  const follow = await request(baseUrl, "/api/prompt", {
+    body: {
+      sessionId: "project-session:p_alpha",
+      text: "same selected project row session",
+      clientRequestId: "codex-select-project-row-follow",
+    },
+  });
+  const followBody = await follow.json();
+  assert.equal(followBody.action, "send_prompt");
+  assert.equal(followBody.sessionId, "codex-thread-1");
+  assert.equal(followBody.text, "answer for: same selected project row session");
+});
+
+test("selecting a project row after an active session enters project sessions without opening transcript", async (t) => {
+  const { baseUrl } = await withBridge(t, {
+    agentBackend: "codex_app_server",
+    createCodexAgentProvider: fakeCodexAgentProvider(),
+    mirrorCodexTui: false,
+    showProjectsFirst: true,
+  });
+  await request(baseUrl, "/api/prompt", {
+    body: {
+      sessionId: "project:p_alpha",
+      text: "first project navigation turn",
+      clientRequestId: "codex-select-project-row-nav-first",
+    },
+  });
+  await request(baseUrl, "/api/sessions/nav:projects/history");
+
+  const select = await request(baseUrl, "/api/select-session", {
+    body: {
+      sessionId: "project:p_alpha",
+      clientRequestId: "codex-select-project-row-nav",
+    },
+  });
+  assert.equal(select.status, 200);
+  const selectBody = await select.json();
+  assert.equal(selectBody.selectedProject.id, "p_alpha");
+  assert.equal(selectBody.selectedSession, null);
+  assert.equal(selectBody.navigation.view, "sessions");
+  assert.equal(selectBody.activeSessionId, "codex-thread-1");
+
+  const sessions = await request(baseUrl, `/api/sessions?token=${TOKEN}`, { token: null });
+  const sessionsBody = await sessions.json();
+  assert.equal(sessionsBody.sessions[0].id, "nav:projects");
+  assert.equal(sessionsBody.sessions[1].id, "project-session:p_alpha");
+  assert.equal(sessionsBody.sessions[1].latestOutput, "answer for: first project navigation turn");
+});
+
+test("codex app-server backend hides old codex history from project session list", async (t) => {
+  const { baseUrl } = await withBridge(t, {
+    agentBackend: "codex_app_server",
+    createCodexAgentProvider: fakeCodexAgentProvider({
+      seedSessions: [
+        {
+          id: "old-cached-thread",
+          title: "Old cached Codex thread",
+          timestamp: new Date(1_779_999_000_000).toISOString(),
+          cwd: "/tmp/morpheus-alpha",
+          status: "idle",
+        },
+      ],
+    }),
+    mirrorCodexTui: false,
+    showProjectsFirst: true,
+  });
+  await request(baseUrl, "/api/select-project", {
+    body: { projectId: "p_alpha", clientRequestId: "codex-history-select-project" },
+  });
+
+  const before = await request(baseUrl, `/api/sessions?token=${TOKEN}`, { token: null });
+  const beforeBody = await before.json();
+  assert.equal(beforeBody.sessions.length, 1);
+  assert.equal(beforeBody.sessions[0].id, "nav:projects");
+  assert.equal(beforeBody.sessions.some((session) => session.id === "old-cached-thread"), false);
+
+  await request(baseUrl, "/api/prompt", {
+    body: { text: "fresh g2 turn", clientRequestId: "codex-history-fresh" },
+  });
+  const after = await request(baseUrl, `/api/sessions?token=${TOKEN}`, { token: null });
+  const afterBody = await after.json();
+  assert.equal(afterBody.sessions.some((session) => session.id === "codex-thread-1"), false);
+  assert.equal(afterBody.sessions[0].id, "nav:projects");
+  assert.equal(afterBody.sessions[1].id, "project-session:p_alpha");
+  assert.equal(afterBody.sessions[1].activeSessionId, "codex-thread-1");
+  assert.equal(afterBody.sessions.some((session) => session.id === "old-cached-thread"), false);
+});
+
+test("status polling does not undo back navigation from a codex session", async (t) => {
+  const { baseUrl } = await withBridge(t, {
+    agentBackend: "codex_app_server",
+    createCodexAgentProvider: fakeCodexAgentProvider(),
+    mirrorCodexTui: false,
+    showProjectsFirst: true,
+  });
+  await request(baseUrl, "/api/select-project", {
+    body: { projectId: "p_alpha", clientRequestId: "codex-nav-select-project" },
+  });
+  await request(baseUrl, "/api/prompt", {
+    body: { text: "first turn", clientRequestId: "codex-nav-first" },
+  });
+
+  const backOne = await request(baseUrl, "/api/back", {
+    body: { clientRequestId: "codex-nav-back-one" },
+  });
+  assert.equal((await backOne.json()).to, "projects");
+
+  const status = await request(baseUrl, "/api/status?sessionId=codex-thread-1");
+  assert.equal(status.status, 200);
+  assert.equal((await status.json()).selectedSession, null);
+
+  const staleHistory = await request(baseUrl, "/api/sessions/project-session:p_alpha/history");
+  assert.equal(staleHistory.status, 200);
+  const staleHistoryBody = await staleHistory.json();
+  assert.deepEqual(staleHistoryBody.history, []);
+  assert.equal(staleHistoryBody.navigation.view, "projects");
+  assert.equal(staleHistoryBody.selectedProject, null);
+  assert.equal(staleHistoryBody.selectedSession, null);
+
+  const navigation = await request(baseUrl, "/api/navigation");
+  assert.equal((await navigation.json()).view, "projects");
+});
+
+test("delayed prompt completion after back does not reselect the session", async (t) => {
+  const { baseUrl } = await withBridge(t, {
+    agentBackend: "codex_app_server",
+    createCodexAgentProvider: fakeCodexAgentProvider({ asyncResultMs: 80 }),
+    mirrorCodexTui: false,
+    showProjectsFirst: true,
+  });
+
+  const prompt = request(baseUrl, "/api/prompt", {
+    body: {
+      sessionId: "project:p_alpha",
+      text: "finish after I leave",
+      clientRequestId: "codex-finish-after-back",
+    },
+  });
+  let enteredSession = false;
+  for (let attempt = 0; attempt < 80; attempt += 1) {
+    const navigation = await request(baseUrl, "/api/navigation");
+    if ((await navigation.json()).view === "session") {
+      enteredSession = true;
+      break;
+    }
+    await sleep(5);
+  }
+  assert.equal(enteredSession, true);
+
+  const back = await request(baseUrl, "/api/back", {
+    body: { clientRequestId: "codex-finish-after-back-nav" },
+  });
+  assert.equal((await back.json()).to, "projects");
+
+  const promptRes = await prompt;
+  assert.equal(promptRes.status, 202);
+  assert.equal((await promptRes.json()).text, "answer for: finish after I leave");
+
+  const navigation = await request(baseUrl, "/api/navigation");
+  const navigationBody = await navigation.json();
+  assert.equal(navigationBody.view, "projects");
+  assert.equal(navigationBody.selectedSession, null);
+
+  const activeHistory = await request(baseUrl, "/api/sessions/project:p_alpha/history");
+  const activeHistoryBody = await activeHistory.json();
+  assert.equal(activeHistoryBody.navigation.view, "sessions");
+  assert.equal(activeHistoryBody.selectedSession, null);
+  assert.equal(activeHistoryBody.projectActiveSessionId, "project-session:p_alpha");
+});
+
+test("stale active history from another project does not replace current session", async (t) => {
+  const { baseUrl } = await withBridge(t, {
+    agentBackend: "codex_app_server",
+    createCodexAgentProvider: fakeCodexAgentProvider(),
+    mirrorCodexTui: false,
+    showProjectsFirst: true,
+  });
+
+  await request(baseUrl, "/api/prompt", {
+    body: {
+      sessionId: "project:p_alpha",
+      text: "alpha answer",
+      clientRequestId: "codex-stale-alpha",
+    },
+  });
+  await request(baseUrl, "/api/prompt", {
+    body: {
+      sessionId: "project:p_beta",
+      text: "beta answer",
+      clientRequestId: "codex-stale-beta",
+    },
+  });
+
+  const stale = await request(baseUrl, "/api/sessions/project-session:p_alpha/history");
+  assert.equal(stale.status, 200);
+  const staleBody = await stale.json();
+  assert.deepEqual(staleBody.history, []);
+  assert.equal(staleBody.navigation.action, "stale_history_ignored");
+  assert.equal(staleBody.selectedProject.id, "p_beta");
+  assert.equal(staleBody.selectedSession.id, "codex-thread-2");
+
+  const sessions = await request(baseUrl, `/api/sessions?token=${TOKEN}`, { token: null });
+  const sessionsBody = await sessions.json();
+  assert.equal(sessionsBody.selectedProject.id, "p_beta");
+  assert.equal(sessionsBody.selectedSession.id, "codex-thread-2");
+  assert.equal(sessionsBody.sessions[1].id, "project-session:p_beta");
+});
+
+test("rejects over-limit prompt text", async (t) => {
+  const { baseUrl } = await withBridge(t, { maxPromptChars: 8 });
+  await request(baseUrl, "/api/select-session", {
+    body: { sessionId: "abc123", clientRequestId: "select-0003" },
+  });
+  const res = await request(baseUrl, "/api/prompt", {
+    body: { text: "this is too long", clientRequestId: "prompt-0003" },
+  });
+  assert.equal(res.status, 413);
+  assert.equal((await res.json()).code, "text_too_long");
+});
+
+test("keeps approvals blocked", async (t) => {
+  const { baseUrl } = await withBridge(t);
+  const res = await request(baseUrl, "/api/permission-response", {
+    body: { decision: "approve", clientRequestId: "approve-0001" },
+  });
+  assert.equal(res.status, 403);
+  assert.equal((await res.json()).code, "action_blocked");
+});

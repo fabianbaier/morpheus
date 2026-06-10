@@ -71,6 +71,24 @@ def command_in_project(command: str, project_root: str) -> str:
     return f"cd {shlex.quote(project_root)} && {command}"
 
 
+def command_with_prompt_in_project(command: str, project_root: str, initial_prompt: str = "") -> str:
+    """Build a project-scoped command, passing prompts to known interactive agents."""
+    base_command = (command or "codex").strip()
+    prompt = (initial_prompt or "").strip()
+    if prompt:
+        quoted_prompt = shlex.quote(prompt)
+        if "{prompt}" in base_command or "{goal}" in base_command:
+            base_command = base_command.replace("{prompt}", quoted_prompt).replace("{goal}", quoted_prompt)
+        else:
+            try:
+                first_token = shlex.split(base_command)[0]
+            except (IndexError, ValueError):
+                first_token = ""
+            if Path(first_token).name == "codex":
+                base_command = f"{base_command} {quoted_prompt}"
+    return command_in_project(base_command, project_root)
+
+
 def backfill_known_tenants() -> int:
     """Assign tenants to older rows when a known path already exists."""
     changed = 0

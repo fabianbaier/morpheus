@@ -167,6 +167,7 @@ def _loop_runner_plist_xml(
         <string>{limit:d}</string>
         <string>--timeout</string>
         <string>{timeout:d}</string>
+        <string>--all-projects</string>
     </array>
     <key>RunAtLoad</key>
     <true/>
