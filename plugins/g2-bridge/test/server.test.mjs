@@ -487,6 +487,28 @@ test("rejects prompt without selected project or session context", async (t) => 
   assert.equal(body.code, "project_not_selected");
 });
 
+test("spawns in remembered project when Add session prompt omits sessionId", async (t) => {
+  const { baseUrl } = await withBridge(t, { showProjectsFirst: true });
+  await request(baseUrl, "/api/select-project", {
+    body: { projectId: "p_beta", clientRequestId: "remembered-project-select" },
+  });
+  await request(baseUrl, "/api/sessions/project:__projects__/history");
+
+  const res = await request(baseUrl, "/api/prompt", {
+    body: {
+      text: "start a fresh remembered project session",
+      clientRequestId: "remembered-project-add-session",
+    },
+  });
+  assert.equal(res.status, 202);
+  const body = await res.json();
+  assert.equal(body.action, "spawn_session");
+  assert.equal(body.sessionId, "g2spawn");
+  assert.equal(body.selectedProject.id, "p_beta");
+  assert.equal(body.result.session.project.root_path, "/tmp/morpheus-beta");
+  assert.equal(body.result.session.prompt, "start a fresh remembered project session");
+});
+
 test("continues selected session when app posts the project row again", async (t) => {
   const { baseUrl } = await withBridge(t, { showProjectsFirst: true });
   await request(baseUrl, "/api/select-project", {

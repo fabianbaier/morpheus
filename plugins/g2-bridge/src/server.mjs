@@ -339,9 +339,20 @@ function rememberSessionAliases(state, sessionId, { project, requestSessionId } 
   }
 }
 
+function rememberProjectContext(state, project) {
+  if (!projectKey(project)) return null;
+  state.lastProject = project;
+  return project;
+}
+
+function projectContextForPrompt(state) {
+  return state.selectedProject || state.lastProject || null;
+}
+
 function rememberActiveProjectSession(state, project, session) {
   const activeProjectId = projectKey(project);
   if (!activeProjectId || !session?.id) return;
+  rememberProjectContext(state, project);
   state.projectActiveSessions.set(activeProjectId, session);
   addSessionAlias(state, session.id, activeProjectSessionId(project));
 }
@@ -1963,6 +1974,7 @@ async function spawnSessionFromText({ req, res, context, requestId, text, projec
     timestamp: nowIso(config.clock),
   });
   if (project) {
+    rememberProjectContext(state, project);
     state.selectedProject = project;
   }
   if (pendingProjectRow) {
@@ -2489,11 +2501,13 @@ async function submitTextToMorpheus(req, res, context) {
     await runProjectPromptLocked(state, resolvedProjectId, async () => {
       const activeSession = state.projectActiveSessions.get(resolvedProjectId);
       if (!activeSession) {
+        rememberProjectContext(state, project.project);
         state.selectedProject = project.project;
         state.selectedSession = null;
         await spawnSessionFromText({ req, res, context, requestId, text: textResult.text, project: project.project });
         return;
       }
+      rememberProjectContext(state, project.project);
       state.selectedProject = project.project;
       state.selectedSession = activeSession;
       await sendPromptToSession({
@@ -2534,6 +2548,7 @@ async function submitTextToMorpheus(req, res, context) {
       }
       const rememberedSession = state.projectActiveSessions.get(resolvedProjectId);
       if (rememberedSession) {
+        rememberProjectContext(state, project.project);
         state.selectedProject = project.project;
         state.selectedSession = rememberedSession;
         await sendPromptToSession({
@@ -2546,6 +2561,7 @@ async function submitTextToMorpheus(req, res, context) {
         });
         return;
       }
+      rememberProjectContext(state, project.project);
       state.selectedProject = project.project;
       await spawnSessionFromText({ req, res, context, requestId, text: textResult.text, project: project.project });
     });
@@ -2560,17 +2576,34 @@ async function submitTextToMorpheus(req, res, context) {
   }
 
   if (!targetSessionId) {
-    if (!state.selectedProject) {
+    const promptProject = projectContextForPrompt(state);
+    if (!promptProject) {
       const body = {
         error: "Select a Morpheus project or session before sending text from G2.",
         code: "project_not_selected",
       };
-      audit("remote_text_rejected", { requestId, reason: "project_not_selected" });
+      audit("remote_text_rejected", {
+        requestId,
+        reason: "project_not_selected",
+        lastProjectId: projectKey(state.lastProject) || "",
+      });
       rememberReplay(req, state, requestId, 409, body, config.clock, config.requestIdTtlMs);
       res.status(409).json(body);
       return;
     }
-    await spawnSessionFromText({ req, res, context, requestId, text: textResult.text, project: state.selectedProject });
+    if (!state.selectedProject && state.lastProject) {
+      bridgeDebug(config, "prompt-using-remembered-project", {
+        requestId,
+        projectId: projectKey(promptProject),
+      });
+      audit("remote_prompt_remembered_project", {
+        requestId,
+        projectId: projectKey(promptProject),
+      });
+    }
+    rememberProjectContext(state, promptProject);
+    state.selectedProject = promptProject;
+    await spawnSessionFromText({ req, res, context, requestId, text: textResult.text, project: promptProject });
     return;
   }
 
@@ -2740,6 +2773,7 @@ function createBridge(options = {}) {
     projectSessionRowsCache: new Map(),
     projectListCache: null,
     navigationEpoch: 0,
+    lastProject: null,
     selectedProject: null,
     selectedSession: null,
   };
@@ -3109,6 +3143,7 @@ function createBridge(options = {}) {
         res.status(resolved.status).json({ error: resolved.error });
         return;
       }
+      rememberProjectContext(state, resolved.project);
       state.selectedProject = resolved.project;
       state.selectedSession = null;
       bumpNavigationEpoch(state);
@@ -3167,6 +3202,7 @@ function createBridge(options = {}) {
         res.status(resolved.status).json({ error: resolved.error });
         return;
       }
+      rememberProjectContext(state, resolved.project);
       state.selectedProject = resolved.project;
       const activeSession = state.projectActiveSessions.get(activeProjectSelectId) || null;
       state.selectedSession = activeSession;
@@ -3198,6 +3234,7 @@ function createBridge(options = {}) {
         res.status(resolved.status).json({ error: resolved.error });
         return;
       }
+      rememberProjectContext(state, resolved.project);
       state.selectedProject = resolved.project;
       const activeSession = state.projectActiveSessions.get(projectId) || null;
       state.selectedSession = null;
@@ -3396,7 +3433,10 @@ function createBridge(options = {}) {
           return;
         }
         const resolved = await resolveProject(provider, activeProjectHistoryId, config.projectLimit);
-        if (resolved.ok) state.selectedProject = resolved.project;
+        if (resolved.ok) {
+          rememberProjectContext(state, resolved.project);
+          state.selectedProject = resolved.project;
+        }
         if (!activeSession) {
           state.selectedSession = null;
           bumpNavigationEpoch(state);
@@ -3433,7 +3473,10 @@ function createBridge(options = {}) {
         const selectedProjectId = state.selectedProject?.id || state.selectedProject?.tenant_id || "";
         if (selectedProjectId !== projectId) {
           const resolved = await resolveProject(provider, projectId, config.projectLimit);
-          if (resolved.ok) state.selectedProject = resolved.project;
+          if (resolved.ok) {
+            rememberProjectContext(state, resolved.project);
+            state.selectedProject = resolved.project;
+          }
         }
         const activeSession = state.projectActiveSessions.get(projectId) || null;
         const pendingProjectRow = !activeSession ? pendingProjectPromptForProject(state, projectId) : null;
