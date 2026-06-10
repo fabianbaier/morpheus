@@ -696,12 +696,109 @@ test("project menu history request returns to projects for stock Even row opens"
   const history = await request(baseUrl, "/api/sessions/nav:projects/history");
   assert.equal(history.status, 200);
   const historyBody = await history.json();
+  assert.equal(historyBody.mode, "projects");
   assert.equal(historyBody.navigation.view, "projects");
+  assert.deepEqual(historyBody.history, []);
+  assert.equal(historyBody.sessions[0].id, "project:p_alpha");
+  assert.equal(historyBody.sessions[0].title, "alpha");
 
   const projects = await request(baseUrl, `/api/sessions?token=${TOKEN}`, { token: null });
   const projectsBody = await projects.json();
   assert.equal(projectsBody.mode, "projects");
   assert.equal(projectsBody.sessions[0].id, "project:p_alpha");
+});
+
+test("project menu history uses cached project rows if live project listing fails", async (t) => {
+  const baseRunner = fakeMorpheusRunner();
+  let failProjects = false;
+  const runner = async (command, args, options) => {
+    if (args[1] === "projects" && failProjects) {
+      throw new Error("project list down");
+    }
+    return baseRunner(command, args, options);
+  };
+  const { baseUrl } = await withBridge(t, {
+    agentBackend: "codex_app_server",
+    createCodexAgentProvider: fakeCodexAgentProvider(),
+    mirrorCodexTui: false,
+    runner,
+    showProjectsFirst: true,
+  });
+
+  const firstProjects = await request(baseUrl, `/api/sessions?token=${TOKEN}`, { token: null });
+  assert.equal(firstProjects.status, 200);
+  assert.equal((await firstProjects.json()).sessions[0].id, "project:p_alpha");
+
+  await request(baseUrl, "/api/select-project", {
+    body: { projectId: "p_alpha", clientRequestId: "nav-history-cached-select-project" },
+  });
+  failProjects = true;
+
+  const history = await request(baseUrl, "/api/sessions/nav:projects/history");
+  assert.equal(history.status, 200);
+  const historyBody = await history.json();
+  assert.equal(historyBody.mode, "projects");
+  assert.equal(historyBody.stale, true);
+  assert.deepEqual(historyBody.history, []);
+  assert.equal(historyBody.sessions[0].id, "project:p_alpha");
+});
+
+test("session menu polling uses cached rows if live provider listing fails", async (t) => {
+  let failListSessions = false;
+  const codexSession = {
+    id: "codex-cached",
+    title: "Cached Codex session",
+    timestamp: new Date(1_779_999_999_000).toISOString(),
+    cwd: "/tmp/morpheus-alpha",
+    status: "idle",
+  };
+  const { baseUrl } = await withBridge(t, {
+    agentBackend: "codex_app_server",
+    includeCodexHistory: true,
+    createCodexAgentProvider: () => ({
+      async getInfo() {
+        return { provider: "codex", model: "Codex", version: "test" };
+      },
+      async listSessions(_limit, cwd) {
+        if (failListSessions) throw new Error("codex list sessions down");
+        return !cwd || codexSession.cwd === cwd ? [codexSession] : [];
+      },
+      getStatus(sessionId) {
+        return sessionId === codexSession.id ? { state: "idle", provider: "codex" } : null;
+      },
+      async getSessionStatus(sessionId) {
+        return sessionId === codexSession.id ? "idle" : "unknown";
+      },
+      async getHistory() {
+        return [];
+      },
+      async prompt() {
+        throw new Error("prompt not expected");
+      },
+    }),
+    mirrorCodexTui: false,
+    showProjectsFirst: true,
+  });
+
+  await request(baseUrl, "/api/select-project", {
+    body: { projectId: "p_alpha", clientRequestId: "session-cache-select-project" },
+  });
+
+  const firstSessions = await request(baseUrl, `/api/sessions?token=${TOKEN}`, { token: null });
+  assert.equal(firstSessions.status, 200);
+  const firstBody = await firstSessions.json();
+  assert.equal(firstBody.mode, "sessions");
+  assert.equal(firstBody.sessions.some((session) => session.id === "codex-cached"), true);
+  failListSessions = true;
+
+  const secondSessions = await request(baseUrl, `/api/sessions?token=${TOKEN}`, { token: null });
+  assert.equal(secondSessions.status, 200);
+  const secondBody = await secondSessions.json();
+  assert.equal(secondBody.mode, "sessions");
+  assert.equal(secondBody.stale, true);
+  assert.match(secondBody.error, /codex list sessions down/);
+  assert.equal(secondBody.sessions.some((session) => session.id === "codex-cached"), true);
+  assert.equal(secondBody.sessions[0].id, "nav:projects");
 });
 
 test("spawns a local Morpheus session when prompting a project row", async (t) => {

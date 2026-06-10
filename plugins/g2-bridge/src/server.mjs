@@ -859,7 +859,6 @@ function projectMenuRow(project) {
     promptBehavior: "navigate_back",
     preview: "Return to project list",
     lastMessage: "Return to project list",
-    history: [{ role: "assistant", text: "Back to projects" }],
     navigation: {
       action: "projects",
       projectId: project?.id || project?.tenant_id || "",
@@ -952,9 +951,44 @@ function activeProjectSessionRow(state, project) {
 }
 
 async function projectSessionMenuRows(provider, state, config, project, limit) {
-  const result = await provider.listSessions(limit, {
-    projectId: project?.id || project?.tenant_id || "",
-  });
+  const projectId = project?.id || project?.tenant_id || "";
+  const cacheKey = projectId || "__global__";
+  let result = null;
+  let listError = "";
+  try {
+    result = await provider.listSessions(limit, { projectId });
+    const providerSessions = Array.isArray(result) ? result : result.sessions || [];
+    state.projectSessionRowsCache.set(cacheKey, {
+      sessions: providerSessions,
+      snapshot: Array.isArray(result) ? undefined : result.snapshot,
+      at: config.clock(),
+    });
+  } catch (err) {
+    listError = safeJsonError(err);
+    bridgeDebug(config, "project-session-menu-list-failed", {
+      projectId,
+      reason: listError,
+    });
+    config.logger?.warn?.(
+      `[g2-sessions] using cached project session rows for ${projectId || "global"}: ${listError}`,
+    );
+    const cached = state.projectSessionRowsCache.get(cacheKey);
+    result = {
+      sessions: cached?.sessions || [],
+      snapshot:
+        cached?.snapshot || {
+          generated_at: Math.floor(config.clock() / 1000),
+          summary: listError ? `Project session list unavailable: ${listError}` : "Project session list unavailable.",
+          counts: {},
+          policy: {
+            raw_terminal_buffers: false,
+            source: "cache_fallback",
+          },
+        },
+      stale: true,
+      error: listError,
+    };
+  }
   const providerSessions = Array.isArray(result) ? result : result.sessions || [];
   const activeProjectRow = activeProjectSessionRow(state, project);
   const pendingProjectRow = activeProjectRow ? null : pendingProjectPromptForProject(state, project);
@@ -980,6 +1014,8 @@ async function projectSessionMenuRows(provider, state, config, project, limit) {
   return {
     sessions,
     snapshot: Array.isArray(result) ? undefined : result.snapshot,
+    stale: Boolean(result?.stale),
+    error: listError || result?.error || "",
   };
 }
 
@@ -1042,6 +1078,57 @@ async function listProjects(provider, limit) {
   return {
     ...result,
     projects: (result.projects || []).slice(0, limit),
+  };
+}
+
+function cacheProjects(state, result, clock) {
+  if (!Array.isArray(result?.projects)) return result;
+  state.projectListCache = {
+    ...result,
+    projects: [...result.projects],
+    at: clock(),
+  };
+  return result;
+}
+
+function cachedProjects(state, limit) {
+  const cached = state.projectListCache;
+  if (!cached?.projects?.length) return null;
+  return {
+    ...cached,
+    projects: cached.projects.slice(0, limit),
+    stale: true,
+  };
+}
+
+async function listProjectsForResponse(provider, state, config, limit, options = {}) {
+  const { preferCache = false } = options;
+  if (preferCache) {
+    const cached = cachedProjects(state, limit);
+    if (cached) return cached;
+  }
+  try {
+    return cacheProjects(state, await listProjects(provider, limit), config.clock);
+  } catch (err) {
+    const message = safeJsonError(err);
+    bridgeDebug(config, "project-list-failed", { reason: message });
+    const cached = cachedProjects(state, limit);
+    if (cached) {
+      config.logger?.warn?.(`[g2-projects] using cached project list: ${message}`);
+      return { ...cached, error: message };
+    }
+    throw err;
+  }
+}
+
+function projectsResponseBody(result, state) {
+  return {
+    sessions: (result.projects || []).map(projectRowToEvenSession),
+    projects: result.projects || [],
+    selectedProject: state.selectedProject,
+    mode: "projects",
+    stale: Boolean(result.stale),
+    error: result.error || undefined,
   };
 }
 
@@ -2643,6 +2730,8 @@ function createBridge(options = {}) {
     projectActiveSessions: new Map(),
     pendingProjectPrompts: new Map(),
     projectPromptLocks: new Map(),
+    projectSessionRowsCache: new Map(),
+    projectListCache: null,
     navigationEpoch: 0,
     selectedProject: null,
     selectedSession: null,
@@ -2739,22 +2828,17 @@ function createBridge(options = {}) {
       Math.max(Number.parseInt(req.query.limit || String(config.sessionLimit), 10), 1),
       config.sessionLimit,
     );
+    const wantsProjects =
+      req.query.view === "projects" ||
+      req.query.scope === "projects" ||
+      (!state.selectedProject && config.showProjectsFirst);
     try {
-      const wantsProjects =
-        req.query.view === "projects" ||
-        req.query.scope === "projects" ||
-        (!state.selectedProject && config.showProjectsFirst);
       if (wantsProjects) {
-        const result = await listProjects(provider, config.projectLimit);
-        res.json({
-          sessions: result.projects.map(projectRowToEvenSession),
-          projects: result.projects,
-          selectedProject: state.selectedProject,
-          mode: "projects",
-        });
+        const result = await listProjectsForResponse(provider, state, config, config.projectLimit);
+        res.json(projectsResponseBody(result, state));
         return;
       }
-      const { sessions, snapshot } = await projectSessionMenuRows(
+      const { sessions, snapshot, stale, error } = await projectSessionMenuRows(
         provider,
         state,
         config,
@@ -2767,8 +2851,54 @@ function createBridge(options = {}) {
         selectedProject: state.selectedProject,
         selectedSession: state.selectedSession,
         mode: "sessions",
+        stale,
+        error: error || undefined,
       });
     } catch (err) {
+      const message = safeJsonError(err);
+      bridgeDebug(config, "sessions-endpoint-failed", {
+        mode: wantsProjects ? "projects" : "sessions",
+        reason: message,
+      });
+      if (wantsProjects) {
+        const cached = cachedProjects(state, config.projectLimit);
+        if (cached) {
+          res.json(projectsResponseBody({ ...cached, error: message }, state));
+          return;
+        }
+      } else if (state.selectedProject) {
+        const activeRow = activeProjectSessionRow(state, state.selectedProject);
+        const pendingRow = pendingProjectPromptForProject(state, state.selectedProject);
+        const rows = [
+          ...(config.showBackToProjectsRow ? [projectMenuRow(state.selectedProject)] : []),
+          ...(activeRow ? [activeRow] : []),
+          ...(pendingRow ? [pendingRow] : []),
+        ];
+        if (rows.length) {
+          res.json({
+            sessions: rows,
+            snapshot: {
+              generated_at: Math.floor(config.clock() / 1000),
+              summary: `Using local G2 session state after list failure: ${message}`,
+              counts: rows.reduce((acc, session) => {
+                const status = session.status || "unknown";
+                acc[status] = (acc[status] || 0) + 1;
+                return acc;
+              }, {}),
+              policy: {
+                raw_terminal_buffers: false,
+                source: "local_state_fallback",
+              },
+            },
+            selectedProject: state.selectedProject,
+            selectedSession: state.selectedSession,
+            mode: "sessions",
+            stale: true,
+            error: message,
+          });
+          return;
+        }
+      }
       res.status(500).json({ sessions: [], error: safeJsonError(err) });
     }
   });
@@ -2779,7 +2909,7 @@ function createBridge(options = {}) {
       config.projectLimit,
     );
     try {
-      const result = await listProjects(provider, limit);
+      const result = await listProjectsForResponse(provider, state, config, limit);
       res.json({
         ...result,
         selectedProject: state.selectedProject,
@@ -3180,8 +3310,25 @@ function createBridge(options = {}) {
       audit("history_project_menu", {
         priorProjectId: priorProject?.id || priorProject?.tenant_id || "",
       });
+      let result;
+      try {
+        result = await listProjectsForResponse(
+          provider,
+          state,
+          config,
+          config.projectLimit,
+          { preferCache: true },
+        );
+      } catch (err) {
+        result = {
+          projects: [],
+          stale: true,
+          error: safeJsonError(err),
+        };
+      }
       res.json({
-        history: [{ role: "assistant", text: "Back to projects" }],
+        ...projectsResponseBody(result, state),
+        history: [],
         navigation: navigationPayload(state, { action: "navigate_projects" }),
       });
       return;
@@ -3325,7 +3472,7 @@ function createBridge(options = {}) {
         }
         state.selectedSession = null;
         bumpNavigationEpoch(state);
-        const { sessions, snapshot } = await projectSessionMenuRows(
+        const { sessions, snapshot, stale, error } = await projectSessionMenuRows(
           provider,
           state,
           config,
@@ -3349,6 +3496,8 @@ function createBridge(options = {}) {
           activeSessionId: activeSession?.id || null,
           projectActiveSessionId: activeSession ? `${PROJECT_ACTIVE_SESSION_PREFIX}${projectId}` : null,
           navigation: navigationPayload(state, { action: "select_project", mode: "sessions" }),
+          stale,
+          error: error || undefined,
         });
         return;
       }
