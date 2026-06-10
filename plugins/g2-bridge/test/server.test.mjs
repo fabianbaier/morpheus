@@ -2240,6 +2240,46 @@ test("simulator client sees delayed result from prompt response without EventSou
   assert.match(submitted.glassesText, /answer for: what is 2 plus 2 plus 2/);
 });
 
+test("simulator stock polling catches glasses updates through sessions endpoint", async (t) => {
+  const { baseUrl } = await withBridge(t, {
+    agentBackend: "codex_app_server",
+    createCodexAgentProvider: fakeCodexAgentProvider({
+      asyncResultMs: 20,
+      promptReturnDelayMs: 60,
+    }),
+    mirrorCodexTui: false,
+    showProjectsFirst: true,
+  });
+  const calls = [];
+  const fetchImpl = async (url, options) => {
+    const parsed = new URL(url);
+    calls.push(`${parsed.pathname}${parsed.search}`);
+    return fetch(url, options);
+  };
+  const client = new G2BridgeClient({
+    bridgeUrl: baseUrl,
+    token: TOKEN,
+    fetchImpl,
+    eventSourceFactory: () => null,
+  });
+
+  await client.connect();
+  await client.activateSelected();
+  const submitted = await client.submitTranscriptViaSessionPolling("what is 4 plus 5", {
+    waitFor: /answer for: what is 4 plus 5/,
+    timeoutMs: 1000,
+    intervalMs: 20,
+  });
+
+  assert.equal(submitted.mode, "session");
+  assert.equal(submitted.status, "idle");
+  assert.equal(submitted.selectedSession.id, "project-session:p_alpha");
+  assert.equal(submitted.activeSessionId, "codex-thread-1");
+  assert.match(submitted.glassesText, /answer for: what is 4 plus 5/);
+  assert.equal(calls.some((path) => path.startsWith("/api/messages")), false);
+  assert.ok(calls.filter((path) => path.startsWith("/api/sessions")).length >= 3);
+});
+
 test("sessions poll includes active session result for glasses session view", async (t) => {
   const { baseUrl } = await withBridge(t, {
     agentBackend: "codex_app_server",

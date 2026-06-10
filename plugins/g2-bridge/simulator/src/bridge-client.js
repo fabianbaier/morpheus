@@ -75,6 +75,39 @@ function historyToMessages(history) {
   );
 }
 
+function outputTextFromBody(body) {
+  if (!body || typeof body !== "object") return "";
+  if (body.text) return String(body.text);
+  if (body.answer) return String(body.answer);
+  if (body.message) return String(body.message);
+  if (body.response) return String(body.response);
+  if (body.output?.text) return String(body.output.text);
+  if (body.selectedSession?.latestOutput) return String(body.selectedSession.latestOutput);
+  return "";
+}
+
+function messagesFromResponseBody(body) {
+  const messages = coerceArray(body?.messages).map((message) => normalizeMessage(message));
+  if (messages.length) return messages;
+
+  const historyMessages = historyToMessages(body?.history || body?.selectedSession?.history);
+  if (historyMessages.length) return historyMessages;
+
+  const text = outputTextFromBody(body);
+  return text
+    ? [
+        normalizeMessage(
+          {
+            type: "result",
+            role: "assistant",
+            text,
+          },
+          { id: 1 },
+        ),
+      ]
+    : [];
+}
+
 function truncateLine(value, max = 76) {
   const clean = String(value || "").replace(/\s+/g, " ").trim();
   if (clean.length <= max) return clean;
@@ -255,14 +288,31 @@ export class G2BridgeClient {
     const body = await this.api("/api/sessions");
     const rows = coerceArray(body.sessions);
     const firstSelectable = Math.min(rows.length - 1, rows.findIndex((row) => row.id !== NAV_PROJECTS_ID));
+    const view = body.view || body.mode || "sessions";
+    const selectedSession = body.selectedSession || null;
+    const messages = messagesFromResponseBody(body);
+    const displaySessionId =
+      body.displaySessionId ||
+      body.projectActiveSessionId ||
+      selectedSession?.projectActiveSessionId ||
+      selectedSession?.id ||
+      this.state.displaySessionId;
+    const activeSessionId =
+      body.activeSessionId ||
+      selectedSession?.activeSessionId ||
+      selectedSession?.realSessionId ||
+      this.state.activeSessionId;
     this.state = {
       ...this.state,
-      mode: body.mode || "sessions",
+      mode: view,
       rows,
       selectedIndex: firstSelectable >= 0 ? firstSelectable : 0,
       selectedProject: body.selectedProject || this.state.selectedProject,
-      selectedSession: body.selectedSession || null,
-      status: "idle",
+      selectedSession,
+      displaySessionId: selectedSession ? displaySessionId : this.state.displaySessionId,
+      activeSessionId: activeSessionId || "",
+      messages: messages.length ? messages : view === "session" ? this.state.messages : [],
+      status: body.state || selectedSession?.status || "idle",
       error: "",
     };
     this.emit();
@@ -402,6 +452,41 @@ export class G2BridgeClient {
     return this.snapshot();
   }
 
+  async submitTranscriptViaSessionPolling(text, options = {}) {
+    const clean = String(text || "").trim();
+    if (!clean) return this.snapshot();
+    const localMessage = normalizeMessage(
+      {
+        type: "user_prompt",
+        role: "user",
+        text: clean,
+      },
+      { id: lastMessageId(this.state.messages) + 1 },
+    );
+    this.state = {
+      ...this.state,
+      mode: "session",
+      messages: this.mergeMessages([localMessage]),
+      status: "busy",
+      error: "",
+    };
+    this.emit();
+
+    await this.api("/api/transcript/finalize", {
+      body: {
+        text: clean,
+        sessionId: this.state.displaySessionId || undefined,
+        clientRequestId: requestId("sim-stock-transcript"),
+      },
+    });
+
+    const waitFor = options.waitFor || options.pattern || null;
+    if (waitFor) {
+      return this.waitForTextViaSessions(waitFor, options);
+    }
+    return this.refreshSessions();
+  }
+
   async loadHistory(sessionId = this.state.displaySessionId) {
     if (!sessionId) return [];
     const body = await this.api(`/api/sessions/${encodeURIComponent(sessionId)}/history?limit=10`);
@@ -496,6 +581,23 @@ export class G2BridgeClient {
       await new Promise((resolve) => setTimeout(resolve, intervalMs));
     }
     throw new Error(`Timed out waiting for ${String(pattern)}`);
+  }
+
+  async waitForTextViaSessions(pattern, options = {}) {
+    const timeoutMs = options.timeoutMs || 3000;
+    const intervalMs = options.intervalMs || 100;
+    const matcher = typeof pattern === "string" ? (text) => text.includes(pattern) : (text) => pattern.test(text);
+    const started = Date.now();
+    while (Date.now() - started < timeoutMs) {
+      const text = buildGlassesText(this.state);
+      if (matcher(text)) return this.snapshot();
+      await this.refreshSessions().catch((err) => {
+        this.state = { ...this.state, error: err.message };
+        this.emit();
+      });
+      await new Promise((resolve) => setTimeout(resolve, intervalMs));
+    }
+    throw new Error(`Timed out waiting for ${String(pattern)} through /api/sessions polling`);
   }
 }
 

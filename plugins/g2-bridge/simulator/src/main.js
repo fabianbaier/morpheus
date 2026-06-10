@@ -179,7 +179,7 @@ elements.refreshButton.addEventListener("click", () =>
 elements.sendTranscriptButton.addEventListener("click", () =>
   runAction(async () => {
     saveConfig();
-    await client.submitTranscript(elements.transcriptText.value);
+    await client.submitTranscriptViaSessionPolling(elements.transcriptText.value);
   }),
 );
 
