@@ -1,7 +1,8 @@
 const DEFAULT_BRIDGE_URL = "http://127.0.0.1:3456";
 const PROJECT_PREFIX = "project:";
 const PROJECT_SESSION_PREFIX = "project-session:";
-const NAV_PROJECTS_ID = "nav:projects";
+const NAV_PROJECTS_ID = "project:__projects__";
+const LEGACY_NAV_PROJECTS_ID = "nav:projects";
 
 function trimTrailingSlash(value) {
   return String(value || "").replace(/\/+$/, "");
@@ -284,7 +285,7 @@ export class G2BridgeClient {
   async activateSelected() {
     const row = this.selectedRow();
     if (!row?.id) return this.snapshot();
-    if (row.id === NAV_PROJECTS_ID) return this.navigateBack();
+    if (row.id === NAV_PROJECTS_ID || row.id === LEGACY_NAV_PROJECTS_ID) return this.navigateBack();
     if (isProjectRow(row.id)) return this.selectProject(projectIdFromRow(row.id));
     return this.selectSession(row.id);
   }

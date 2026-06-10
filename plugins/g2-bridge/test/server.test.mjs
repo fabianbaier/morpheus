@@ -353,8 +353,10 @@ test("selects a project and then lists project sessions", async (t) => {
   assert.equal(sessions.status, 200);
   const body = await sessions.json();
   assert.equal(body.mode, "sessions");
-  assert.equal(body.sessions[0].id, "nav:projects");
+  assert.equal(body.sessions[0].id, "project:__projects__");
   assert.equal(body.sessions[0].title, "Back to projects");
+  assert.equal(body.sessions[0].promptBehavior, "select_project");
+  assert.equal(body.sessions[0].allowedActions.includes("select_project"), true);
   assert.equal(body.sessions[1].id, "abc123");
   assert.equal(body.sessions[1].provider, "codex");
   assert.equal(body.selectedProject.id, "p_alpha");
@@ -371,7 +373,7 @@ test("opening a project row history returns project session rows without menu tr
   assert.equal(body.navigation.action, "select_project");
   assert.equal(body.selectedProject.id, "p_alpha");
   assert.equal(body.selectedSession, null);
-  assert.equal(body.sessions[0].id, "nav:projects");
+  assert.equal(body.sessions[0].id, "project:__projects__");
   assert.equal(body.sessions[1].id, "abc123");
   assert.deepEqual(body.history, []);
 });
@@ -389,7 +391,7 @@ test("codex app-server project menu includes Morpheus snapshot sessions after br
   const historyBody = await projectHistory.json();
   assert.equal(historyBody.mode, "sessions");
   assert.equal(historyBody.navigation.view, "sessions");
-  assert.equal(historyBody.sessions[0].id, "nav:projects");
+  assert.equal(historyBody.sessions[0].id, "project:__projects__");
   assert.equal(historyBody.sessions[1].id, "abc123");
   assert.equal(historyBody.selectedSession, null);
   assert.deepEqual(historyBody.history, []);
@@ -619,7 +621,7 @@ test("two-step back navigation remains available when direct mode is disabled", 
   const sessions = await request(baseUrl, `/api/sessions?token=${TOKEN}`, { token: null });
   const sessionsBody = await sessions.json();
   assert.equal(sessionsBody.mode, "sessions");
-  assert.equal(sessionsBody.sessions[0].id, "nav:projects");
+  assert.equal(sessionsBody.sessions[0].id, "project:__projects__");
   assert.equal(sessionsBody.sessions[1].id, "abc123");
 
   const backTwo = await request(baseUrl, "/api/interrupt", {
@@ -671,10 +673,10 @@ test("project menu row returns from sessions to projects", async (t) => {
 
   const sessions = await request(baseUrl, `/api/sessions?token=${TOKEN}`, { token: null });
   const sessionsBody = await sessions.json();
-  assert.equal(sessionsBody.sessions[0].id, "nav:projects");
+  assert.equal(sessionsBody.sessions[0].id, "project:__projects__");
 
   const selectNav = await request(baseUrl, "/api/select-session", {
-    body: { sessionId: "nav:projects", clientRequestId: "nav-row-select" },
+    body: { sessionId: "project:__projects__", clientRequestId: "nav-row-select" },
   });
   assert.equal(selectNav.status, 200);
   const selectNavBody = await selectNav.json();
@@ -687,13 +689,30 @@ test("project menu row returns from sessions to projects", async (t) => {
   assert.equal(projectsBody.sessions[0].id, "project:p_alpha");
 });
 
+test("project-shaped back row returns projects through select-project", async (t) => {
+  const { baseUrl } = await withBridge(t, { showProjectsFirst: true });
+  await request(baseUrl, "/api/select-project", {
+    body: { projectId: "p_alpha", clientRequestId: "nav-project-shaped-select-project" },
+  });
+
+  const nav = await request(baseUrl, "/api/select-project", {
+    body: { projectId: "__projects__", clientRequestId: "nav-project-shaped-back" },
+  });
+  assert.equal(nav.status, 200);
+  const navBody = await nav.json();
+  assert.equal(navBody.mode, "projects");
+  assert.equal(navBody.navigation.view, "projects");
+  assert.equal(navBody.selectedProject, null);
+  assert.equal(navBody.sessions[0].id, "project:p_alpha");
+});
+
 test("project menu history request returns to projects for stock Even row opens", async (t) => {
   const { baseUrl } = await withBridge(t, { showProjectsFirst: true });
   await request(baseUrl, "/api/select-project", {
     body: { projectId: "p_alpha", clientRequestId: "nav-history-select-project" },
   });
 
-  const history = await request(baseUrl, "/api/sessions/nav:projects/history");
+  const history = await request(baseUrl, "/api/sessions/project:__projects__/history");
   assert.equal(history.status, 200);
   const historyBody = await history.json();
   assert.equal(historyBody.mode, "projects");
@@ -706,6 +725,20 @@ test("project menu history request returns to projects for stock Even row opens"
   const projectsBody = await projects.json();
   assert.equal(projectsBody.mode, "projects");
   assert.equal(projectsBody.sessions[0].id, "project:p_alpha");
+});
+
+test("legacy nav project history still returns projects", async (t) => {
+  const { baseUrl } = await withBridge(t, { showProjectsFirst: true });
+  await request(baseUrl, "/api/select-project", {
+    body: { projectId: "p_alpha", clientRequestId: "legacy-nav-history-select-project" },
+  });
+
+  const history = await request(baseUrl, "/api/sessions/nav:projects/history");
+  assert.equal(history.status, 200);
+  const historyBody = await history.json();
+  assert.equal(historyBody.mode, "projects");
+  assert.deepEqual(historyBody.history, []);
+  assert.equal(historyBody.sessions[0].id, "project:p_alpha");
 });
 
 test("project menu history uses cached project rows if live project listing fails", async (t) => {
@@ -734,7 +767,7 @@ test("project menu history uses cached project rows if live project listing fail
   });
   failProjects = true;
 
-  const history = await request(baseUrl, "/api/sessions/nav:projects/history");
+  const history = await request(baseUrl, "/api/sessions/project:__projects__/history");
   assert.equal(history.status, 200);
   const historyBody = await history.json();
   assert.equal(historyBody.mode, "projects");
@@ -798,7 +831,7 @@ test("session menu polling uses cached rows if live provider listing fails", asy
   assert.equal(secondBody.stale, true);
   assert.match(secondBody.error, /codex list sessions down/);
   assert.equal(secondBody.sessions.some((session) => session.id === "codex-cached"), true);
-  assert.equal(secondBody.sessions[0].id, "nav:projects");
+  assert.equal(secondBody.sessions[0].id, "project:__projects__");
 });
 
 test("spawns a local Morpheus session when prompting a project row", async (t) => {
@@ -937,7 +970,7 @@ test("codex app-server backend mirrors results to project row and default messag
 
   const sessions = await request(baseUrl, `/api/sessions?token=${TOKEN}`, { token: null });
   const sessionsBody = await sessions.json();
-  assert.equal(sessionsBody.sessions[0].id, "nav:projects");
+  assert.equal(sessionsBody.sessions[0].id, "project:__projects__");
   assert.equal(sessionsBody.sessions[1].id, "project-session:p_beta");
   assert.equal(sessionsBody.sessions[1].activeSessionId, "codex-thread-1");
   assert.equal(sessionsBody.sessions[1].latestOutput, "answer for: alias target please");
@@ -974,7 +1007,7 @@ test("project row messages stop exposing transcript output after leaving the ses
     "answer for: visible only while live",
   );
 
-  await request(baseUrl, "/api/sessions/nav:projects/history");
+  await request(baseUrl, "/api/sessions/project:__projects__/history");
 
   const staleProjectMessages = await request(baseUrl, "/api/messages?sessionId=project:p_alpha");
   const staleProjectBody = await staleProjectMessages.json();
@@ -1212,7 +1245,7 @@ test("codex app-server backend keeps follow-ups in the selected session", async 
   const sessions = await request(baseUrl, "/api/sessions?token=test-token-123456", { token: null });
   const sessionsBody = await sessions.json();
   assert.equal(sessionsBody.sessions.filter((session) => session.id === "codex-thread-1").length, 0);
-  assert.equal(sessionsBody.sessions[0].id, "nav:projects");
+  assert.equal(sessionsBody.sessions[0].id, "project:__projects__");
   assert.equal(sessionsBody.sessions[1].id, "project-session:p_alpha");
   assert.equal(sessionsBody.sessions[1].activeSessionId, "codex-thread-1");
   assert.equal(sessionsBody.sessions[1].latestOutput, "answer for: same session follow up");
@@ -1246,13 +1279,13 @@ test("project row follow-up reuses remembered active session after back and reop
     },
   });
 
-  await request(baseUrl, "/api/sessions/nav:projects/history");
+  await request(baseUrl, "/api/sessions/project:__projects__/history");
   const projectHistory = await request(baseUrl, "/api/sessions/project:p_alpha/history");
   const projectHistoryBody = await projectHistory.json();
   assert.equal(projectHistoryBody.navigation.view, "sessions");
   assert.equal(projectHistoryBody.selectedSession, null);
   assert.equal(projectHistoryBody.mode, "sessions");
-  assert.equal(projectHistoryBody.sessions[0].id, "nav:projects");
+  assert.equal(projectHistoryBody.sessions[0].id, "project:__projects__");
   assert.equal(projectHistoryBody.sessions[1].id, "project-session:p_alpha");
 
   const activeHistory = await request(baseUrl, "/api/sessions/project-session:p_alpha/history");
@@ -1353,7 +1386,7 @@ test("project row history returns the session menu after leaving a live session"
   const projectHistoryBody = await projectHistory.json();
   assert.equal(projectHistoryBody.navigation.view, "sessions");
   assert.equal(projectHistoryBody.mode, "sessions");
-  assert.equal(projectHistoryBody.sessions[0].id, "nav:projects");
+  assert.equal(projectHistoryBody.sessions[0].id, "project:__projects__");
   assert.equal(projectHistoryBody.sessions[1].id, "project-session:p_alpha");
 
   const history = await request(baseUrl, "/api/sessions/project-session:p_alpha/history");
@@ -1727,7 +1760,7 @@ test("stale project row event stream does not replay transcript after leaving se
       clientRequestId: "codex-stale-event-prompt",
     },
   });
-  await request(baseUrl, "/api/sessions/nav:projects/history");
+  await request(baseUrl, "/api/sessions/project:__projects__/history");
 
   const events = await fetch(`${baseUrl}/api/events?sessionId=project:p_alpha&token=${TOKEN}`);
   assert.equal(events.status, 200);
@@ -1914,7 +1947,7 @@ test("selecting an active project-session row reopens its real codex session", a
       clientRequestId: "codex-select-project-row-first",
     },
   });
-  await request(baseUrl, "/api/sessions/nav:projects/history");
+  await request(baseUrl, "/api/sessions/project:__projects__/history");
 
   const select = await request(baseUrl, "/api/select-session", {
     body: {
@@ -1954,7 +1987,7 @@ test("selecting a project row after an active session enters project sessions wi
       clientRequestId: "codex-select-project-row-nav-first",
     },
   });
-  await request(baseUrl, "/api/sessions/nav:projects/history");
+  await request(baseUrl, "/api/sessions/project:__projects__/history");
 
   const select = await request(baseUrl, "/api/select-session", {
     body: {
@@ -1971,7 +2004,7 @@ test("selecting a project row after an active session enters project sessions wi
 
   const sessions = await request(baseUrl, `/api/sessions?token=${TOKEN}`, { token: null });
   const sessionsBody = await sessions.json();
-  assert.equal(sessionsBody.sessions[0].id, "nav:projects");
+  assert.equal(sessionsBody.sessions[0].id, "project:__projects__");
   assert.equal(sessionsBody.sessions[1].id, "project-session:p_alpha");
   assert.equal(sessionsBody.sessions[1].latestOutput, "answer for: first project navigation turn");
 });
@@ -1999,7 +2032,7 @@ test("codex app-server backend hides old codex history from project session list
 
   const before = await request(baseUrl, `/api/sessions?token=${TOKEN}`, { token: null });
   const beforeBody = await before.json();
-  assert.deepEqual(beforeBody.sessions.map((session) => session.id), ["nav:projects", "abc123"]);
+  assert.deepEqual(beforeBody.sessions.map((session) => session.id), ["project:__projects__", "abc123"]);
   assert.equal(beforeBody.sessions.some((session) => session.id === "old-cached-thread"), false);
 
   await request(baseUrl, "/api/prompt", {
@@ -2008,7 +2041,7 @@ test("codex app-server backend hides old codex history from project session list
   const after = await request(baseUrl, `/api/sessions?token=${TOKEN}`, { token: null });
   const afterBody = await after.json();
   assert.equal(afterBody.sessions.some((session) => session.id === "codex-thread-1"), false);
-  assert.equal(afterBody.sessions[0].id, "nav:projects");
+  assert.equal(afterBody.sessions[0].id, "project:__projects__");
   assert.equal(afterBody.sessions[1].id, "project-session:p_alpha");
   assert.equal(afterBody.sessions[1].activeSessionId, "codex-thread-1");
   assert.equal(afterBody.sessions.some((session) => session.id === "old-cached-thread"), false);

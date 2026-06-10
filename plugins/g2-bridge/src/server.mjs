@@ -38,7 +38,9 @@ const EVEN_APP_ORIGINS = [
 const REQUEST_ID_RE = /^[A-Za-z0-9._:-]{8,128}$/;
 const PROJECT_SESSION_PREFIX = "project:";
 const PROJECT_ACTIVE_SESSION_PREFIX = "project-session:";
-const PROJECTS_NAV_SESSION_ID = "nav:projects";
+const PROJECTS_NAV_PROJECT_ID = "__projects__";
+const PROJECTS_NAV_SESSION_ID = `${PROJECT_SESSION_PREFIX}${PROJECTS_NAV_PROJECT_ID}`;
+const LEGACY_PROJECTS_NAV_SESSION_ID = "nav:projects";
 const SECRET_LIKE_RE =
   /\b(sk-[A-Za-z0-9_-]{20,}|AKIA[0-9A-Z]{16}|BEGIN [A-Z ]*PRIVATE KEY)\b/;
 
@@ -855,8 +857,8 @@ function projectMenuRow(project) {
     cwd: String(project?.root_path || ""),
     provider: "codex",
     status: "idle",
-    allowedActions: ["list_projects", "navigate_back"],
-    promptBehavior: "navigate_back",
+    allowedActions: ["select_project", "list_projects", "navigate_back"],
+    promptBehavior: "select_project",
     preview: "Return to project list",
     lastMessage: "Return to project list",
     navigation: {
@@ -867,7 +869,11 @@ function projectMenuRow(project) {
 }
 
 function isProjectMenuSessionId(sessionId) {
-  return sessionId === PROJECTS_NAV_SESSION_ID;
+  return sessionId === PROJECTS_NAV_SESSION_ID || sessionId === LEGACY_PROJECTS_NAV_SESSION_ID;
+}
+
+function isProjectsNavProjectId(projectId) {
+  return projectId === PROJECTS_NAV_PROJECT_ID;
 }
 
 function shortText(value, max = 240) {
@@ -1040,6 +1046,7 @@ function toEvenStatus(state) {
 }
 
 function projectIdFromSessionId(sessionId) {
+  if (isProjectMenuSessionId(sessionId)) return "";
   if (typeof sessionId !== "string" || !sessionId.startsWith(PROJECT_SESSION_PREFIX)) {
     return "";
   }
@@ -3056,6 +3063,43 @@ function createBridge(options = {}) {
     const projectId = req.body?.projectId || projectIdFromSessionId(req.body?.sessionId);
     if (!projectId || typeof projectId !== "string") {
       res.status(400).json({ error: "Missing projectId", code: "missing_project_id" });
+      return;
+    }
+    if (isProjectsNavProjectId(projectId) || isProjectMenuSessionId(req.body?.sessionId)) {
+      const priorProject = state.selectedProject;
+      state.selectedProject = null;
+      state.selectedSession = null;
+      bumpNavigationEpoch(state);
+      let result;
+      try {
+        result = await listProjectsForResponse(
+          provider,
+          state,
+          config,
+          config.projectLimit,
+          { preferCache: true },
+        );
+      } catch (err) {
+        result = {
+          projects: [],
+          stale: true,
+          error: safeJsonError(err),
+        };
+      }
+      const body = {
+        ...projectsResponseBody(result, state),
+        navigation: navigationPayload(state, {
+          action: "navigate_projects",
+          requestId,
+        }),
+        requestId,
+      };
+      rememberReplay(req, state, requestId, 200, body, config.clock, config.requestIdTtlMs);
+      audit("select_project_menu", {
+        requestId,
+        priorProjectId: priorProject?.id || priorProject?.tenant_id || "",
+      });
+      res.json(body);
       return;
     }
     try {
