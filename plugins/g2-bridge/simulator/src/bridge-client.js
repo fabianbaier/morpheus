@@ -288,7 +288,7 @@ export class G2BridgeClient {
     const body = await this.api("/api/sessions");
     const rows = coerceArray(body.sessions);
     const firstSelectable = Math.min(rows.length - 1, rows.findIndex((row) => row.id !== NAV_PROJECTS_ID));
-    const view = body.view || body.mode || "sessions";
+    const view = body.mode || body.view || "sessions";
     const selectedSession = body.selectedSession || null;
     const messages = messagesFromResponseBody(body);
     const displaySessionId =

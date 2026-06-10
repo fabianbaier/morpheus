@@ -3023,6 +3023,7 @@ function createBridge(options = {}) {
       }
       const selected = selectedSessionResponse(state);
       const responseText = selected.text;
+      const view = navigationView(state);
       res.json({
         sessions,
         snapshot,
@@ -3039,8 +3040,8 @@ function createBridge(options = {}) {
         message: responseText,
         response: responseText,
         output: responseText ? { text: responseText } : undefined,
-        mode: "sessions",
-        view: navigationView(state),
+        mode: view,
+        view,
         stale,
         error: error || undefined,
       });
@@ -3061,6 +3062,7 @@ function createBridge(options = {}) {
         const pendingRow = pendingProjectPromptForProject(state, state.selectedProject);
         const selected = selectedSessionResponse(state);
         const responseText = selected.text;
+        const view = navigationView(state);
         const rows = [
           ...(config.showBackToProjectsRow ? [projectMenuRow(state.selectedProject)] : []),
           ...(activeRow ? [activeRow] : []),
@@ -3095,8 +3097,8 @@ function createBridge(options = {}) {
             message: responseText,
             response: responseText,
             output: responseText ? { text: responseText } : undefined,
-            mode: "sessions",
-            view: navigationView(state),
+            mode: view,
+            view,
             stale: true,
             error: message,
           });
@@ -3624,6 +3626,8 @@ function createBridge(options = {}) {
         }
         res.json({
           history,
+          mode: "session",
+          view: "session",
           selectedProject: state.selectedProject,
           selectedSession: activeProjectSessionRow(state, state.selectedProject) || activeSession,
           activeSessionId: activeSession.id,
@@ -3666,6 +3670,7 @@ function createBridge(options = {}) {
               },
             },
             mode: "session",
+            view: "session",
             selectedProject: state.selectedProject,
             selectedSession: pendingProjectRow,
             activeSessionId: null,
@@ -3712,6 +3717,8 @@ function createBridge(options = {}) {
           });
           res.json({
             history,
+            mode: "session",
+            view: "session",
             selectedProject: state.selectedProject,
             selectedSession: activeProjectSessionRow(state, state.selectedProject) || state.selectedSession,
             activeSessionId: activeSession.id,

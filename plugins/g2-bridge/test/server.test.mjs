@@ -1502,6 +1502,8 @@ test("project history polling during new session keeps glasses stream live", asy
   const projectHistory = await request(baseUrl, "/api/sessions/project:p_alpha/history");
   assert.equal(projectHistory.status, 200);
   const projectHistoryBody = await projectHistory.json();
+  assert.equal(projectHistoryBody.mode, "session");
+  assert.equal(projectHistoryBody.view, "session");
   assert.equal(projectHistoryBody.navigation.view, "session");
   assert.equal(projectHistoryBody.activeSessionId, "codex-thread-1");
   assert.equal(projectHistoryBody.selectedSession.activeSessionId, "codex-thread-1");
@@ -2349,6 +2351,7 @@ test("sessions poll includes active session result for glasses session view", as
   const body = await sessions.json();
 
   assert.equal(body.view, "session");
+  assert.equal(body.mode, "session");
   assert.equal(body.state, "idle");
   assert.equal(body.selectedSession.id, "project-session:p_alpha");
   assert.equal(body.selectedSession.activeSessionId, "codex-thread-1");
