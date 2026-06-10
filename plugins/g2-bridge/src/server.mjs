@@ -2396,6 +2396,67 @@ async function refreshSessionHistory({ provider, state, config, sessionId }) {
   }
 }
 
+async function refreshSessionForSessionsPoll({ provider, state, config, sessionId, reason = "sessions_poll" }) {
+  if (!sessionId) return { refreshed: false, published: false };
+  const beforeLatestId = latestMessageId(state, sessionId);
+  const beforeHash = state.outputHashes.get(sessionId) || "";
+  const outputResult = await refreshSessionOutput({ provider, state, config, sessionId });
+  const outputText = String(outputResult?.output?.text || "").trim();
+  const historyResult = outputText
+    ? null
+    : await refreshSessionHistory({ provider, state, config, sessionId });
+  const directStatus = provider.getStatus?.(sessionId);
+  const status =
+    toEvenStatus(outputResult?.session?.state) ||
+    outputResult?.session?.state ||
+    directStatus?.state ||
+    statusFromBufferedMessages(state, sessionId, "idle");
+  const afterLatestId = latestMessageId(state, sessionId);
+  const afterHash = state.outputHashes.get(sessionId) || "";
+  const published =
+    afterLatestId !== beforeLatestId ||
+    afterHash !== beforeHash ||
+    Boolean(historyResult?.published);
+
+  bridgeDebug(config, "sessions-poll-refresh", {
+    reason,
+    sessionId,
+    status,
+    outputChars: outputText.length,
+    historyChars: String(historyResult?.text || "").length,
+    published,
+  });
+  return {
+    refreshed: Boolean(outputResult || historyResult),
+    published,
+    status,
+    outputResult,
+    historyResult,
+  };
+}
+
+async function refreshSelectedSessionForSessionsPoll({ provider, state, config, reason }) {
+  const ids = [];
+  const activeProjectSession = state.selectedProject
+    ? activeSessionForProject(state, state.selectedProject)
+    : null;
+  if (activeProjectSession?.id) ids.push(activeProjectSession.id);
+  if (state.selectedSession?.id) ids.push(state.selectedSession.id);
+
+  let published = false;
+  for (const sessionId of [...new Set(ids)]) {
+    const result = await refreshSessionForSessionsPoll({
+      provider,
+      state,
+      config,
+      sessionId,
+      reason,
+    });
+    published = published || Boolean(result.published);
+  }
+  return { published };
+}
+
 function stopOutputPoller(state, sessionId) {
   const timer = state.outputPollers.get(sessionId);
   if (timer) {
@@ -2932,13 +2993,34 @@ function createBridge(options = {}) {
         res.json(projectsResponseBody(result, state));
         return;
       }
-      const { sessions, snapshot, stale, error } = await projectSessionMenuRows(
+      await refreshSelectedSessionForSessionsPoll({
+        provider,
+        state,
+        config,
+        reason: "sessions_poll_before_rows",
+      });
+      let { sessions, snapshot, stale, error } = await projectSessionMenuRows(
         provider,
         state,
         config,
         state.selectedProject,
         limit,
       );
+      const postRefresh = await refreshSelectedSessionForSessionsPoll({
+        provider,
+        state,
+        config,
+        reason: "sessions_poll_after_rows",
+      });
+      if (postRefresh.published) {
+        ({ sessions, snapshot, stale, error } = await projectSessionMenuRows(
+          provider,
+          state,
+          config,
+          state.selectedProject,
+          limit,
+        ));
+      }
       const selected = selectedSessionResponse(state);
       const responseText = selected.text;
       res.json({

@@ -2280,6 +2280,53 @@ test("simulator stock polling catches glasses updates through sessions endpoint"
   assert.ok(calls.filter((path) => path.startsWith("/api/sessions")).length >= 3);
 });
 
+test("simulator polling hydrates terminal mirror output when codex final event is missed", async (t) => {
+  const { baseUrl } = await withBridge(t, {
+    agentBackend: "codex_app_server",
+    createCodexAgentProvider: fakeCodexAgentProvider({
+      emitFinalResult: false,
+      promptReturnDelayMs: 20,
+    }),
+    mirrorCodexTui: true,
+    showProjectsFirst: true,
+    waitForPromptResult: false,
+    outputPollIntervalMs: 5000,
+    outputPollAttempts: 1,
+    runner: fakeMorpheusRunner({
+      mirrorDelayMs: 1200,
+      mirrorOutputText: "terminal-only answer from resumed Codex",
+    }),
+  });
+  const calls = [];
+  const fetchImpl = async (url, options) => {
+    const parsed = new URL(url);
+    calls.push(`${parsed.pathname}${parsed.search}`);
+    return fetch(url, options);
+  };
+  const client = new G2BridgeClient({
+    bridgeUrl: baseUrl,
+    token: TOKEN,
+    fetchImpl,
+    eventSourceFactory: () => null,
+  });
+
+  await client.connect();
+  await client.activateSelected();
+  const submitted = await client.submitTranscriptViaSessionPolling("answer from visible terminal only", {
+    waitFor: /terminal-only answer from resumed Codex/,
+    timeoutMs: 3000,
+    intervalMs: 50,
+  });
+
+  assert.equal(submitted.mode, "session");
+  assert.equal(submitted.status, "idle");
+  assert.equal(submitted.selectedSession.id, "project-session:p_alpha");
+  assert.equal(submitted.activeSessionId, "codex-thread-1");
+  assert.match(submitted.glassesText, /terminal-only answer from resumed Codex/);
+  assert.equal(calls.some((path) => path.startsWith("/api/messages")), false);
+  assert.equal(calls.some((path) => path.startsWith("/api/events")), false);
+});
+
 test("sessions poll includes active session result for glasses session view", async (t) => {
   const { baseUrl } = await withBridge(t, {
     agentBackend: "codex_app_server",
