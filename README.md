@@ -76,6 +76,33 @@ from any worktree and Morpheus will use that terminal's current directory as
 the dashboard cwd and PRD/source-file picker fallback. If `~/.local/bin` is not
 on your `PATH`, the target prints the exact `export PATH=...` line to add.
 
+## Desktop app
+
+Prefer a chat-agent UI that feels like Claude Code / Codex / Cowork? Morpheus
+ships a **desktop cockpit** — the same mission graph, sessions, goals, and loops,
+behind a chat-first window instead of (or alongside) the terminal TUI.
+
+```bash
+morpheus desktop          # start the bridge and open the cockpit
+```
+
+The hero is **"Chat with Morpheus"**: ask about your fleet in plain language
+("what's blocked right now?", "summarize the auth mission"), and issue commands
+via slash syntax (`/spawn`, `/broadcast`, `/note`). A live sessions sidebar, a
+durable **Mission Card** inspector (why / done / plan / next / proof), and a 🐇
+ticker round out a three-pane layout. It is a front-end over the same
+`~/.morpheus/morpheus.db` the CLI uses, so state stays in sync everywhere.
+
+Switch the composer's agent picker from "Ask Morpheus" to **Claude Code**,
+**Codex**, or **Gemini** and the chat drives that real CLI under the hood —
+streaming prose, tool-use cards, and web-search steps, multi-turn with resumed
+sessions — so it feels like Claude Code's own desktop app while staying pure
+Morpheus.
+
+For a native macOS `.app`/`.dmg`, there's an Electron shell under
+`morpheus/desktop/electron/`. Full details — architecture, HTTP API, security
+model, and build instructions — live in [`docs/desktop.md`](docs/desktop.md).
+
 ## Daily Use
 
 Morpheus is meant to be your **home tab** while many agent tabs run around it.

@@ -123,3 +123,8 @@ morpheus.db
 
 # JavaScript plugin dependencies
 plugins/*/node_modules/
+
+# Electron desktop shell build artifacts
+morpheus/desktop/electron/node_modules/
+morpheus/desktop/electron/dist/
+morpheus/desktop/electron/package-lock.json

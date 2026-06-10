@@ -8,6 +8,7 @@ tab/session currently attached to it.
 from __future__ import annotations
 
 import json
+import os
 import re
 import secrets
 import shlex
@@ -18,8 +19,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Optional
 
-DB_DIR = Path.home() / ".morpheus"
-DB_PATH = DB_DIR / "morpheus.db"
+# Storage location. Defaults to ~/.morpheus/morpheus.db but can be overridden via
+# environment so a separate process (e.g. the desktop bridge server, which cannot
+# use the per-call `patch.object(db, "DB_PATH", ...)` convention the tests rely on)
+# can point at an alternate database without code changes. Tests still patch the
+# module globals directly, which keeps working because `_connect()` re-reads them.
+DB_DIR = Path(os.environ.get("MORPHEUS_DB_DIR") or (Path.home() / ".morpheus"))
+DB_PATH = Path(os.environ["MORPHEUS_DB_PATH"]) if os.environ.get("MORPHEUS_DB_PATH") else (DB_DIR / "morpheus.db")
 CODEX_SESSION_ID_RE = re.compile(
     r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b"
 )
@@ -514,8 +520,18 @@ CREATE INDEX IF NOT EXISTS prompt_loop_runs_loop_idx ON prompt_loop_runs(loop_id
 @contextmanager
 def _connect() -> Iterator[sqlite3.Connection]:
     DB_DIR.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=5.0)
     conn.row_factory = sqlite3.Row
+    # WAL lets the CLI, the launchd daemon, and the long-running desktop bridge
+    # read/write the same file concurrently without "database is locked" errors;
+    # busy_timeout makes the rare writer contention block-and-retry instead of
+    # failing immediately. Both are no-ops if already set on the file.
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout=5000")
+        conn.execute("PRAGMA synchronous=NORMAL")
+    except sqlite3.Error:
+        pass
     _ensure_schema(conn)
     try:
         yield conn
