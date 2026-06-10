@@ -14,6 +14,7 @@ const DEFAULT_HOST = "127.0.0.1";
 const DEFAULT_MAX_PROMPT_CHARS = 240;
 const DEFAULT_JSON_LIMIT = "256kb";
 const DEFAULT_RUNNER_TIMEOUT_MS = 10_000;
+const DEFAULT_OUTPUT_RUNNER_TIMEOUT_MS = 30_000;
 const DEFAULT_RUNNER_OUTPUT_BYTES = 256 * 1024;
 const DEFAULT_RUNNER_CONCURRENCY = 2;
 const DEFAULT_REQUEST_ID_TTL_MS = 10 * 60 * 1000;
@@ -85,6 +86,14 @@ function nowIso(clock) {
 
 function sha256(value) {
   return crypto.createHash("sha256").update(value).digest("hex");
+}
+
+function resultFingerprint(text) {
+  return `result:${sha256(String(text || ""))}`;
+}
+
+function outputFingerprint(status, text) {
+  return `output:${String(status || "idle")}:${sha256(String(text || ""))}`;
 }
 
 function shellQuote(value) {
@@ -161,6 +170,16 @@ function latestTerminalMessage(state, sessionId, after = 0) {
   for (let idx = messages.length - 1; idx >= 0; idx -= 1) {
     const msg = messages[idx];
     if (msg.id > after && (msg.type === "result" || msg.type === "error")) return msg;
+  }
+  return null;
+}
+
+function latestTerminalMessageAfterLatestPrompt(state, sessionId) {
+  const messages = getMessages(state, sessionId, 0);
+  for (let idx = messages.length - 1; idx >= 0; idx -= 1) {
+    const msg = messages[idx];
+    if (msg.type === "result" || msg.type === "error") return msg;
+    if (msg.type === "prompt_submitted" || msg.type === "user_prompt") return null;
   }
   return null;
 }
@@ -248,6 +267,66 @@ function pushMessageForSession(state, sessionId, msg) {
     }
   }
   return primaryId;
+}
+
+function markSessionIdle(state, sessionId) {
+  if (state.selectedSession && sessionMatches(state.selectedSession, sessionId)) {
+    state.selectedSession = { ...state.selectedSession, status: "idle" };
+  }
+  for (const [projectId, projectSession] of state.projectActiveSessions) {
+    if (sessionMatches(projectSession, sessionId)) {
+      state.projectActiveSessions.set(projectId, { ...projectSession, status: "idle" });
+    }
+  }
+}
+
+function resultAlreadyPublishedAfterLatestPrompt(state, sessionId, text) {
+  const expected = String(text || "").trim();
+  if (!expected) return false;
+  const messages = getMessages(state, sessionId, 0);
+  for (let idx = messages.length - 1; idx >= 0; idx -= 1) {
+    const message = messages[idx];
+    if (message.type === "result" && String(message.text || "").trim() === expected) {
+      return true;
+    }
+    if (
+      message.type === "prompt_submitted" ||
+      message.type === "user_prompt"
+    ) {
+      return false;
+    }
+  }
+  return false;
+}
+
+function publishAssistantResultIfNew(state, config, sessionId, text, providerName = "codex") {
+  const trimmed = String(text || "").trim();
+  if (!sessionId || !trimmed) return false;
+  const fingerprint = resultFingerprint(trimmed);
+  if (resultAlreadyPublishedAfterLatestPrompt(state, sessionId, trimmed)) {
+    state.outputHashes.set(sessionId, fingerprint);
+    return false;
+  }
+  const outputHash = sha256(trimmed);
+  state.outputHashes.set(sessionId, fingerprint);
+  pushMessageForSession(state, sessionId, {
+    type: "result",
+    success: true,
+    provider: providerName,
+    sessionId,
+    text: trimmed,
+    outputHash,
+    at: nowIso(config.clock),
+  });
+  pushMessageForSession(state, sessionId, {
+    type: "status",
+    state: "idle",
+    provider: providerName,
+    sessionId,
+    at: nowIso(config.clock),
+  });
+  markSessionIdle(state, sessionId);
+  return true;
 }
 
 function rememberSessionAliases(state, sessionId, { project, requestSessionId } = {}) {
@@ -539,15 +618,16 @@ function createMorpheusProvider(options = {}) {
     morpheusBin = "morpheus",
     runner = runJsonCommand,
     runnerTimeoutMs = DEFAULT_RUNNER_TIMEOUT_MS,
+    outputRunnerTimeoutMs = DEFAULT_OUTPUT_RUNNER_TIMEOUT_MS,
     runnerOutputBytes = DEFAULT_RUNNER_OUTPUT_BYTES,
     runnerConcurrency = DEFAULT_RUNNER_CONCURRENCY,
   } = options;
   const semaphore = new Semaphore(runnerConcurrency);
 
-  async function morpheusJson(args) {
+  async function morpheusJson(args, overrides = {}) {
     return semaphore.run(() =>
       runner(morpheusBin, args, {
-        timeoutMs: runnerTimeoutMs,
+        timeoutMs: overrides.timeoutMs || runnerTimeoutMs,
         outputLimitBytes: runnerOutputBytes,
       }),
     );
@@ -664,7 +744,7 @@ function createMorpheusProvider(options = {}) {
         args.push("--project", projectId);
       }
       args.push(sessionId);
-      return morpheusJson(args);
+      return morpheusJson(args, { timeoutMs: outputRunnerTimeoutMs });
     },
   };
 }
@@ -1386,7 +1466,7 @@ function createCodexAppServerBridgeProvider(options = {}) {
       }
     }
     if (entry.type === "result") {
-      state.outputHashes.set(sessionId, sha256(String(entry.text || "")));
+      state.outputHashes.set(sessionId, resultFingerprint(entry.text));
       audit("codex_result_emitted", {
         sessionId,
         success: entry.success !== false,
@@ -2102,16 +2182,23 @@ async function refreshSessionOutput({ provider, state, config, sessionId, publis
     const text = String(result?.output?.text || "").trim();
     if (!text) return null;
     const outputStatus = toEvenStatus(result?.session?.state) || result?.session?.state || "idle";
-    const outputHash = sha256(text);
-    const outputFingerprint = `${outputStatus}:${outputHash}`;
-    if (state.outputHashes.get(sessionId) === outputFingerprint) {
+    const fingerprint = outputStatus === "busy" || outputStatus === "working"
+      ? outputFingerprint(outputStatus, text)
+      : resultFingerprint(text);
+    if (
+      state.outputHashes.get(sessionId) === fingerprint &&
+      (outputStatus === "busy" ||
+        outputStatus === "working" ||
+        resultAlreadyPublishedAfterLatestPrompt(state, sessionId, text))
+    ) {
       return result;
     }
-    state.outputHashes.set(sessionId, outputFingerprint);
     if (!publish) {
+      state.outputHashes.set(sessionId, fingerprint);
       return result;
     }
     if (outputStatus === "busy" || outputStatus === "working") {
+      state.outputHashes.set(sessionId, fingerprint);
       pushMessageForSession(state, sessionId, {
         type: "status",
         state: "busy",
@@ -2121,37 +2208,30 @@ async function refreshSessionOutput({ provider, state, config, sessionId, publis
       });
       return result;
     }
-    pushMessageForSession(state, sessionId, {
-      type: "result",
-      success: true,
-      provider: "codex",
-      sessionId,
-      text,
-      outputHash,
-      at: nowIso(config.clock),
-    });
-    pushMessageForSession(state, sessionId, {
-      type: "status",
-      state: "idle",
-      provider: "codex",
-      sessionId,
-      at: nowIso(config.clock),
-    });
-    if (state.selectedSession && sessionMatches(state.selectedSession, sessionId)) {
-      state.selectedSession = { ...state.selectedSession, status: "idle" };
-    }
-    for (const [projectId, projectSession] of state.projectActiveSessions) {
-      if (sessionMatches(projectSession, sessionId)) {
-        state.projectActiveSessions.set(projectId, { ...projectSession, status: "idle" });
-      }
-    }
+    publishAssistantResultIfNew(state, config, sessionId, text, "codex");
     return result;
   } catch (err) {
-    pushMessageForSession(state, sessionId, {
-      type: "error",
-      provider: provider.name,
-      message: safeJsonError(err),
-      at: nowIso(config.clock),
+    bridgeDebug(config, "session-output-refresh-failed", {
+      sessionId,
+      reason: safeJsonError(err),
+    });
+    config.logger?.warn?.(`[g2-output] ${sessionId}: ${safeJsonError(err)}`);
+    return null;
+  }
+}
+
+async function refreshSessionHistory({ provider, state, config, sessionId }) {
+  if (!sessionId || !provider.getHistory) return null;
+  try {
+    const history = await provider.getHistory(sessionId, 10);
+    const text = latestHistoryText(history, "assistant");
+    if (!text) return { history, text: "", published: false };
+    const published = publishAssistantResultIfNew(state, config, sessionId, text, provider.name || "codex");
+    return { history, text, published };
+  } catch (err) {
+    bridgeDebug(config, "session-history-refresh-failed", {
+      sessionId,
+      reason: safeJsonError(err),
     });
     return null;
   }
@@ -2168,16 +2248,35 @@ function stopOutputPoller(state, sessionId) {
 function scheduleOutputRefresh(context, sessionId) {
   const { config, provider, state } = context;
   if (!sessionId || !provider.sessionOutput || state.outputPollers.has(sessionId)) return;
+  if (latestTerminalMessageAfterLatestPrompt(state, sessionId)) return;
+  const pollAfterId = latestMessageId(state, sessionId);
   let attempts = 0;
+  let running = false;
   const tick = async () => {
-    attempts += 1;
-    const before = state.outputHashes.get(sessionId);
-    const result = await refreshSessionOutput({ provider, state, config, sessionId });
-    const after = state.outputHashes.get(sessionId);
-    const outputStatus = toEvenStatus(result?.session?.state) || result?.session?.state || "idle";
-    const isBusy = outputStatus === "busy" || outputStatus === "working";
-    if ((result?.output?.text && after && after !== before && !isBusy) || attempts >= config.outputPollAttempts) {
-      stopOutputPoller(state, sessionId);
+    if (running) return;
+    running = true;
+    try {
+      if (latestTerminalMessage(state, sessionId, pollAfterId)) {
+        stopOutputPoller(state, sessionId);
+        return;
+      }
+      attempts += 1;
+      const before = state.outputHashes.get(sessionId);
+      const result = await refreshSessionOutput({ provider, state, config, sessionId });
+      const historyResult = result?.output?.text
+        ? null
+        : await refreshSessionHistory({ provider, state, config, sessionId });
+      const after = state.outputHashes.get(sessionId);
+      const outputStatus = toEvenStatus(result?.session?.state) || result?.session?.state || "idle";
+      const isBusy = outputStatus === "busy" || outputStatus === "working";
+      const published =
+        Boolean(historyResult?.published) ||
+        Boolean(result?.output?.text && after && after !== before && !isBusy);
+      if (published || attempts >= config.outputPollAttempts) {
+        stopOutputPoller(state, sessionId);
+      }
+    } finally {
+      running = false;
     }
   };
   const timer = setInterval(tick, config.outputPollIntervalMs);
@@ -2441,6 +2540,12 @@ function buildConfigFromEnv(env = process.env, argv = process.argv.slice(2)) {
       min: 100,
       max: 60_000,
     }),
+    outputRunnerTimeoutMs: envInt(
+      env,
+      "MORPHEUS_G2_OUTPUT_RUNNER_TIMEOUT_MS",
+      DEFAULT_OUTPUT_RUNNER_TIMEOUT_MS,
+      { min: 100, max: 5 * 60_000 },
+    ),
     runnerOutputBytes: envInt(
       env,
       "MORPHEUS_G2_RUNNER_OUTPUT_BYTES",
@@ -2547,6 +2652,7 @@ function createBridge(options = {}) {
     morpheusBin: config.morpheusBin,
     runner: config.runner,
     runnerTimeoutMs: config.runnerTimeoutMs,
+    outputRunnerTimeoutMs: config.outputRunnerTimeoutMs,
     runnerOutputBytes: config.runnerOutputBytes,
     runnerConcurrency: config.runnerConcurrency,
   });

@@ -138,10 +138,13 @@ function fakeCodexAgentProvider({
 function fakeMorpheusRunner({
   mirrorDelayMs = 0,
   mirrorOutputText = "",
+  outputFailuresBeforeSuccess = 0,
+  outputErrorMessage = "morpheus timed out after 10000ms",
   onMirrorStart = () => {},
   onMirrorDone = () => {},
 } = {}) {
   let mirroredTabRef = "";
+  let outputCalls = 0;
   return async (_command, args) => {
     if (args[0] !== "remote") throw new Error(`unexpected command: ${args.join(" ")}`);
 
@@ -189,6 +192,10 @@ function fakeMorpheusRunner({
     if (args[1] === "output") {
       const ref = args[args.length - 1];
       if (ref !== mirroredTabRef) throw new Error(`unexpected output target: ${ref}`);
+      outputCalls += 1;
+      if (outputCalls <= outputFailuresBeforeSuccess) {
+        throw new Error(outputErrorMessage);
+      }
       return {
         ok: true,
         session: {
@@ -271,6 +278,18 @@ async function readStreamFor(body, durationMs = 100) {
   } finally {
     await reader.cancel().catch(() => {});
   }
+}
+
+async function readMessagesUntil(baseUrl, sessionId, predicate, timeoutMs = 1000) {
+  const until = Date.now() + Math.max(1, timeoutMs);
+  let body = null;
+  while (Date.now() < until) {
+    const res = await request(baseUrl, `/api/messages?sessionId=${encodeURIComponent(sessionId)}`);
+    body = await res.json();
+    if (predicate(body.messages || [])) return body;
+    await sleep(20);
+  }
+  throw new Error(`Timed out waiting for messages in ${sessionId}: ${JSON.stringify(body)}`);
 }
 
 test("rejects unauthenticated API reads", async (t) => {
@@ -1347,8 +1366,8 @@ test("project history polling while codex thread id is pending keeps glasses str
   const { baseUrl } = await withBridge(t, {
     agentBackend: "codex_app_server",
     createCodexAgentProvider: fakeCodexAgentProvider({
-      asyncResultMs: 10,
-      promptReturnDelayMs: 90,
+      asyncResultMs: 120,
+      promptReturnDelayMs: 200,
     }),
     mirrorCodexTui: false,
     showProjectsFirst: true,
@@ -1365,7 +1384,7 @@ test("project history polling while codex thread id is pending keeps glasses str
       clientRequestId: "codex-pending-thread-stream",
     },
   });
-  await sleep(20);
+  await sleep(40);
 
   const projectHistory = await request(baseUrl, "/api/sessions/project:p_alpha/history");
   assert.equal(projectHistory.status, 200);
@@ -1415,6 +1434,141 @@ test("mirrored terminal output is streamed when codex app-server misses final re
   assert.equal(
     messagesBody.messages.find((message) => message.type === "result")?.text,
     "terminal mirror answer: 2",
+  );
+});
+
+test("mirrored terminal output timeout is not streamed as the session answer", async (t) => {
+  const { baseUrl } = await withBridge(t, {
+    agentBackend: "codex_app_server",
+    createCodexAgentProvider: fakeCodexAgentProvider({
+      emitFinalResult: false,
+      promptReturnDelayMs: 20,
+    }),
+    mirrorCodexTui: true,
+    showProjectsFirst: true,
+    outputPollIntervalMs: 20,
+    outputPollAttempts: 20,
+    runner: fakeMorpheusRunner({
+      mirrorOutputText: "terminal mirror answer after timeout",
+      outputFailuresBeforeSuccess: 1,
+      outputErrorMessage: "morpheus timed out after 10000ms",
+    }),
+  });
+
+  const events = await fetch(`${baseUrl}/api/events?sessionId=project:p_alpha&token=${TOKEN}`);
+  assert.equal(events.status, 200);
+  const streamed = readStreamUntil(events.body, "terminal mirror answer after timeout", 1500);
+
+  const prompt = await request(baseUrl, "/api/prompt", {
+    body: {
+      sessionId: "project:p_alpha",
+      text: "one plus one after output timeout",
+      clientRequestId: "codex-mirror-output-timeout-stream",
+    },
+  });
+  assert.equal(prompt.status, 202);
+  const eventText = await streamed;
+  assert.match(eventText, /"type":"result"/);
+  assert.doesNotMatch(eventText, /morpheus timed out after 10000ms/);
+
+  const messages = await request(baseUrl, "/api/messages?sessionId=project-session:p_alpha");
+  const messagesBody = await messages.json();
+  assert.equal(
+    messagesBody.messages.find((message) => message.type === "result")?.text,
+    "terminal mirror answer after timeout",
+  );
+  assert.equal(
+    messagesBody.messages.some((message) => String(message.message || message.text || "").includes("timed out")),
+    false,
+  );
+});
+
+test("codex history polling streams final answer when live notification is missed", async (t) => {
+  const { baseUrl } = await withBridge(t, {
+    agentBackend: "codex_app_server",
+    createCodexAgentProvider: fakeCodexAgentProvider({
+      emitFinalResult: false,
+      history: {
+        "codex-thread-1": [
+          { role: "user", text: "history fallback answer" },
+          { role: "assistant", text: "answer from persisted codex history" },
+        ],
+      },
+    }),
+    mirrorCodexTui: false,
+    showProjectsFirst: true,
+    outputPollIntervalMs: 20,
+    outputPollAttempts: 20,
+  });
+
+  const events = await fetch(`${baseUrl}/api/events?sessionId=project:p_alpha&token=${TOKEN}`);
+  assert.equal(events.status, 200);
+  const streamed = readStreamUntil(events.body, "answer from persisted codex history", 1500);
+
+  const prompt = await request(baseUrl, "/api/prompt", {
+    body: {
+      sessionId: "project:p_alpha",
+      text: "history fallback answer",
+      clientRequestId: "codex-history-poll-stream",
+    },
+  });
+  assert.equal(prompt.status, 202);
+  assert.match(await streamed, /"type":"result"/);
+
+  const messages = await request(baseUrl, "/api/messages?sessionId=project-session:p_alpha");
+  const messagesBody = await messages.json();
+  assert.equal(
+    messagesBody.messages.find((message) => message.type === "result")?.text,
+    "answer from persisted codex history",
+  );
+});
+
+test("same mirrored answer can stream again after a follow-up prompt", async (t) => {
+  const { baseUrl } = await withBridge(t, {
+    agentBackend: "codex_app_server",
+    createCodexAgentProvider: fakeCodexAgentProvider({
+      emitFinalResult: false,
+      promptReturnDelayMs: 20,
+    }),
+    mirrorCodexTui: true,
+    showProjectsFirst: true,
+    outputPollIntervalMs: 20,
+    outputPollAttempts: 20,
+    runner: fakeMorpheusRunner({
+      mirrorOutputText: "2",
+    }),
+  });
+
+  const first = await request(baseUrl, "/api/prompt", {
+    body: {
+      sessionId: "project:p_alpha",
+      text: "what is one plus one",
+      clientRequestId: "codex-repeat-answer-first",
+    },
+  });
+  assert.equal(first.status, 202);
+  await readMessagesUntil(
+    baseUrl,
+    "project-session:p_alpha",
+    (messages) => messages.filter((message) => message.type === "result" && message.text === "2").length === 1,
+  );
+
+  const second = await request(baseUrl, "/api/prompt", {
+    body: {
+      sessionId: "project:p_alpha",
+      text: "what is one plus one again",
+      clientRequestId: "codex-repeat-answer-second",
+    },
+  });
+  assert.equal(second.status, 202);
+  const messagesBody = await readMessagesUntil(
+    baseUrl,
+    "project-session:p_alpha",
+    (messages) => messages.filter((message) => message.type === "result" && message.text === "2").length === 2,
+  );
+  assert.equal(
+    messagesBody.messages.filter((message) => message.type === "result" && message.text === "2").length,
+    2,
   );
 });
 
