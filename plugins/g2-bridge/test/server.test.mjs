@@ -55,6 +55,7 @@ function fakeCodexAgentProvider({
   seedSessions = [],
   history = null,
   asyncResultMs = 0,
+  emitFinalResult = true,
   promptReturnDelayMs = 0,
   throwOnProjectHistory = false,
 } = {}) {
@@ -103,6 +104,7 @@ function fakeCodexAgentProvider({
       session.status = "busy";
       emit(id, { type: "status", state: "busy", provider: "codex", sessionId: id });
       const finish = () => {
+        if (!emitFinalResult) return;
         emit(id, {
           type: "result",
           success: true,
@@ -130,9 +132,11 @@ function fakeCodexAgentProvider({
 
 function fakeMorpheusRunner({
   mirrorDelayMs = 0,
+  mirrorOutputText = "",
   onMirrorStart = () => {},
   onMirrorDone = () => {},
 } = {}) {
+  let mirroredTabRef = "";
   return async (_command, args) => {
     if (args[0] !== "remote") throw new Error(`unexpected command: ${args.join(" ")}`);
 
@@ -159,6 +163,7 @@ function fakeMorpheusRunner({
       onMirrorStart();
       if (mirrorDelayMs > 0) await sleep(mirrorDelayMs);
       onMirrorDone();
+      mirroredTabRef = "mirror-tab";
       return {
         ok: true,
         session: {
@@ -172,6 +177,26 @@ function fakeMorpheusRunner({
             name: "alpha",
             root_path: "/tmp/morpheus-alpha",
           },
+        },
+      };
+    }
+
+    if (args[1] === "output") {
+      const ref = args[args.length - 1];
+      if (ref !== mirroredTabRef) throw new Error(`unexpected output target: ${ref}`);
+      return {
+        ok: true,
+        session: {
+          tab_ref: ref,
+          mission_ref: "mirror-mission",
+          state: mirrorOutputText ? "idle" : "working",
+          goal: "G2: mirrored Codex session",
+        },
+        output: {
+          text: mirrorOutputText,
+          lines: mirrorOutputText ? [mirrorOutputText] : [],
+          line_count: mirrorOutputText ? 1 : 0,
+          char_count: mirrorOutputText.length,
         },
       };
     }
@@ -1311,6 +1336,80 @@ test("project history polling during new session keeps glasses stream live", asy
   const navigationBody = await navigation.json();
   assert.equal(navigationBody.view, "session");
   assert.equal(navigationBody.selectedSession.id, "codex-thread-1");
+});
+
+test("project history polling while codex thread id is pending keeps glasses stream live", async (t) => {
+  const { baseUrl } = await withBridge(t, {
+    agentBackend: "codex_app_server",
+    createCodexAgentProvider: fakeCodexAgentProvider({
+      asyncResultMs: 10,
+      promptReturnDelayMs: 90,
+    }),
+    mirrorCodexTui: false,
+    showProjectsFirst: true,
+  });
+
+  const events = await fetch(`${baseUrl}/api/events?sessionId=project:p_alpha&token=${TOKEN}`);
+  assert.equal(events.status, 200);
+  const streamed = readStreamUntil(events.body, "answer for: slow thread id still streams", 1000);
+
+  const prompt = request(baseUrl, "/api/prompt", {
+    body: {
+      sessionId: "project:p_alpha",
+      text: "slow thread id still streams",
+      clientRequestId: "codex-pending-thread-stream",
+    },
+  });
+  await sleep(20);
+
+  const projectHistory = await request(baseUrl, "/api/sessions/project:p_alpha/history");
+  assert.equal(projectHistory.status, 200);
+  const projectHistoryBody = await projectHistory.json();
+  assert.equal(projectHistoryBody.navigation.view, "session");
+  assert.equal(projectHistoryBody.selectedSession.pending, true);
+  assert.doesNotMatch(projectHistoryBody.history[0].text, /No sessions in alpha/);
+
+  const promptRes = await prompt;
+  assert.equal(promptRes.status, 202);
+  assert.match(await streamed, /"type":"result"/);
+});
+
+test("mirrored terminal output is streamed when codex app-server misses final result", async (t) => {
+  const { baseUrl } = await withBridge(t, {
+    agentBackend: "codex_app_server",
+    createCodexAgentProvider: fakeCodexAgentProvider({
+      emitFinalResult: false,
+      promptReturnDelayMs: 20,
+    }),
+    mirrorCodexTui: true,
+    showProjectsFirst: true,
+    outputPollIntervalMs: 20,
+    outputPollAttempts: 20,
+    runner: fakeMorpheusRunner({
+      mirrorOutputText: "terminal mirror answer: 2",
+    }),
+  });
+
+  const events = await fetch(`${baseUrl}/api/events?sessionId=project:p_alpha&token=${TOKEN}`);
+  assert.equal(events.status, 200);
+  const streamed = readStreamUntil(events.body, "terminal mirror answer: 2", 1000);
+
+  const prompt = await request(baseUrl, "/api/prompt", {
+    body: {
+      sessionId: "project:p_alpha",
+      text: "one plus one through mirror",
+      clientRequestId: "codex-mirror-output-stream",
+    },
+  });
+  assert.equal(prompt.status, 202);
+  assert.match(await streamed, /"type":"result"/);
+
+  const messages = await request(baseUrl, "/api/messages?sessionId=project-session:p_alpha");
+  const messagesBody = await messages.json();
+  assert.equal(
+    messagesBody.messages.find((message) => message.type === "result")?.text,
+    "terminal mirror answer: 2",
+  );
 });
 
 test("codex app-server streams results before slow terminal mirror finishes", async (t) => {

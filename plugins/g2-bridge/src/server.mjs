@@ -730,6 +730,43 @@ function projectKey(project) {
   return String(project?.id || project?.tenant_id || "");
 }
 
+function rememberPendingProjectPrompt(state, project, pending) {
+  const key = projectKey(project);
+  if (!key) return null;
+  const row = {
+    id: activeProjectSessionId(project),
+    title: pending.title || "Starting G2 session",
+    timestamp: pending.timestamp || new Date().toISOString(),
+    cwd: String(project?.root_path || ""),
+    provider: "codex",
+    status: "busy",
+    allowedActions: ["select_session", "send_prompt", "interrupt"],
+    promptBehavior: "send_prompt",
+    pending: true,
+    pendingRequestId: pending.requestId || "",
+    activeSessionId: null,
+    realSessionId: null,
+    projectSessionId: projectSessionId(project),
+    projectActiveSessionId: activeProjectSessionId(project),
+    morpheusProject: project,
+  };
+  state.pendingProjectPrompts.set(key, row);
+  return row;
+}
+
+function pendingProjectPromptForProject(state, projectOrId) {
+  const key = typeof projectOrId === "string" ? projectOrId : projectKey(projectOrId);
+  return key ? state.pendingProjectPrompts.get(key) || null : null;
+}
+
+function clearPendingProjectPrompt(state, projectOrId, requestId = "") {
+  const key = typeof projectOrId === "string" ? projectOrId : projectKey(projectOrId);
+  if (!key) return;
+  const pending = state.pendingProjectPrompts.get(key);
+  if (requestId && pending?.pendingRequestId && pending.pendingRequestId !== requestId) return;
+  state.pendingProjectPrompts.delete(key);
+}
+
 function projectMenuRow(project) {
   return {
     id: PROJECTS_NAV_SESSION_ID,
@@ -840,6 +877,7 @@ async function projectSessionMenuRows(provider, state, config, project, limit) {
   });
   const providerSessions = Array.isArray(result) ? result : result.sessions || [];
   const activeProjectRow = activeProjectSessionRow(state, project);
+  const pendingProjectRow = activeProjectRow ? null : pendingProjectPromptForProject(state, project);
   const hydratedSessions = providerSessions.map((session) =>
     hydrateSessionRowWithBufferedHistory(state, session),
   );
@@ -849,6 +887,12 @@ async function projectSessionMenuRows(provider, state, config, project, limit) {
         activeProjectRow,
         ...hydratedSessions.filter((session) => session.id !== activeProjectRow.activeSessionId),
       ]
+    : pendingProjectRow
+      ? [
+          ...(config.showBackToProjectsRow && project ? [projectMenuRow(project)] : []),
+          pendingProjectRow,
+          ...hydratedSessions,
+        ]
     : [
         ...(config.showBackToProjectsRow && project ? [projectMenuRow(project)] : []),
         ...hydratedSessions,
@@ -1363,6 +1407,7 @@ function createCodexAppServerBridgeProvider(options = {}) {
     createCodexAgentProvider?.(emit, client) ||
     createCodexProvider(emit, () => client);
   const morpheusSnapshotSessions = new Map();
+  const codexMirrorSessions = new Map();
 
   async function listMorpheusSnapshotSessions(limit, projectId = "") {
     if (!morpheusProvider?.listSessions) return [];
@@ -1392,10 +1437,11 @@ function createCodexAppServerBridgeProvider(options = {}) {
 
   async function morpheusOutputHistory(sessionId, limit, projectId = "") {
     if (!morpheusProvider?.sessionOutput) return [];
-    if (!isKnownMorpheusSession(sessionId)) return [];
+    const outputSessionId = morpheusOutputSessionId(sessionId);
+    if (!outputSessionId) return [];
     try {
       const result = await morpheusProvider.sessionOutput({
-        sessionId,
+        sessionId: outputSessionId,
         projectId,
         lines: Math.max(1, limit || 10),
       });
@@ -1425,9 +1471,20 @@ function createCodexAppServerBridgeProvider(options = {}) {
 
   function isKnownMorpheusSession(sessionId) {
     if (isSelectedMorpheusSession(sessionId)) return true;
+    if (codexMirrorSessions.has(sessionId)) return true;
     return [...morpheusSnapshotSessions.values()].some((session) =>
       session?.morpheus && sessionMatches(session, sessionId),
     );
+  }
+
+  function morpheusOutputSessionId(sessionId) {
+    const mirrored = codexMirrorSessions.get(sessionId);
+    if (mirrored?.id) return mirrored.id;
+    if (isSelectedMorpheusSession(sessionId)) return state.selectedSession.id;
+    const snapshot = [...morpheusSnapshotSessions.values()].find((session) =>
+      session?.morpheus && sessionMatches(session, sessionId),
+    );
+    return snapshot?.id || "";
   }
 
   async function listCodexSessions(limit, projectId = "") {
@@ -1478,10 +1535,19 @@ function createCodexAppServerBridgeProvider(options = {}) {
         command,
         prompt: "",
       });
+      const mirroredSession = result?.session ? sessionRowToEvenSession(result.session) : null;
+      if (mirroredSession?.id) {
+        codexMirrorSessions.set(sessionId, mirroredSession);
+      }
       audit("codex_tui_mirrored", {
         sessionId,
         projectId: project?.id || project?.tenant_id || "",
         tabRef: result?.session?.tab_ref || "",
+      });
+      bridgeDebug(config, "codex-tui-mirror-ready", {
+        sessionId,
+        projectId: project?.id || project?.tenant_id || "",
+        tabRef: mirroredSession?.id || "",
       });
       return result;
     } catch (err) {
@@ -1660,11 +1726,12 @@ function createCodexAppServerBridgeProvider(options = {}) {
     },
 
     async sessionOutput({ sessionId, projectId, lines = 10 }) {
-      if (!isSelectedMorpheusSession(sessionId)) {
+      const outputSessionId = morpheusOutputSessionId(sessionId);
+      if (!outputSessionId) {
         return { ok: true, skipped: true, output: { text: "", lines: [] } };
       }
       return morpheusProvider.sessionOutput({
-        sessionId,
+        sessionId: outputSessionId,
         projectId: projectId || state.selectedProject?.id || state.selectedProject?.tenant_id || "",
         lines,
       });
@@ -1711,6 +1778,23 @@ async function spawnSessionFromText({ req, res, context, requestId, text, projec
 
   const textHash = sha256(text);
   const promptNavigationEpoch = navigationEpoch(state);
+  const pendingProjectRow = rememberPendingProjectPrompt(state, project, {
+    requestId,
+    title: goalFromRemoteText(text),
+    timestamp: nowIso(config.clock),
+  });
+  if (project) {
+    state.selectedProject = project;
+  }
+  if (pendingProjectRow) {
+    pushMessageForSession(state, projectSessionId(project), {
+      type: "status",
+      state: "busy",
+      provider: provider.name,
+      sessionId: projectSessionId(project),
+      at: nowIso(config.clock),
+    });
+  }
   try {
     const spawnResult = await provider.spawnSession({
       projectId: project.id || project.tenant_id,
@@ -1724,6 +1808,7 @@ async function spawnSessionFromText({ req, res, context, requestId, text, projec
     if (!spawned) {
       throw new Error("morpheus remote spawn returned no session");
     }
+    clearPendingProjectPrompt(state, project, requestId);
     if (navigationEpoch(state) === promptNavigationEpoch) {
       state.selectedProject = project;
       state.selectedSession = spawned;
@@ -1830,6 +1915,7 @@ async function spawnSessionFromText({ req, res, context, requestId, text, projec
     });
     res.status(202).json(body);
   } catch (err) {
+    clearPendingProjectPrompt(state, project, requestId);
     const message = safeJsonError(err);
     const body = { error: message, code: "spawn_failed" };
     audit("remote_spawn_failed", {
@@ -2010,12 +2096,24 @@ async function refreshSessionOutput({ provider, state, config, sessionId, publis
     });
     const text = String(result?.output?.text || "").trim();
     if (!text) return null;
+    const outputStatus = toEvenStatus(result?.session?.state) || result?.session?.state || "idle";
     const outputHash = sha256(text);
-    if (state.outputHashes.get(sessionId) === outputHash) {
+    const outputFingerprint = `${outputStatus}:${outputHash}`;
+    if (state.outputHashes.get(sessionId) === outputFingerprint) {
       return result;
     }
-    state.outputHashes.set(sessionId, outputHash);
+    state.outputHashes.set(sessionId, outputFingerprint);
     if (!publish) {
+      return result;
+    }
+    if (outputStatus === "busy" || outputStatus === "working") {
+      pushMessageForSession(state, sessionId, {
+        type: "status",
+        state: "busy",
+        provider: "codex",
+        sessionId,
+        at: nowIso(config.clock),
+      });
       return result;
     }
     pushMessageForSession(state, sessionId, {
@@ -2071,7 +2169,9 @@ function scheduleOutputRefresh(context, sessionId) {
     const before = state.outputHashes.get(sessionId);
     const result = await refreshSessionOutput({ provider, state, config, sessionId });
     const after = state.outputHashes.get(sessionId);
-    if ((result?.output?.text && after && after !== before) || attempts >= config.outputPollAttempts) {
+    const outputStatus = toEvenStatus(result?.session?.state) || result?.session?.state || "idle";
+    const isBusy = outputStatus === "busy" || outputStatus === "working";
+    if ((result?.output?.text && after && after !== before && !isBusy) || attempts >= config.outputPollAttempts) {
       stopOutputPoller(state, sessionId);
     }
   };
@@ -2431,6 +2531,7 @@ function createBridge(options = {}) {
     sessionAliases: new Map(),
     resultWaiters: new Map(),
     projectActiveSessions: new Map(),
+    pendingProjectPrompts: new Map(),
     projectPromptLocks: new Map(),
     navigationEpoch: 0,
     selectedProject: null,
@@ -3033,6 +3134,46 @@ function createBridge(options = {}) {
           if (resolved.ok) state.selectedProject = resolved.project;
         }
         const activeSession = state.projectActiveSessions.get(projectId) || null;
+        const pendingProjectRow = !activeSession ? pendingProjectPromptForProject(state, projectId) : null;
+        if (pendingProjectRow) {
+          const rows = [
+            ...(config.showBackToProjectsRow && state.selectedProject ? [projectMenuRow(state.selectedProject)] : []),
+            pendingProjectRow,
+          ];
+          bridgeDebug(config, "project-history-pending", {
+            projectId,
+            sessionId,
+            pendingRequestId: pendingProjectRow.pendingRequestId || "",
+          });
+          res.json({
+            history: projectSessionMenuHistory(state.selectedProject, rows),
+            sessions: rows,
+            snapshot: {
+              generated_at: Math.floor(config.clock() / 1000),
+              summary: "1 pending Codex app-server session.",
+              counts: { busy: 1 },
+              policy: {
+                raw_terminal_buffers: false,
+                source: "codex_app_server",
+              },
+            },
+            mode: "session",
+            selectedProject: state.selectedProject,
+            selectedSession: pendingProjectRow,
+            activeSessionId: null,
+            projectActiveSessionId: pendingProjectRow.id,
+            navigation: {
+              ...navigationPayload(state, {
+                action: "select_project_pending_session",
+                mode: "session",
+              }),
+              view: "session",
+              mode: "session",
+              selectedSession: pendingProjectRow,
+            },
+          });
+          return;
+        }
         if (activeProjectHistoryShouldStayLive(state, projectId, activeSession)) {
           const status = statusFromBufferedMessages(state, activeSession.id, activeSession.status || "idle");
           state.selectedSession = {
@@ -3142,12 +3283,15 @@ function createBridge(options = {}) {
       await refreshSessionOutput({ provider, state, config, sessionId });
 	    }
     const projectActiveSession = projectId ? activeSessionForProject(state, projectId) : null;
+    const pendingProjectRow = projectId && !projectActiveSession
+      ? pendingProjectPromptForProject(state, projectId)
+      : null;
     const directStatus = provider.getStatus?.(activeSession?.id || projectActiveSession?.id || sessionId);
     const bufferedStatusTarget = activeSession?.id || projectActiveSession?.id || sessionId;
     const bufferedStatus = statusFromBufferedMessages(
       state,
       bufferedStatusTarget,
-      activeSession?.status || projectActiveSession?.status || selected?.status || "idle",
+      activeSession?.status || projectActiveSession?.status || pendingProjectRow?.status || selected?.status || "idle",
     );
 	    const projectRowIsLiveRequest =
 	      projectId &&
@@ -3160,6 +3304,7 @@ function createBridge(options = {}) {
         state: directStatus?.state || bufferedStatus,
 	        sessionId,
 	        activeSessionId: projectActiveSession?.id || undefined,
+	        pendingSessionId: pendingProjectRow?.id || undefined,
 	        projectActiveSessionId: projectActiveSession ? `${PROJECT_ACTIVE_SESSION_PREFIX}${projectId}` : undefined,
 	        provider: directStatus?.provider || projectActiveSession?.provider || provider.name,
 	      });
