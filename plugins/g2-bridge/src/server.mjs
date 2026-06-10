@@ -1255,13 +1255,15 @@ function codexResumeCommand({ sessionId, cwd, port }) {
   ].join(" ");
 }
 
-function mergeSessionRows(primary, secondary) {
+function mergeSessionRows(...groups) {
   const seen = new Set();
   const merged = [];
-  for (const session of [...primary, ...secondary]) {
-    if (!session?.id || seen.has(session.id)) continue;
-    seen.add(session.id);
-    merged.push(session);
+  for (const group of groups) {
+    for (const session of Array.isArray(group) ? group : []) {
+      if (!session?.id || seen.has(session.id)) continue;
+      seen.add(session.id);
+      merged.push(session);
+    }
   }
   return merged;
 }
@@ -1360,10 +1362,78 @@ function createCodexAppServerBridgeProvider(options = {}) {
   const codex =
     createCodexAgentProvider?.(emit, client) ||
     createCodexProvider(emit, () => client);
+  const morpheusSnapshotSessions = new Map();
+
+  async function listMorpheusSnapshotSessions(limit, projectId = "") {
+    if (!morpheusProvider?.listSessions) return [];
+    try {
+      const result = await morpheusProvider.listSessions(limit, { projectId });
+      const sessions = Array.isArray(result) ? result : result.sessions || [];
+      for (const session of sessions) {
+        if (session?.id) morpheusSnapshotSessions.set(session.id, session);
+      }
+      bridgeDebug(config, "morpheus-snapshot-sessions", {
+        projectId,
+        count: sessions.length,
+      });
+      return sessions;
+    } catch (err) {
+      audit("morpheus_snapshot_sessions_failed", {
+        projectId,
+        reason: safeJsonError(err),
+      });
+      bridgeDebug(config, "morpheus-snapshot-sessions-failed", {
+        projectId,
+        reason: safeJsonError(err),
+      });
+      return [];
+    }
+  }
+
+  async function morpheusOutputHistory(sessionId, limit, projectId = "") {
+    if (!morpheusProvider?.sessionOutput) return [];
+    if (!isKnownMorpheusSession(sessionId)) return [];
+    try {
+      const result = await morpheusProvider.sessionOutput({
+        sessionId,
+        projectId,
+        lines: Math.max(1, limit || 10),
+      });
+      const text = String(result?.output?.text || "").trim();
+      if (!text) return [];
+      return [{ role: "assistant", text }];
+    } catch (err) {
+      audit("morpheus_session_output_failed", {
+        sessionId,
+        projectId,
+        reason: safeJsonError(err),
+      });
+      bridgeDebug(config, "morpheus-session-output-failed", {
+        sessionId,
+        projectId,
+        reason: safeJsonError(err),
+      });
+      return [];
+    }
+  }
+
+  function isSelectedMorpheusSession(sessionId) {
+    return Boolean(
+      state.selectedSession?.morpheus && sessionMatches(state.selectedSession, sessionId),
+    );
+  }
+
+  function isKnownMorpheusSession(sessionId) {
+    if (isSelectedMorpheusSession(sessionId)) return true;
+    return [...morpheusSnapshotSessions.values()].some((session) =>
+      session?.morpheus && sessionMatches(session, sessionId),
+    );
+  }
 
   async function listCodexSessions(limit, projectId = "") {
     const project = await projectForProvider(morpheusProvider, projectId, state, config.projectLimit);
     const cwd = project?.root_path || state.selectedProject?.root_path || "";
+    const resolvedProjectId = project?.id || project?.tenant_id || projectId || "";
     const rows = config.includeCodexHistory ? await codex.listSessions(limit, cwd) : [];
     const fromCodex = rows
       .filter((row) => {
@@ -1380,7 +1450,16 @@ function createCodexAppServerBridgeProvider(options = {}) {
       if (!cwd) return true;
       return !session.cwd || session.cwd === cwd;
     });
-    return mergeSessionRows(remembered, fromCodex).slice(0, limit);
+    const fromMorpheus = await listMorpheusSnapshotSessions(limit, resolvedProjectId);
+    const merged = mergeSessionRows(remembered, fromCodex, fromMorpheus).slice(0, limit);
+    bridgeDebug(config, "codex-list-sessions-merged", {
+      projectId: resolvedProjectId,
+      remembered: remembered.length,
+      codex: fromCodex.length,
+      morpheus: fromMorpheus.length,
+      merged: merged.length,
+    });
+    return merged;
   }
 
   async function mirrorSessionToMorpheus({ sessionId, project, goal }) {
@@ -1524,6 +1603,13 @@ function createCodexAppServerBridgeProvider(options = {}) {
     },
 
     async sendPrompt({ sessionId, text, projectId }) {
+      if (state.selectedSession?.morpheus && sessionMatches(state.selectedSession, sessionId)) {
+        return morpheusProvider.sendPrompt({
+          sessionId: state.selectedSession.id,
+          text,
+          projectId: projectId || state.selectedProject?.id || state.selectedProject?.tenant_id || "",
+        });
+      }
       const project = await projectForProvider(morpheusProvider, projectId, state, config.projectLimit);
       const cwd = project?.root_path || state.selectedSession?.cwd || process.cwd();
       const result = await codex.prompt(sessionId, text, cwd);
@@ -1557,9 +1643,31 @@ function createCodexAppServerBridgeProvider(options = {}) {
       if (codex.getHistory) {
         const persisted = await codex.getHistory(sessionId, limit);
         if (hasAssistantHistory(persisted)) return persisted;
+        const outputHistory = await morpheusOutputHistory(
+          sessionId,
+          limit,
+          state.selectedProject?.id || state.selectedProject?.tenant_id || "",
+        );
+        if (hasAssistantHistory(outputHistory)) return outputHistory;
         return buffered.length ? buffered : persisted;
       }
-      return buffered;
+      const outputHistory = await morpheusOutputHistory(
+        sessionId,
+        limit,
+        state.selectedProject?.id || state.selectedProject?.tenant_id || "",
+      );
+      return hasAssistantHistory(outputHistory) ? outputHistory : buffered;
+    },
+
+    async sessionOutput({ sessionId, projectId, lines = 10 }) {
+      if (!isSelectedMorpheusSession(sessionId)) {
+        return { ok: true, skipped: true, output: { text: "", lines: [] } };
+      }
+      return morpheusProvider.sessionOutput({
+        sessionId,
+        projectId: projectId || state.selectedProject?.id || state.selectedProject?.tenant_id || "",
+        lines,
+      });
     },
 
     getStatus(sessionId) {

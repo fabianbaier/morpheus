@@ -329,6 +329,63 @@ test("opening a project row history returns the project session menu", async (t)
   assert.match(body.history[0].text, /G2: Test Morpheus session/);
 });
 
+test("codex app-server project menu includes Morpheus snapshot sessions after bridge restart", async (t) => {
+  const { baseUrl } = await withBridge(t, {
+    agentBackend: "codex_app_server",
+    createCodexAgentProvider: fakeCodexAgentProvider(),
+    mirrorCodexTui: false,
+    showProjectsFirst: true,
+  });
+
+  const projectHistory = await request(baseUrl, "/api/sessions/project:p_alpha/history");
+  assert.equal(projectHistory.status, 200);
+  const historyBody = await projectHistory.json();
+  assert.equal(historyBody.mode, "sessions");
+  assert.equal(historyBody.sessions[0].id, "nav:projects");
+  assert.equal(historyBody.sessions[1].id, "abc123");
+  assert.match(historyBody.history[0].text, /Sessions in alpha:/);
+  assert.match(historyBody.history[0].text, /G2: Test Morpheus session/);
+  assert.doesNotMatch(historyBody.history[0].text, /No sessions in alpha/);
+
+  const sessions = await request(baseUrl, `/api/sessions?token=${TOKEN}`, { token: null });
+  assert.equal(sessions.status, 200);
+  const sessionsBody = await sessions.json();
+  assert.equal(sessionsBody.mode, "sessions");
+  assert.equal(sessionsBody.sessions[1].id, "abc123");
+
+  const directHistory = await request(baseUrl, "/api/sessions/abc123/history");
+  assert.equal(directHistory.status, 200);
+  const directHistoryBody = await directHistory.json();
+  assert.match(directHistoryBody.history.at(-1).text, /current directory tree/);
+});
+
+test("codex app-server can read output for a Morpheus snapshot session", async (t) => {
+  const { baseUrl } = await withBridge(t, {
+    agentBackend: "codex_app_server",
+    createCodexAgentProvider: fakeCodexAgentProvider(),
+    mirrorCodexTui: false,
+    showProjectsFirst: true,
+  });
+
+  const selectProject = await request(baseUrl, "/api/select-project", {
+    body: { projectId: "p_alpha", clientRequestId: "codex-morpheus-output-project" },
+  });
+  assert.equal(selectProject.status, 200);
+
+  const selectSession = await request(baseUrl, "/api/select-session", {
+    body: { sessionId: "abc123", clientRequestId: "codex-morpheus-output-session" },
+  });
+  assert.equal(selectSession.status, 200);
+  const selectBody = await selectSession.json();
+  assert.equal(selectBody.selectedSession.id, "abc123");
+  assert.equal(selectBody.selectedSession.promptBehavior, "stage_operator_note");
+
+  const history = await request(baseUrl, "/api/sessions/abc123/history");
+  assert.equal(history.status, 200);
+  const historyBody = await history.json();
+  assert.match(historyBody.history.at(-1).text, /README\.md, morpheus\/, plugins\/, tests\/\./);
+});
+
 test("rejects unlisted browser origins before processing API requests", async (t) => {
   const { baseUrl } = await withBridge(t);
   const res = await request(baseUrl, "/api/info", { origin: "https://evil.example" });
@@ -1586,8 +1643,7 @@ test("codex app-server backend hides old codex history from project session list
 
   const before = await request(baseUrl, `/api/sessions?token=${TOKEN}`, { token: null });
   const beforeBody = await before.json();
-  assert.equal(beforeBody.sessions.length, 1);
-  assert.equal(beforeBody.sessions[0].id, "nav:projects");
+  assert.deepEqual(beforeBody.sessions.map((session) => session.id), ["nav:projects", "abc123"]);
   assert.equal(beforeBody.sessions.some((session) => session.id === "old-cached-thread"), false);
 
   await request(baseUrl, "/api/prompt", {
