@@ -903,16 +903,9 @@ async function projectSessionMenuRows(provider, state, config, project, limit) {
   };
 }
 
-function projectSessionMenuHistory(project, sessions) {
-  const projectName = String(project?.name || project?.id || project?.tenant_id || "project");
-  const visibleSessions = (Array.isArray(sessions) ? sessions : [])
-    .filter((session) => !isProjectMenuSessionId(session?.id))
-    .slice(0, 8);
-  const text = visibleSessions.length
-    ? [`Sessions in ${projectName}:`, ...visibleSessions.map((session) => `/ ${session.title || session.id}`)].join("\n")
-    : `No sessions in ${projectName} yet. Use Add session to start one.`;
-
-  return [{ role: "assistant", text }];
+function pendingProjectPromptHistory(pendingRow) {
+  const title = String(pendingRow?.title || "").replace(/^G2:\s*/i, "").trim();
+  return title ? [{ role: "user", text: title }] : [];
 }
 
 function toEvenStatus(state) {
@@ -1707,7 +1700,19 @@ function createCodexAppServerBridgeProvider(options = {}) {
         return buffered;
       }
       if (codex.getHistory) {
-        const persisted = await codex.getHistory(sessionId, limit);
+        let persisted = [];
+        try {
+          persisted = await codex.getHistory(sessionId, limit);
+        } catch (err) {
+          audit("codex_history_failed", {
+            sessionId,
+            reason: safeJsonError(err),
+          });
+          bridgeDebug(config, "codex-history-failed", {
+            sessionId,
+            reason: safeJsonError(err),
+          });
+        }
         if (hasAssistantHistory(persisted)) return persisted;
         const outputHistory = await morpheusOutputHistory(
           sessionId,
@@ -3146,7 +3151,7 @@ function createBridge(options = {}) {
             pendingRequestId: pendingProjectRow.pendingRequestId || "",
           });
           res.json({
-            history: projectSessionMenuHistory(state.selectedProject, rows),
+            history: pendingProjectPromptHistory(pendingProjectRow),
             sessions: rows,
             snapshot: {
               generated_at: Math.floor(config.clock() / 1000),
@@ -3229,7 +3234,7 @@ function createBridge(options = {}) {
           rows: sessions.length,
         });
         res.json({
-          history: projectSessionMenuHistory(state.selectedProject, sessions),
+          history: [],
           sessions,
           snapshot,
           mode: "sessions",

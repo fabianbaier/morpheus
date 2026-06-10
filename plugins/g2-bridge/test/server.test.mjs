@@ -58,6 +58,7 @@ function fakeCodexAgentProvider({
   emitFinalResult = true,
   promptReturnDelayMs = 0,
   throwOnProjectHistory = false,
+  throwHistoryFor = [],
 } = {}) {
   const sessions = [...seedSessions];
   let nextId = 1;
@@ -81,7 +82,10 @@ function fakeCodexAgentProvider({
     },
 
     async getHistory(sessionId, limit) {
-      if (throwOnProjectHistory && String(sessionId).startsWith("project:")) {
+      if (
+        (throwOnProjectHistory && String(sessionId).startsWith("project:")) ||
+        throwHistoryFor.includes(String(sessionId))
+      ) {
         throw new Error("thread not found");
       }
       const entries = history?.[sessionId] || [];
@@ -349,9 +353,7 @@ test("opening a project row history returns the project session menu", async (t)
   assert.equal(body.selectedSession, null);
   assert.equal(body.sessions[0].id, "nav:projects");
   assert.equal(body.sessions[1].id, "abc123");
-  assert.equal(body.history.length, 1);
-  assert.match(body.history[0].text, /Sessions in alpha:/);
-  assert.match(body.history[0].text, /G2: Test Morpheus session/);
+  assert.deepEqual(body.history, []);
 });
 
 test("codex app-server project menu includes Morpheus snapshot sessions after bridge restart", async (t) => {
@@ -366,11 +368,11 @@ test("codex app-server project menu includes Morpheus snapshot sessions after br
   assert.equal(projectHistory.status, 200);
   const historyBody = await projectHistory.json();
   assert.equal(historyBody.mode, "sessions");
+  assert.equal(historyBody.navigation.view, "sessions");
   assert.equal(historyBody.sessions[0].id, "nav:projects");
   assert.equal(historyBody.sessions[1].id, "abc123");
-  assert.match(historyBody.history[0].text, /Sessions in alpha:/);
-  assert.match(historyBody.history[0].text, /G2: Test Morpheus session/);
-  assert.doesNotMatch(historyBody.history[0].text, /No sessions in alpha/);
+  assert.equal(historyBody.selectedSession, null);
+  assert.deepEqual(historyBody.history, []);
 
   const sessions = await request(baseUrl, `/api/sessions?token=${TOKEN}`, { token: null });
   assert.equal(sessions.status, 200);
@@ -387,7 +389,9 @@ test("codex app-server project menu includes Morpheus snapshot sessions after br
 test("codex app-server can read output for a Morpheus snapshot session", async (t) => {
   const { baseUrl } = await withBridge(t, {
     agentBackend: "codex_app_server",
-    createCodexAgentProvider: fakeCodexAgentProvider(),
+    createCodexAgentProvider: fakeCodexAgentProvider({
+      throwHistoryFor: ["abc123"],
+    }),
     mirrorCodexTui: false,
     showProjectsFirst: true,
   });
@@ -1367,7 +1371,8 @@ test("project history polling while codex thread id is pending keeps glasses str
   const projectHistoryBody = await projectHistory.json();
   assert.equal(projectHistoryBody.navigation.view, "session");
   assert.equal(projectHistoryBody.selectedSession.pending, true);
-  assert.doesNotMatch(projectHistoryBody.history[0].text, /No sessions in alpha/);
+  assert.equal(projectHistoryBody.history[0].role, "user");
+  assert.equal(projectHistoryBody.history[0].text, "slow thread id still streams");
 
   const promptRes = await prompt;
   assert.equal(promptRes.status, 202);
