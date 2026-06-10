@@ -4,6 +4,9 @@ This plugin is the Morpheus-side home for Even Realities G2 work. It is designed
 to stay as close as possible to Even Terminal while giving Morpheus a stricter
 policy boundary.
 
+For the planned evolution from "Codex on glasses" to a compact Morpheus cockpit,
+see [docs/morpheus-native-prd.md](docs/morpheus-native-prd.md).
+
 ## Reference Path
 
 First validate the stock upstream flow:
