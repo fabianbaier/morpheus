@@ -164,15 +164,14 @@ app-server path from Even Terminal for G2 conversations:
 - `POST /api/prompt` submits bounded text to the selected session. If no session
   is selected, or the prompt targets a project row, it starts a Codex app-server
   thread in that project. Follow-up prompts target the selected Codex thread.
-  By default the bridge returns as soon as the Codex turn is launched, matching
-  Even Terminal's live-update flow: the glasses should then read deltas/final
-  answers from `/api/events`, `/api/messages`, or the session history fallback.
-  Custom clients that only read the prompt response body can set
-  `MORPHEUS_G2_WAIT_FOR_RESULT=1`; in that mode the bridge waits for the final
-  Codex `result` event before returning and includes the answer redundantly as
+  By default the bridge waits for the final Codex `result` event before
+  returning, so G2 runtimes that miss Server-Sent Events still receive the
+  answer in the prompt response body. The answer is included redundantly as
   `text`, `answer`, `message`, `response`, `output.text`, `history`,
   `messages`, and `activeMessages`. Tune that wait with
-  `MORPHEUS_G2_PROMPT_WAIT_FOR_RESULT_MS` (default 90000).
+  `MORPHEUS_G2_PROMPT_WAIT_FOR_RESULT_MS` (default 90000), or set
+  `MORPHEUS_G2_WAIT_FOR_RESULT=0` to return as soon as the Codex turn is
+  launched and rely on `/api/events`, `/api/messages`, or history polling.
 - By default, new app-server threads are also mirrored into a local Morpheus/iTerm
   tab with `codex --remote ws://127.0.0.1:$CODEX_APP_SERVER_PORT resume <thread>`
   so the laptop can watch the same session. Set

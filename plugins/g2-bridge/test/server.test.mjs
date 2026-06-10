@@ -1443,12 +1443,13 @@ test("project row event stream receives codex final result via query-token auth"
   assert.match(await streamed, /"type":"result"/);
 });
 
-test("default codex prompt returns before final answer and streams it live after submit", async (t) => {
+test("codex prompt can return before final answer when result waiting is disabled", async (t) => {
   const { baseUrl } = await withBridge(t, {
     agentBackend: "codex_app_server",
     createCodexAgentProvider: fakeCodexAgentProvider({ asyncResultMs: 80 }),
     mirrorCodexTui: false,
     showProjectsFirst: true,
+    waitForPromptResult: false,
   });
 
   const prompt = await request(baseUrl, "/api/prompt", {
@@ -1482,6 +1483,7 @@ test("project history polling during new session keeps glasses stream live", asy
     createCodexAgentProvider: fakeCodexAgentProvider({ asyncResultMs: 120 }),
     mirrorCodexTui: false,
     showProjectsFirst: true,
+    waitForPromptResult: false,
   });
 
   const prompt = await request(baseUrl, "/api/prompt", {
@@ -1523,6 +1525,7 @@ test("project history polling while codex thread id is pending keeps glasses str
     }),
     mirrorCodexTui: false,
     showProjectsFirst: true,
+    waitForPromptResult: false,
   });
 
   const events = await fetch(`${baseUrl}/api/events?sessionId=project:p_alpha&token=${TOKEN}`);
@@ -1560,6 +1563,7 @@ test("mirrored terminal output is streamed when codex app-server misses final re
     }),
     mirrorCodexTui: true,
     showProjectsFirst: true,
+    waitForPromptResult: false,
     outputPollIntervalMs: 20,
     outputPollAttempts: 20,
     runner: fakeMorpheusRunner({
@@ -1598,6 +1602,7 @@ test("mirrored terminal output timeout is not streamed as the session answer", a
     }),
     mirrorCodexTui: true,
     showProjectsFirst: true,
+    waitForPromptResult: false,
     outputPollIntervalMs: 20,
     outputPollAttempts: 20,
     runner: fakeMorpheusRunner({
@@ -1684,6 +1689,7 @@ test("same mirrored answer can stream again after a follow-up prompt", async (t)
     }),
     mirrorCodexTui: true,
     showProjectsFirst: true,
+    waitForPromptResult: false,
     outputPollIntervalMs: 20,
     outputPollAttempts: 20,
     runner: fakeMorpheusRunner({
@@ -2209,6 +2215,28 @@ test("keeps approvals blocked", async (t) => {
   });
   assert.equal(res.status, 403);
   assert.equal((await res.json()).code, "action_blocked");
+});
+
+test("simulator client sees delayed result from prompt response without EventSource", async (t) => {
+  const { baseUrl } = await withBridge(t, {
+    agentBackend: "codex_app_server",
+    createCodexAgentProvider: fakeCodexAgentProvider({ asyncResultMs: 80 }),
+    mirrorCodexTui: false,
+    showProjectsFirst: true,
+  });
+  const client = new G2BridgeClient({
+    bridgeUrl: baseUrl,
+    token: TOKEN,
+    eventSourceFactory: () => null,
+  });
+
+  await client.connect();
+  await client.activateSelected();
+  const submitted = await client.submitTranscript("what is 2 plus 2 plus 2");
+
+  assert.equal(submitted.mode, "session");
+  assert.equal(submitted.status, "idle");
+  assert.match(submitted.glassesText, /answer for: what is 2 plus 2 plus 2/);
 });
 
 test("simulator client can create a Morpheus project session and read the stream", async (t) => {

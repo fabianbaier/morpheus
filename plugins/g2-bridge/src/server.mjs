@@ -2729,8 +2729,8 @@ function buildConfigFromEnv(env = process.env, argv = process.argv.slice(2)) {
     includeCodexHistory: env.MORPHEUS_G2_INCLUDE_CODEX_HISTORY === "1",
     requestLog: env.MORPHEUS_G2_REQUEST_LOG !== "0",
     debug: env.MORPHEUS_G2_DEBUG === "1",
-    waitForPromptResult: ["1", "true", "yes"].includes(
-      String(env.MORPHEUS_G2_WAIT_FOR_RESULT || "").toLowerCase(),
+    waitForPromptResult: !["0", "false", "no", "off"].includes(
+      String(env.MORPHEUS_G2_WAIT_FOR_RESULT || "1").toLowerCase(),
     ),
     allowSpawn: env.MORPHEUS_G2_ALLOW_SPAWN !== "0",
     allowTerminalPrompts: env.MORPHEUS_G2_ALLOW_TERMINAL_PROMPTS !== "0",
