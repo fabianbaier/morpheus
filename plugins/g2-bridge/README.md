@@ -104,13 +104,15 @@ app-server path from Even Terminal for G2 conversations:
 - `POST /api/prompt` submits bounded text to the selected session. If no session
   is selected, or the prompt targets a project row, it starts a Codex app-server
   thread in that project. Follow-up prompts target the selected Codex thread.
-  For the Codex app-server backend, the bridge waits for the final Codex
-  `result` event before returning, then includes the answer redundantly as
+  By default the bridge returns as soon as the Codex turn is launched, matching
+  Even Terminal's live-update flow: the glasses should then read deltas/final
+  answers from `/api/events`, `/api/messages`, or the session history fallback.
+  Custom clients that only read the prompt response body can set
+  `MORPHEUS_G2_WAIT_FOR_RESULT=1`; in that mode the bridge waits for the final
+  Codex `result` event before returning and includes the answer redundantly as
   `text`, `answer`, `message`, `response`, `output.text`, `history`,
-  `messages`, and `activeMessages`. This keeps stock Even clients from dropping
-  back to `Waiting input` before the glasses have a completed answer to render.
-  Set `MORPHEUS_G2_WAIT_FOR_RESULT=0` to restore immediate `202` responses, or
-  tune the wait with `MORPHEUS_G2_PROMPT_WAIT_FOR_RESULT_MS` (default 90000).
+  `messages`, and `activeMessages`. Tune that wait with
+  `MORPHEUS_G2_PROMPT_WAIT_FOR_RESULT_MS` (default 90000).
 - By default, new app-server threads are also mirrored into a local Morpheus/iTerm
   tab with `codex --remote ws://127.0.0.1:$CODEX_APP_SERVER_PORT resume <thread>`
   so the laptop can watch the same session. Set
@@ -146,7 +148,9 @@ project session list to include older Codex app-server threads.
 
 The bridge prints `[g2-api]` request lines by default so hardware runs can show
 whether the phone is reading `/api/messages`, `/api/events`, or
-`/api/sessions/:id/history`. Set `MORPHEUS_G2_REQUEST_LOG=0` to quiet those logs.
+`/api/sessions/:id/history`. Set `MORPHEUS_G2_DEBUG=1` to add stream/session
+routing logs such as event-stream connects and project-history live/menu
+decisions. Set `MORPHEUS_G2_REQUEST_LOG=0` to quiet the ordinary request logs.
 
 The bridge does not print bearer tokens. Set `MORPHEUS_G2_TOKEN` yourself and
 store it somewhere private while pairing your phone-side client.

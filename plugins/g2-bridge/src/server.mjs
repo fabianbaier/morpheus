@@ -114,6 +114,12 @@ function safeJsonError(err) {
   return err instanceof Error ? err.message : String(err || "unknown error");
 }
 
+function bridgeDebug(config, event, fields = {}) {
+  if (!config?.debug) return;
+  const payload = Object.keys(fields).length ? ` ${JSON.stringify(fields)}` : "";
+  config.logger.log(`[g2-debug] ${event}${payload}`);
+}
+
 function cleanMessageState(state, sessionId) {
   const key = sessionId || "morpheus";
   let buffer = state.sessions.get(key);
@@ -287,6 +293,14 @@ function activeSessionForProject(state, projectOrId) {
     return state.selectedSession;
   }
   return remembered;
+}
+
+function activeProjectHistoryShouldStayLive(state, projectId, activeSession) {
+  if (!activeSession?.id) return false;
+  const selectedMatches =
+    state.selectedSession && sessionMatches(state.selectedSession, activeSession.id);
+  const status = statusFromBufferedMessages(state, activeSession.id, activeSession.status || "idle");
+  return Boolean(selectedMatches || status === "busy");
 }
 
 function messageBelongsToSession(msg, session) {
@@ -843,6 +857,18 @@ async function projectSessionMenuRows(provider, state, config, project, limit) {
     sessions,
     snapshot: Array.isArray(result) ? undefined : result.snapshot,
   };
+}
+
+function projectSessionMenuHistory(project, sessions) {
+  const projectName = String(project?.name || project?.id || project?.tenant_id || "project");
+  const visibleSessions = (Array.isArray(sessions) ? sessions : [])
+    .filter((session) => !isProjectMenuSessionId(session?.id))
+    .slice(0, 8);
+  const text = visibleSessions.length
+    ? [`Sessions in ${projectName}:`, ...visibleSessions.map((session) => `/ ${session.title || session.id}`)].join("\n")
+    : `No sessions in ${projectName} yet. Use Add session to start one.`;
+
+  return [{ role: "assistant", text }];
 }
 
 function toEvenStatus(state) {
@@ -2257,7 +2283,10 @@ function buildConfigFromEnv(env = process.env, argv = process.argv.slice(2)) {
     mirrorCodexTui: env.MORPHEUS_G2_MIRROR_CODEX_TUI !== "0",
     includeCodexHistory: env.MORPHEUS_G2_INCLUDE_CODEX_HISTORY === "1",
     requestLog: env.MORPHEUS_G2_REQUEST_LOG !== "0",
-    waitForPromptResult: env.MORPHEUS_G2_WAIT_FOR_RESULT !== "0",
+    debug: env.MORPHEUS_G2_DEBUG === "1",
+    waitForPromptResult: ["1", "true", "yes"].includes(
+      String(env.MORPHEUS_G2_WAIT_FOR_RESULT || "").toLowerCase(),
+    ),
     allowSpawn: env.MORPHEUS_G2_ALLOW_SPAWN !== "0",
     allowTerminalPrompts: env.MORPHEUS_G2_ALLOW_TERMINAL_PROMPTS !== "0",
     interruptNavigatesBack: env.MORPHEUS_G2_INTERRUPT_NAVIGATES_BACK !== "0",
@@ -2895,8 +2924,46 @@ function createBridge(options = {}) {
           const resolved = await resolveProject(provider, projectId, config.projectLimit);
           if (resolved.ok) state.selectedProject = resolved.project;
         }
-        state.selectedSession = null;
         const activeSession = state.projectActiveSessions.get(projectId) || null;
+        if (activeProjectHistoryShouldStayLive(state, projectId, activeSession)) {
+          const status = statusFromBufferedMessages(state, activeSession.id, activeSession.status || "idle");
+          state.selectedSession = {
+            ...activeSession,
+            status,
+            timestamp: activeSession.timestamp || nowIso(config.clock),
+          };
+          addSessionAlias(state, activeSession.id, sessionId);
+          await refreshSessionOutput({ provider, state, config, sessionId: activeSession.id });
+          let history = bufferedHistoryForRow(state, sessionId, limit, {
+            preferredSessionIds: [activeSession.id],
+          });
+          if (!hasAssistantHistory(history)) {
+            const activeHistory = await sessionHistory(provider, state, activeSession.id, limit);
+            history = history.length ? [...history, ...activeHistory].slice(-limit) : activeHistory;
+          }
+          bridgeDebug(config, "project-history-live", {
+            projectId,
+            sessionId,
+            activeSessionId: activeSession.id,
+            status,
+            selectedSessionId: state.selectedSession?.id || "",
+          });
+          audit("history_project_live_session", {
+            projectId,
+            activeSessionId: activeSession.id,
+            status,
+          });
+          res.json({
+            history,
+            selectedProject: state.selectedProject,
+            selectedSession: activeProjectSessionRow(state, state.selectedProject) || state.selectedSession,
+            activeSessionId: activeSession.id,
+            projectActiveSessionId: `${PROJECT_ACTIVE_SESSION_PREFIX}${projectId}`,
+            navigation: navigationPayload(state, { action: "select_project_active_session" }),
+          });
+          return;
+        }
+        state.selectedSession = null;
         bumpNavigationEpoch(state);
         const { sessions, snapshot } = await projectSessionMenuRows(
           provider,
@@ -2905,8 +2972,15 @@ function createBridge(options = {}) {
           state.selectedProject,
           limit,
         );
+        bridgeDebug(config, "project-history-menu", {
+          projectId,
+          sessionId,
+          activeSessionId: activeSession?.id || "",
+          selectedSessionId: state.selectedSession?.id || "",
+          rows: sessions.length,
+        });
         res.json({
-          history: [],
+          history: projectSessionMenuHistory(state.selectedProject, sessions),
           sessions,
           snapshot,
           mode: "sessions",
@@ -3026,12 +3100,23 @@ function createBridge(options = {}) {
     res.write(":ok\n\n");
     const client = { res, filter: transcriptAllowed };
     buffer.clients.add(client);
+    bridgeDebug(config, "events-connect", {
+      sessionId,
+      requestedSessionId,
+      selectedSessionId: state.selectedSession?.id || "",
+      clients: buffer.clients.size,
+    });
     const heartbeat = setInterval(() => {
       res.write(":heartbeat\n\n");
     }, 15_000);
     req.on("close", () => {
       clearInterval(heartbeat);
       buffer.clients.delete(client);
+      bridgeDebug(config, "events-close", {
+        sessionId,
+        requestedSessionId,
+        clients: buffer.clients.size,
+      });
     });
   });
 

@@ -324,7 +324,9 @@ test("opening a project row history returns the project session menu", async (t)
   assert.equal(body.selectedSession, null);
   assert.equal(body.sessions[0].id, "nav:projects");
   assert.equal(body.sessions[1].id, "abc123");
-  assert.deepEqual(body.history, []);
+  assert.equal(body.history.length, 1);
+  assert.match(body.history[0].text, /Sessions in alpha:/);
+  assert.match(body.history[0].text, /G2: Test Morpheus session/);
 });
 
 test("rejects unlisted browser origins before processing API requests", async (t) => {
@@ -656,6 +658,7 @@ test("codex app-server prompt response waits for delayed final result", async (t
     agentBackend: "codex_app_server",
     createCodexAgentProvider: fakeCodexAgentProvider({ asyncResultMs: 25 }),
     mirrorCodexTui: false,
+    waitForPromptResult: true,
     promptWaitForResultMs: 1000,
   });
   await request(baseUrl, "/api/select-project", {
@@ -717,12 +720,12 @@ test("codex app-server backend mirrors results to project row and default messag
 
   const projectHistory = await request(baseUrl, "/api/sessions/project:p_beta/history");
   const projectHistoryBody = await projectHistory.json();
-  assert.equal(projectHistoryBody.navigation.view, "sessions");
-  assert.equal(projectHistoryBody.selectedSession, null);
-  assert.equal(projectHistoryBody.mode, "sessions");
-  assert.equal(projectHistoryBody.sessions[0].id, "nav:projects");
-  assert.equal(projectHistoryBody.sessions[1].id, "project-session:p_beta");
-  assert.deepEqual(projectHistoryBody.history, []);
+  assert.equal(projectHistoryBody.navigation.view, "session");
+  assert.equal(projectHistoryBody.activeSessionId, "codex-thread-1");
+  assert.equal(projectHistoryBody.selectedSession.activeSessionId, "codex-thread-1");
+  assert.equal(projectHistoryBody.sessions, undefined);
+  assert.equal(projectHistoryBody.history.at(-1).role, "assistant");
+  assert.equal(projectHistoryBody.history.at(-1).text, "answer for: alias target please");
 
   const activeHistory = await request(baseUrl, "/api/sessions/project-session:p_beta/history");
   const activeHistoryBody = await activeHistory.json();
@@ -1085,6 +1088,7 @@ test("concurrent active project-session follow-ups serialize per project", async
     createCodexAgentProvider: fakeCodexAgentProvider({ asyncResultMs: 40 }),
     mirrorCodexTui: false,
     showProjectsFirst: true,
+    waitForPromptResult: true,
   });
   await request(baseUrl, "/api/prompt", {
     body: {
@@ -1120,7 +1124,7 @@ test("concurrent active project-session follow-ups serialize per project", async
   assert.equal(secondBody.text, "answer for: active followup B");
 });
 
-test("project row history stays navigation-only while active project-session history resolves codex thread", async (t) => {
+test("project row history returns the session menu after leaving a live session", async (t) => {
   const { baseUrl } = await withBridge(t, {
     agentBackend: "codex_app_server",
     createCodexAgentProvider: fakeCodexAgentProvider({ throwOnProjectHistory: true }),
@@ -1136,6 +1140,9 @@ test("project row history stays navigation-only while active project-session his
       text: "answer visible through project history",
       clientRequestId: "codex-project-history-prompt",
     },
+  });
+  await request(baseUrl, "/api/back", {
+    body: { clientRequestId: "codex-project-history-back" },
   });
 
   const projectHistory = await request(baseUrl, "/api/sessions/project:p_alpha/history");
@@ -1178,6 +1185,77 @@ test("project row event stream receives codex final result via query-token auth"
   assert.match(await streamed, /"type":"result"/);
 });
 
+test("default codex prompt returns before final answer and streams it live after submit", async (t) => {
+  const { baseUrl } = await withBridge(t, {
+    agentBackend: "codex_app_server",
+    createCodexAgentProvider: fakeCodexAgentProvider({ asyncResultMs: 80 }),
+    mirrorCodexTui: false,
+    showProjectsFirst: true,
+  });
+
+  const prompt = await request(baseUrl, "/api/prompt", {
+    body: {
+      sessionId: "project:p_alpha",
+      text: "live result after submit",
+      clientRequestId: "codex-live-after-submit",
+    },
+  });
+  assert.equal(prompt.status, 202);
+  const promptBody = await prompt.json();
+  assert.equal(promptBody.state, "busy");
+  assert.equal(promptBody.text, "");
+
+  const events = await fetch(`${baseUrl}/api/events?sessionId=project:p_alpha&token=${TOKEN}`);
+  assert.equal(events.status, 200);
+  const streamed = await readStreamUntil(events.body, "answer for: live result after submit", 1000);
+  assert.match(streamed, /"type":"result"/);
+
+  const messages = await request(baseUrl, "/api/messages?sessionId=project:p_alpha");
+  const messageBody = await messages.json();
+  assert.equal(
+    messageBody.messages.find((message) => message.type === "result").text,
+    "answer for: live result after submit",
+  );
+});
+
+test("project history polling during new session keeps glasses stream live", async (t) => {
+  const { baseUrl } = await withBridge(t, {
+    agentBackend: "codex_app_server",
+    createCodexAgentProvider: fakeCodexAgentProvider({ asyncResultMs: 120 }),
+    mirrorCodexTui: false,
+    showProjectsFirst: true,
+  });
+
+  const prompt = await request(baseUrl, "/api/prompt", {
+    body: {
+      sessionId: "project:p_alpha",
+      text: "stay live despite project history poll",
+      clientRequestId: "codex-live-project-history-race",
+    },
+  });
+  assert.equal(prompt.status, 202);
+  assert.equal((await prompt.json()).state, "busy");
+
+  const events = await fetch(`${baseUrl}/api/events?sessionId=project:p_alpha&token=${TOKEN}`);
+  assert.equal(events.status, 200);
+
+  const projectHistory = await request(baseUrl, "/api/sessions/project:p_alpha/history");
+  assert.equal(projectHistory.status, 200);
+  const projectHistoryBody = await projectHistory.json();
+  assert.equal(projectHistoryBody.navigation.view, "session");
+  assert.equal(projectHistoryBody.activeSessionId, "codex-thread-1");
+  assert.equal(projectHistoryBody.selectedSession.activeSessionId, "codex-thread-1");
+  assert.equal(projectHistoryBody.sessions, undefined);
+
+  const streamed = await readStreamUntil(events.body, "answer for: stay live despite project history poll", 1000);
+  assert.match(streamed, /"type":"result"/);
+
+  const navigation = await request(baseUrl, "/api/navigation");
+  const navigationBody = await navigation.json();
+  assert.equal(navigationBody.view, "session");
+  assert.equal(navigationBody.selectedSession.id, "codex-thread-1");
+});
+
 test("codex app-server streams results before slow terminal mirror finishes", async (t) => {
   let mirrorStarted = false;
   let mirrorDone = false;
@@ -1186,6 +1264,7 @@ test("codex app-server streams results before slow terminal mirror finishes", as
     createCodexAgentProvider: fakeCodexAgentProvider({ asyncResultMs: 25 }),
     mirrorCodexTui: true,
     showProjectsFirst: true,
+    waitForPromptResult: true,
     promptWaitForResultMs: 1000,
     runner: fakeMorpheusRunner({
       mirrorDelayMs: 250,
@@ -1250,6 +1329,7 @@ test("project row event stream opened before prompt stops after back navigation"
     createCodexAgentProvider: fakeCodexAgentProvider({ asyncResultMs: 80 }),
     mirrorCodexTui: false,
     showProjectsFirst: true,
+    waitForPromptResult: true,
   });
 
   const events = await fetch(`${baseUrl}/api/events?sessionId=project:p_alpha&token=${TOKEN}`);
@@ -1298,6 +1378,7 @@ test("default event stream opened before prompt stops after back navigation", as
     createCodexAgentProvider: fakeCodexAgentProvider({ asyncResultMs: 80 }),
     mirrorCodexTui: false,
     showProjectsFirst: true,
+    waitForPromptResult: true,
   });
 
   const events = await fetch(`${baseUrl}/api/events?token=${TOKEN}`);
@@ -1562,6 +1643,7 @@ test("delayed prompt completion after back does not reselect the session", async
     createCodexAgentProvider: fakeCodexAgentProvider({ asyncResultMs: 80 }),
     mirrorCodexTui: false,
     showProjectsFirst: true,
+    waitForPromptResult: true,
   });
 
   const prompt = request(baseUrl, "/api/prompt", {
