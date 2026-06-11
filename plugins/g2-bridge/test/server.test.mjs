@@ -139,6 +139,8 @@ function fakeCodexAgentProvider({
 function fakeMorpheusRunner({
   mirrorDelayMs = 0,
   mirrorOutputText = "",
+  outputState = "",
+  snapshotDelayMs = 0,
   outputDelayMs = 0,
   outputFailuresBeforeSuccess = 0,
   outputErrorMessage = "morpheus timed out after 10000ms",
@@ -167,6 +169,16 @@ function fakeMorpheusRunner({
             usage: { live_sessions: 0, graph_rows: 0 },
           },
         ],
+      };
+    }
+
+    if (args[1] === "snapshot") {
+      if (snapshotDelayMs > 0) await sleep(snapshotDelayMs);
+      return {
+        generated_at: 1_779_999_999,
+        summary: "slow Morpheus snapshot",
+        counts: {},
+        sessions: [],
       };
     }
 
@@ -206,7 +218,7 @@ function fakeMorpheusRunner({
         session: {
           tab_ref: ref,
           mission_ref: "mirror-mission",
-          state: mirrorOutputText ? "idle" : "working",
+          state: outputState || (mirrorOutputText ? "idle" : "working"),
           goal: "G2: mirrored Codex session",
         },
         output: {
@@ -2652,6 +2664,60 @@ test("simulator polling hydrates terminal mirror output when codex final event i
   assert.match(submitted.glassesText, /terminal-only answer from resumed Codex/);
   assert.equal(calls.some((path) => path.startsWith("/api/messages")), false);
   assert.equal(calls.some((path) => path.startsWith("/api/events")), false);
+});
+
+test("simulator polling shows mirror output even while morpheus tab remains working", async (t) => {
+  const { baseUrl } = await withBridge(t, {
+    agentBackend: "codex_app_server",
+    createCodexAgentProvider: fakeCodexAgentProvider({
+      emitFinalResult: false,
+      promptReturnDelayMs: 20,
+    }),
+    mirrorCodexTui: true,
+    showProjectsFirst: true,
+    waitForPromptResult: false,
+    outputPollIntervalMs: 5000,
+    outputPollAttempts: 8,
+    runner: fakeMorpheusRunner({
+      mirrorDelayMs: 1200,
+      mirrorOutputText: "terminal answer while the tab is still marked working",
+      outputState: "working",
+      snapshotDelayMs: 1200,
+    }),
+  });
+  const sessionsDurations = [];
+  const fetchImpl = async (url, options) => {
+    const parsed = new URL(url);
+    const started = Date.now();
+    const response = await fetch(url, options);
+    if (parsed.pathname === "/api/sessions" && !parsed.searchParams.has("view")) {
+      sessionsDurations.push(Date.now() - started);
+    }
+    return response;
+  };
+  const client = new G2BridgeClient({
+    bridgeUrl: baseUrl,
+    token: TOKEN,
+    fetchImpl,
+    eventSourceFactory: () => null,
+  });
+
+  await client.connect();
+  await client.activateSelected();
+  sessionsDurations.length = 0;
+  const submitted = await client.submitTranscriptViaSessionPolling("working terminal output must show", {
+    waitFor: /terminal answer while the tab is still marked working/,
+    timeoutMs: 4000,
+    intervalMs: 50,
+  });
+
+  assert.equal(submitted.mode, "session");
+  assert.match(submitted.glassesText, /terminal answer while the tab is still marked working/);
+  assert.deepEqual(
+    sessionsDurations.filter((duration) => duration > 700),
+    [],
+    `/api/sessions should not wait on full Morpheus snapshots in session view: ${sessionsDurations.join(", ")}`,
+  );
 });
 
 test("sessions poll includes active session result for glasses session view", async (t) => {

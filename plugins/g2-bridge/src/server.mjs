@@ -1132,6 +1132,49 @@ async function projectSessionMenuRows(provider, state, config, project, limit) {
   };
 }
 
+function localProjectSessionMenuRows(state, config, project, limit) {
+  const projectId = projectKey(project);
+  const cacheKey = projectId || "__global__";
+  const cached = state.projectSessionRowsCache.get(cacheKey);
+  const activeProjectRow = activeProjectSessionRow(state, project);
+  const pendingProjectRow = activeProjectRow ? null : pendingProjectPromptForProject(state, project);
+  const seen = new Set();
+  const sessions = [];
+
+  function add(row) {
+    if (!row?.id || seen.has(row.id)) return;
+    seen.add(row.id);
+    sessions.push(row);
+  }
+
+  if (config.showBackToProjectsRow && project) add(projectMenuRow(project));
+  if (activeProjectRow) add(activeProjectRow);
+  if (pendingProjectRow) add(pendingProjectRow);
+  for (const row of cached?.sessions || []) {
+    add(hydrateSessionRowWithBufferedHistory(state, row));
+  }
+
+  return {
+    sessions: sessions.slice(0, limit),
+    snapshot:
+      cached?.snapshot || {
+        generated_at: Math.floor(config.clock() / 1000),
+        summary: "Using local live session state.",
+        counts: sessions.reduce((acc, session) => {
+          const status = session.status || "unknown";
+          acc[status] = (acc[status] || 0) + 1;
+          return acc;
+        }, {}),
+        policy: {
+          raw_terminal_buffers: false,
+          source: "local_live_session_state",
+        },
+      },
+    stale: false,
+    error: "",
+  };
+}
+
 function pendingProjectPromptHistory(pendingRow) {
   const title = String(pendingRow?.title || "").replace(/^G2:\s*/i, "").trim();
   return title ? [{ role: "user", text: title }] : [];
@@ -2434,17 +2477,10 @@ async function refreshSessionOutput({ provider, state, config, sessionId, publis
       state.outputHashes.set(sessionId, fingerprint);
       return result;
     }
-    if (outputStatus === "busy" || outputStatus === "working") {
-      state.outputHashes.set(sessionId, fingerprint);
-      pushMessageForSession(state, sessionId, {
-        type: "status",
-        state: "busy",
-        provider: "codex",
-        sessionId,
-        at: nowIso(config.clock),
-      });
-      return result;
-    }
+    // Morpheus marks an open interactive Codex tab as "working" even after the
+    // answer is visible and the TUI is waiting for the next prompt. The terminal
+    // text itself is the stronger live signal for G2, so publish it instead of
+    // hiding it behind the coarse tab state.
     publishAssistantResultIfNew(state, config, sessionId, text, "codex");
     return result;
   } catch (err) {
@@ -3206,6 +3242,38 @@ function createBridge(options = {}) {
         config,
         reason: "sessions_poll_before_rows",
       });
+      if (navigationView(state) === "session") {
+        const { sessions, snapshot, stale, error } = localProjectSessionMenuRows(
+          state,
+          config,
+          state.selectedProject,
+          limit,
+        );
+        const selected = selectedSessionResponse(state);
+        const responseText = selected.text;
+        res.json({
+          sessions,
+          snapshot,
+          selectedProject: state.selectedProject,
+          selectedSession: selected.selectedSession || state.selectedSession,
+          activeSessionId: selected.activeSessionId || undefined,
+          displaySessionId: selected.displaySessionId || undefined,
+          projectActiveSessionId: selected.projectActiveSessionId || undefined,
+          state: selected.state,
+          history: selected.history,
+          messages: selected.messages,
+          text: responseText,
+          answer: responseText,
+          message: responseText,
+          response: responseText,
+          output: responseText ? { text: responseText } : undefined,
+          mode: "session",
+          view: "session",
+          stale,
+          error: error || undefined,
+        });
+        return;
+      }
       let { sessions, snapshot, stale, error } = await projectSessionMenuRows(
         provider,
         state,
