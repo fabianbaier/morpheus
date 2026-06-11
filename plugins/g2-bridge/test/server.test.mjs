@@ -146,6 +146,7 @@ function fakeMorpheusRunner({
   outputErrorMessage = "morpheus timed out after 10000ms",
   onMirrorStart = () => {},
   onMirrorDone = () => {},
+  onSpawnCommand = () => {},
   onOutputStart = () => {},
 } = {}) {
   let mirroredTabRef = "";
@@ -183,6 +184,8 @@ function fakeMorpheusRunner({
     }
 
     if (args[1] === "spawn") {
+      const commandIndex = args.indexOf("--cmd");
+      onSpawnCommand(commandIndex === -1 ? "" : args[commandIndex + 1] || "", args);
       onMirrorStart();
       if (mirrorDelayMs > 0) await sleep(mirrorDelayMs);
       onMirrorDone();
@@ -1894,6 +1897,7 @@ test("client polling skips terminal fallback while codex thread history is not r
 });
 
 test("mirrored terminal output is streamed when codex app-server misses final result", async (t) => {
+  let mirrorCommand = "";
   const { baseUrl } = await withBridge(t, {
     agentBackend: "codex_app_server",
     createCodexAgentProvider: fakeCodexAgentProvider({
@@ -1907,6 +1911,9 @@ test("mirrored terminal output is streamed when codex app-server misses final re
     outputPollAttempts: 20,
     runner: fakeMorpheusRunner({
       mirrorOutputText: "terminal mirror answer: 2",
+      onSpawnCommand: (command) => {
+        mirrorCommand = command;
+      },
     }),
   });
 
@@ -1930,6 +1937,61 @@ test("mirrored terminal output is streamed when codex app-server misses final re
     messagesBody.messages.find((message) => message.type === "result")?.text,
     "terminal mirror answer: 2",
   );
+  assert.match(mirrorCommand, /resume 'codex-thread-1' #$/);
+});
+
+test("mirrored terminal output strips command echoes and duplicate resumed prompts", async (t) => {
+  const dirtyTranscript = [
+    "cd /tmp/morpheus-alpha && codex --remote 'ws://127.0.0.1:8765' -C '/tmp/morpheus-alpha' resume 'codex-thread-1' 'G2: Hey, what is 27 minus 5?'",
+    ">_ OpenAI Codex (v0.139.0)",
+    "model: gpt-5.5 xhigh",
+    "directory: ~/github/fabianbaier/morpheus",
+    "permissions: YOLO mode",
+    "› Hey, what is 27 minus 5?",
+    "• 22",
+    "› G2: Hey, what is 27 minus 5?",
+    "• 22",
+    "2222",
+    "ERROR: remote app server at `ws://127.0.0.1:8765/` transport failed: WebSocket protocol error: Connection reset without closing handshake",
+  ].join("\n");
+  const { baseUrl } = await withBridge(t, {
+    agentBackend: "codex_app_server",
+    createCodexAgentProvider: fakeCodexAgentProvider({
+      emitFinalResult: false,
+      promptReturnDelayMs: 20,
+    }),
+    mirrorCodexTui: true,
+    showProjectsFirst: true,
+    waitForPromptResult: false,
+    outputPollIntervalMs: 20,
+    outputPollAttempts: 20,
+    runner: fakeMorpheusRunner({
+      mirrorOutputText: dirtyTranscript,
+    }),
+  });
+
+  const client = new G2BridgeClient({
+    bridgeUrl: baseUrl,
+    token: TOKEN,
+    eventSourceFactory: () => null,
+  });
+
+  await client.connect();
+  await client.activateSelected();
+  const submitted = await client.submitTranscriptViaSessionPolling("Hey, what is 27 minus 5?", {
+    waitFor: /\b22\b/,
+    timeoutMs: 2000,
+    intervalMs: 20,
+  });
+
+  assert.equal(submitted.mode, "session");
+  assert.match(submitted.glassesText, /\b22\b/);
+  assert.doesNotMatch(submitted.glassesText, /codex --remote|codex-thread-1|Connection reset|2222/);
+
+  const messages = await request(baseUrl, "/api/messages?sessionId=project-session:p_alpha");
+  const messagesBody = await messages.json();
+  const result = messagesBody.messages.find((message) => message.type === "result");
+  assert.equal(result?.text, "22");
 });
 
 test("mirrored terminal output timeout is not streamed as the session answer", async (t) => {

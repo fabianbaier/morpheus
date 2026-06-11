@@ -44,6 +44,8 @@ const PROJECTS_NAV_SESSION_ID = `${PROJECT_SESSION_PREFIX}${PROJECTS_NAV_PROJECT
 const LEGACY_PROJECTS_NAV_SESSION_ID = "nav:projects";
 const SECRET_LIKE_RE =
   /\b(sk-[A-Za-z0-9_-]{20,}|AKIA[0-9A-Z]{16}|BEGIN [A-Z ]*PRIVATE KEY)\b/;
+const ANSI_ESCAPE_RE = /\x1b\[[0-9;?]*[ -/]*[@-~]/g;
+const UUID_RE = /\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/i;
 
 function envInt(env, key, fallback, { min = 1, max = Number.MAX_SAFE_INTEGER } = {}) {
   const raw = env[key];
@@ -146,6 +148,96 @@ function shellQuote(value) {
   return `'${String(value).replace(/'/g, "'\\''")}'`;
 }
 
+function normalizeComparableText(value) {
+  return String(value || "")
+    .replace(/^G2:\s*/i, "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase();
+}
+
+function terminalOutputLineText(line) {
+  return String(line || "")
+    .replace(ANSI_ESCAPE_RE, "")
+    .replace(/[╭╮╰╯│─]+/g, " ")
+    .replace(/^[\s>›•●○·*+-]+/u, "")
+    .trim();
+}
+
+function isTerminalMirrorNoiseLine(rawLine, text, { sessionId = "", latestUserText = "" } = {}) {
+  const raw = String(rawLine || "").trim();
+  const clean = String(text || "").trim();
+  if (!clean || clean === "'" || clean === "`") return true;
+  if (/^[╭╮╰╯│─\s]+$/.test(raw)) return true;
+  if (/^Last login:/i.test(clean)) return true;
+  if (/^[^\s@]+@[^\s%]+%(\s|$)/.test(clean)) return true;
+  if (/\bcodex\b.*\b--remote\b.*\bresume\b/i.test(clean)) return true;
+  if (/\bresume\b\s+['"]?[0-9a-f-]{20,}/i.test(clean)) return true;
+  if (sessionId && clean.includes(sessionId)) return true;
+  if (UUID_RE.test(clean) && /\b(G2:|codex|resume|remote)\b/i.test(clean)) return true;
+  if (/^ERROR: remote app server .* transport failed/i.test(clean)) return true;
+  if (/^morpheus timed out after \d+ms$/i.test(clean)) return true;
+  if (/^G2:\s*/i.test(clean)) return true;
+  if (/^[›>]\s*/u.test(raw) && !/^>_\s*/.test(raw)) return true;
+  if (
+    /^(>_\s*)?(OpenAI Codex|Update available|Run brew|See full release notes|Tip:|model:|directory:|permissions:)/i.test(
+      clean,
+    )
+  ) {
+    return true;
+  }
+  if (/^https:\/\/github\.com\/openai\/codex/i.test(clean)) return true;
+  if (/^(Use \/skills|Implement \{feature\}|Summarize recent commits)$/i.test(clean)) return true;
+
+  const latestComparable = normalizeComparableText(latestUserText);
+  if (latestComparable && normalizeComparableText(clean) === latestComparable) return true;
+  return false;
+}
+
+function collapseRepeatedMirrorCandidates(candidates) {
+  const collapsed = [];
+  for (const candidate of candidates) {
+    const text = String(candidate || "").trim();
+    if (!text) continue;
+    const previous = collapsed.at(-1) || "";
+    if (previous && text === previous) continue;
+    if (previous && previous.length <= 32 && text === `${previous}${previous}`) continue;
+    collapsed.push(text);
+  }
+  return collapsed;
+}
+
+function cleanTerminalMirrorOutput(rawText, { sessionId = "", latestUserText = "" } = {}) {
+  const lines = String(rawText || "")
+    .replace(/\r/g, "\n")
+    .split("\n");
+  const candidates = [];
+  let block = [];
+
+  function flush() {
+    const text = collapseRepeatedMirrorCandidates(block).join("\n").trim();
+    if (text) candidates.push(text);
+    block = [];
+  }
+
+  for (const rawLine of lines) {
+    const line = String(rawLine || "").replace(ANSI_ESCAPE_RE, "");
+    if (!line.trim()) {
+      flush();
+      continue;
+    }
+    const text = terminalOutputLineText(line);
+    if (isTerminalMirrorNoiseLine(line, text, { sessionId, latestUserText })) {
+      flush();
+      continue;
+    }
+    block.push(text);
+  }
+  flush();
+
+  return collapseRepeatedMirrorCandidates(candidates).at(-1) || "";
+}
+
 function secureEqual(left, right) {
   if (typeof left !== "string" || typeof right !== "string") return false;
   const leftBuffer = Buffer.from(left);
@@ -228,6 +320,16 @@ function latestTerminalMessageAfterLatestPrompt(state, sessionId) {
     if (msg.type === "prompt_submitted" || msg.type === "user_prompt") return null;
   }
   return null;
+}
+
+function latestUserPromptText(state, sessionId) {
+  const messages = getMessages(state, sessionId, 0);
+  for (let idx = messages.length - 1; idx >= 0; idx -= 1) {
+    const msg = messages[idx];
+    if (msg.type === "user_prompt" && msg.text) return String(msg.text);
+    if (msg.type === "result" || msg.type === "error") return "";
+  }
+  return "";
 }
 
 function resolveResultWaiters(state, sessionId, msg) {
@@ -749,7 +851,7 @@ function createMorpheusProvider(options = {}) {
         "--cmd",
         command,
       ];
-      if (prompt) {
+      if (prompt !== undefined && prompt !== null) {
         args.push("--prompt", prompt);
       }
       if (projectId) {
@@ -1647,6 +1749,12 @@ function codexResumeCommand({ sessionId, cwd, port }) {
   ].join(" ");
 }
 
+function codexPassiveMirrorCommand(options) {
+  // The mirror tab is display-only. The trailing shell comment prevents any
+  // accidentally appended mission goal from becoming a second Codex prompt.
+  return `${codexResumeCommand(options)} #`;
+}
+
 function mergeSessionRows(...groups) {
   const seen = new Set();
   const merged = [];
@@ -1793,7 +1901,16 @@ function createCodexAppServerBridgeProvider(options = {}) {
         projectId,
         lines: Math.max(1, limit || 10),
       });
-      const text = String(result?.output?.text || "").trim();
+      const rawText = String(result?.output?.text || "");
+      const text = cleanTerminalMirrorOutput(rawText, {
+        sessionId,
+        latestUserText: latestUserPromptText(state, sessionId),
+      }).trim();
+      bridgeDebug(config, "morpheus-output-history-normalized", {
+        sessionId,
+        rawChars: rawText.length,
+        textChars: text.length,
+      });
       if (!text) return [];
       return [{ role: "assistant", text }];
     } catch (err) {
@@ -1871,7 +1988,7 @@ function createCodexAppServerBridgeProvider(options = {}) {
     if (!config.mirrorCodexTui || state.mirroredCodexSessions.has(sessionId)) return null;
     state.mirroredCodexSessions.add(sessionId);
     const cwd = project?.root_path || process.cwd();
-    const command = codexResumeCommand({
+    const command = codexPassiveMirrorCommand({
       sessionId,
       cwd,
       port: config.codexAppServerPort,
@@ -2458,8 +2575,31 @@ async function refreshSessionOutput({ provider, state, config, sessionId, publis
       projectId: state.selectedProject?.id || state.selectedProject?.tenant_id || "",
       lines: 10,
     });
-    const text = String(result?.output?.text || "").trim();
     if (result?.skipped) return result;
+    const rawText = String(result?.output?.text || "");
+    const text = provider.agentBackend === AGENT_BACKEND_CODEX_APP_SERVER
+      ? cleanTerminalMirrorOutput(rawText, {
+          sessionId,
+          latestUserText: latestUserPromptText(state, sessionId),
+        }).trim()
+      : rawText.trim();
+    const normalizedResult = {
+      ...result,
+      output: {
+        ...(result?.output || {}),
+        text,
+        lines: text ? text.split("\n") : [],
+        line_count: text ? text.split("\n").length : 0,
+        char_count: text.length,
+      },
+    };
+    if (provider.agentBackend === AGENT_BACKEND_CODEX_APP_SERVER) {
+      bridgeDebug(config, "session-output-normalized", {
+        sessionId,
+        rawChars: rawText.length,
+        textChars: text.length,
+      });
+    }
     if (!text) return null;
     const outputStatus = toEvenStatus(result?.session?.state) || result?.session?.state || "idle";
     const fingerprint = outputStatus === "busy" || outputStatus === "working"
@@ -2471,18 +2611,18 @@ async function refreshSessionOutput({ provider, state, config, sessionId, publis
         outputStatus === "working" ||
         resultAlreadyPublishedAfterLatestPrompt(state, sessionId, text))
     ) {
-      return result;
+      return normalizedResult;
     }
     if (!publish) {
       state.outputHashes.set(sessionId, fingerprint);
-      return result;
+      return normalizedResult;
     }
     // Morpheus marks an open interactive Codex tab as "working" even after the
     // answer is visible and the TUI is waiting for the next prompt. The terminal
     // text itself is the stronger live signal for G2, so publish it instead of
     // hiding it behind the coarse tab state.
     publishAssistantResultIfNew(state, config, sessionId, text, "codex");
-    return result;
+    return normalizedResult;
   } catch (err) {
     bridgeDebug(config, "session-output-refresh-failed", {
       sessionId,
