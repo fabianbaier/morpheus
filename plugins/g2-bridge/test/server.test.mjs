@@ -1682,6 +1682,69 @@ test("codex prompt can return before final answer when result waiting is disable
   );
 });
 
+test("project-scoped messages stay live when selected session state is cleared", async (t) => {
+  const { baseUrl } = await withBridge(t, {
+    agentBackend: "codex_app_server",
+    createCodexAgentProvider: fakeCodexAgentProvider({ asyncResultMs: 20 }),
+    mirrorCodexTui: false,
+    showProjectsFirst: true,
+  });
+
+  const prompt = await request(baseUrl, "/api/prompt", {
+    body: {
+      sessionId: "project:p_alpha",
+      text: "message survives project overview",
+      clientRequestId: "codex-project-message-live",
+    },
+  });
+  assert.equal(prompt.status, 202);
+
+  const projectOverview = await request(baseUrl, "/api/select-session", {
+    body: {
+      sessionId: "project:p_alpha",
+      clientRequestId: "codex-project-message-live-overview",
+    },
+  });
+  assert.equal(projectOverview.status, 200);
+  const overviewBody = await projectOverview.json();
+  assert.equal(overviewBody.selectedSession, null);
+  assert.equal(overviewBody.selectedProject.id, "p_alpha");
+
+  const messages = await request(baseUrl, "/api/messages?sessionId=project:p_alpha");
+  assert.equal(messages.status, 200);
+  const body = await messages.json();
+  assert.equal(body.activeSessionId, "codex-thread-1");
+  assert.match(
+    body.messages.map((message) => message.text || "").join("\n"),
+    /answer for: message survives project overview/,
+  );
+});
+
+test("project event stream replays buffered answer despite stale last event id", async (t) => {
+  const { baseUrl } = await withBridge(t, {
+    agentBackend: "codex_app_server",
+    createCodexAgentProvider: fakeCodexAgentProvider({ asyncResultMs: 20 }),
+    mirrorCodexTui: false,
+    showProjectsFirst: true,
+  });
+
+  const prompt = await request(baseUrl, "/api/prompt", {
+    body: {
+      sessionId: "project:p_alpha",
+      text: "replay stale event id",
+      clientRequestId: "codex-project-event-stale-id",
+    },
+  });
+  assert.equal(prompt.status, 202);
+
+  const events = await fetch(`${baseUrl}/api/events?sessionId=project:p_alpha&token=${TOKEN}`, {
+    headers: { "Last-Event-ID": "9999" },
+  });
+  assert.equal(events.status, 200);
+  const streamed = await readStreamUntil(events.body, "answer for: replay stale event id", 1000);
+  assert.match(streamed, /"type":"result"/);
+});
+
 test("project history polling during new session keeps glasses stream live", async (t) => {
   const { baseUrl } = await withBridge(t, {
     agentBackend: "codex_app_server",

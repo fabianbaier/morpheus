@@ -587,7 +587,7 @@ export class G2BridgeClient {
   openEventStream(sessionId = this.state.displaySessionId) {
     if (!sessionId || !this.token) return null;
     this.close();
-    const url = `${this.bridgeUrl}/api/events?sessionId=${encodeURIComponent(sessionId)}&token=${encodeURIComponent(this.token)}`;
+    const url = `${this.bridgeUrl}/api/events?sessionId=${encodeURIComponent(sessionId)}&needReplay=true&token=${encodeURIComponent(this.token)}`;
     const source = this.eventSourceFactory(url);
     if (!source) {
       this.log("EventSource unavailable; using message polling only");

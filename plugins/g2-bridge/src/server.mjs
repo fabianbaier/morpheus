@@ -269,6 +269,12 @@ function bridgeDebug(config, event, fields = {}) {
   config.logger.log(`[g2-debug] ${event}${payload}`);
 }
 
+function bridgeFlow(config, event, fields = {}) {
+  if (config?.flowLog === false) return;
+  const payload = Object.keys(fields).length ? ` ${JSON.stringify(fields)}` : "";
+  config.logger.log(`[g2-flow] ${event}${payload}`);
+}
+
 function cleanMessageState(state, sessionId) {
   const key = sessionId || "morpheus";
   let buffer = state.sessions.get(key);
@@ -496,6 +502,19 @@ function publishAssistantResultIfNew(state, config, sessionId, text, providerNam
     sessionId,
     at: nowIso(config.clock),
   });
+  bridgeFlow(config, "terminal-result-published", {
+    sessionId,
+    provider: providerName,
+    textChars: trimmed.length,
+    targets: sessionMessageTargets(state, sessionId).map((target) => {
+      const buffer = state.sessions.get(target);
+      return {
+        id: target,
+        clients: buffer?.clients?.size || 0,
+        latestId: buffer?.messages?.at(-1)?.id || 0,
+      };
+    }),
+  });
   markSessionIdle(state, sessionId);
   return true;
 }
@@ -580,10 +599,12 @@ function transcriptStreamAllowed(state, sessionId, requestedSessionId = "", msg 
   if (activeProjectId) {
     if (projectKey(state.selectedProject) !== activeProjectId) return false;
     const activeSession = activeSessionForProject(state, activeProjectId);
+    const selectedProjectMatches = projectKey(state.selectedProject) === activeProjectId;
+    const selectedSessionMatches =
+      state.selectedSession && activeSession?.id && sessionMatches(state.selectedSession, activeSession.id);
     return Boolean(
       activeSession?.id &&
-        state.selectedSession &&
-        sessionMatches(state.selectedSession, activeSession.id) &&
+        (selectedSessionMatches || selectedProjectMatches) &&
         messageBelongsToSession(msg, activeSession),
     );
   }
@@ -592,9 +613,11 @@ function transcriptStreamAllowed(state, sessionId, requestedSessionId = "", msg 
   if (projectId) {
     const activeSession = activeSessionForProject(state, projectId);
     if (!activeSession?.id) return true;
+    const selectedProjectMatches = projectKey(state.selectedProject) === projectId;
+    const selectedSessionMatches =
+      state.selectedSession && sessionMatches(state.selectedSession, activeSession.id);
     return Boolean(
-      state.selectedSession &&
-        sessionMatches(state.selectedSession, activeSession.id) &&
+      (selectedSessionMatches || selectedProjectMatches) &&
         messageBelongsToSession(msg, activeSession),
     );
   }
@@ -2427,6 +2450,19 @@ async function spawnSessionFromText({ req, res, context, requestId, text, projec
       textHash,
       textChars: text.length,
     });
+    bridgeFlow(config, "prompt-response", {
+      action: "spawn_session",
+      requestId,
+      requestSessionId,
+      activeSessionId: spawned.id,
+      displaySessionId: activeProjectSessionId(project),
+      state: finalStatus,
+      responseTextChars: responseText.length,
+      activeMessages: activeMessages.length,
+      displayMessages: displayMessages.length,
+      selectedProjectId: projectKey(state.selectedProject || project) || "",
+      selectedSessionId: state.selectedSession?.id || "",
+    });
     res.status(202).json(body);
   } catch (err) {
     clearPendingProjectPrompt(state, project, requestId);
@@ -2584,6 +2620,21 @@ async function sendPromptToSession({ req, res, context, requestId, text, session
       projectId: promptProject?.id || promptProject?.tenant_id || "",
       textHash,
       textChars: text.length,
+    });
+    bridgeFlow(config, "prompt-response", {
+      action: "send_prompt",
+      requestId,
+      requestSessionId,
+      activeSessionId,
+      displaySessionId: promptProject
+        ? activeProjectSessionId(promptProject)
+        : requestSessionId || session.id,
+      state: finalStatus,
+      responseTextChars: responseText.length,
+      activeMessages: activeMessages.length,
+      displayMessages: displayMessages.length,
+      selectedProjectId: projectKey(state.selectedProject || promptProject) || "",
+      selectedSessionId: state.selectedSession?.id || "",
     });
     scheduleOutputRefresh(context, activeSessionId);
     res.status(202).json(body);
@@ -2743,6 +2794,7 @@ async function refreshSessionForSessionsPoll({ provider, state, config, sessionI
     : outputStatus || directStatus?.state || bufferedStatus;
   const afterLatestId = latestMessageId(state, sessionId);
   const afterHash = state.outputHashes.get(sessionId) || "";
+  const historyText = String(historyResult?.text || "");
   const published =
     afterLatestId !== beforeLatestId ||
     afterHash !== beforeHash ||
@@ -2756,9 +2808,23 @@ async function refreshSessionForSessionsPoll({ provider, state, config, sessionI
     outputPollActive,
     outputPollStopReason: state.outputPollStats?.get(sessionId)?.stopReason || "",
     outputChars: outputText.length,
-    historyChars: String(historyResult?.text || "").length,
+    historyChars: historyText.length,
     published,
   });
+  if (published || outputText.length || historyText.length) {
+    bridgeFlow(config, "sessions-poll-refresh", {
+      reason,
+      sessionId,
+      status,
+      preferThreadHistory,
+      outputPollActive,
+      outputPollStopReason: state.outputPollStats?.get(sessionId)?.stopReason || "",
+      outputChars: outputText.length,
+      historyChars: historyText.length,
+      published,
+      latestId: afterLatestId,
+    });
+  }
   return {
     refreshed: Boolean(outputResult || historyResult),
     published,
@@ -2836,6 +2902,12 @@ function scheduleOutputRefresh(context, sessionId) {
     stopReason: "",
   });
   bridgeDebug(config, "output-poller-start", {
+    sessionId,
+    pollAfterId,
+    intervalMs: config.outputPollIntervalMs,
+    maxAttempts: config.outputPollAttempts,
+  });
+  bridgeFlow(config, "output-poller-start", {
     sessionId,
     pollAfterId,
     intervalMs: config.outputPollIntervalMs,
@@ -2919,6 +2991,14 @@ function scheduleOutputRefresh(context, sessionId) {
           reason: published ? "published" : "attempts-exhausted",
           attempts,
           skippedAttempts,
+        });
+        bridgeFlow(config, "output-poller-stop", {
+          sessionId,
+          reason: published ? "published" : "attempts-exhausted",
+          attempts,
+          skippedAttempts,
+          outputChars: String(result?.output?.text || "").length,
+          historyChars: String(historyResult?.text || firstHistoryText || "").length,
         });
         stopOutputPoller(state, sessionId, published ? "published" : "attempts-exhausted");
       } else if (skipped && skippedAttempts < Math.max(3, config.outputPollAttempts)) {
@@ -3356,6 +3436,7 @@ function buildConfigFromEnv(env = process.env, argv = process.argv.slice(2)) {
     includeCodexHistory: env.MORPHEUS_G2_INCLUDE_CODEX_HISTORY === "1",
     requestLog: env.MORPHEUS_G2_REQUEST_LOG !== "0",
     debug: env.MORPHEUS_G2_DEBUG === "1",
+    flowLog: env.MORPHEUS_G2_FLOW_LOG !== "0",
     waitForPromptResult: !["0", "false", "no", "off"].includes(
       String(env.MORPHEUS_G2_WAIT_FOR_RESULT || "1").toLowerCase(),
     ),
@@ -3515,6 +3596,18 @@ function createBridge(options = {}) {
           outputPollActive: outputPollIsActive(state, selected.activeSessionId),
           outputPollStopReason: state.outputPollStats?.get(selected.activeSessionId)?.stopReason || "",
         });
+        bridgeFlow(config, "sessions-response", {
+          view: "session",
+          state: selected.state,
+          selectedSessionId: selected.selectedSession?.id || "",
+          activeSessionId: selected.activeSessionId || "",
+          displaySessionId: selected.displaySessionId || "",
+          rowCount: sessions.length,
+          messages: selected.messages.length,
+          textChars: String(responseText || "").length,
+          outputPollActive: outputPollIsActive(state, selected.activeSessionId),
+          outputPollStopReason: state.outputPollStats?.get(selected.activeSessionId)?.stopReason || "",
+        });
         res.json({
           sessions,
           snapshot,
@@ -3564,6 +3657,18 @@ function createBridge(options = {}) {
       const responseText = selected.text;
       const view = navigationView(state);
       bridgeDebug(config, "sessions-response", {
+        view,
+        state: selected.state,
+        selectedSessionId: selected.selectedSession?.id || "",
+        activeSessionId: selected.activeSessionId || "",
+        displaySessionId: selected.displaySessionId || "",
+        rowCount: sessions.length,
+        messages: selected.messages.length,
+        textChars: String(responseText || "").length,
+        outputPollActive: outputPollIsActive(state, selected.activeSessionId),
+        outputPollStopReason: state.outputPollStats?.get(selected.activeSessionId)?.stopReason || "",
+      });
+      bridgeFlow(config, "sessions-response", {
         view,
         state: selected.state,
         selectedSessionId: selected.selectedSession?.id || "",
@@ -4401,11 +4506,12 @@ function createBridge(options = {}) {
     const responseStatus = hasBufferedResult
       ? bufferedStatus
       : directStatus?.state || bufferedStatus;
+    const selectedProjectMatches = projectId && projectKey(state.selectedProject) === projectId;
     const projectRowIsLiveRequest =
       projectId &&
       projectActiveSession &&
-      state.selectedSession &&
-      sessionMatches(state.selectedSession, projectActiveSession.id);
+      ((state.selectedSession && sessionMatches(state.selectedSession, projectActiveSession.id)) ||
+        selectedProjectMatches);
     if (projectId && !projectRowIsLiveRequest) {
       res.json({
         messages: [],
@@ -4418,6 +4524,16 @@ function createBridge(options = {}) {
       });
       return;
     }
+    bridgeFlow(config, "messages-response", {
+      sessionId,
+      after: Number.isFinite(after) ? after : 0,
+      activeSessionId: activeSession?.id || projectActiveSession?.id || "",
+      projectRowIsLiveRequest: Boolean(projectRowIsLiveRequest),
+      state: responseStatus,
+      messages: getMessages(state, sessionId, Number.isFinite(after) ? after : 0).length,
+      selectedProjectId: projectKey(state.selectedProject) || "",
+      selectedSessionId: state.selectedSession?.id || "",
+    });
     res.json({
       messages: getMessages(state, sessionId, Number.isFinite(after) ? after : 0),
       state: responseStatus,
@@ -4433,19 +4549,43 @@ function createBridge(options = {}) {
     });
   });
 
-  app.get("/api/events", (req, res) => {
+  app.get("/api/events", async (req, res) => {
     const requestedSessionId = typeof req.query.sessionId === "string" ? req.query.sessionId : "";
     const sessionId = String(requestedSessionId || state.selectedSession?.id || "morpheus");
     const lastEventId = Number.parseInt(req.headers["last-event-id"] || req.query.after || "0", 10);
+    const safeLastEventId = Number.isFinite(lastEventId) ? lastEventId : 0;
+    const replayRequested =
+      req.query.needReplay === "true" ||
+      req.query.needReplay === "1" ||
+      req.query.replay === "true" ||
+      req.query.replay === "1";
+    let activeEventSession = null;
     const activeProjectEventsId = projectIdFromActiveSessionId(sessionId);
     if (activeProjectEventsId) {
-      const activeSession = activeSessionForProject(state, activeProjectEventsId);
-      if (activeSession?.id) addSessionAlias(state, activeSession.id, sessionId);
+      activeEventSession = activeSessionForProject(state, activeProjectEventsId);
+      if (activeEventSession?.id) addSessionAlias(state, activeEventSession.id, sessionId);
     }
     const projectEventsId = projectIdFromSessionId(sessionId);
     if (projectEventsId) {
-      const activeSession = activeSessionForProject(state, projectEventsId);
-      if (activeSession?.id) addSessionAlias(state, activeSession.id, sessionId);
+      activeEventSession = activeSessionForProject(state, projectEventsId);
+      if (activeEventSession?.id) addSessionAlias(state, activeEventSession.id, sessionId);
+    }
+    try {
+      if (activeEventSession?.id) {
+        await refreshSessionForSessionsPoll({
+          provider,
+          state,
+          config,
+          sessionId: activeEventSession.id,
+          reason: "events_connect",
+        });
+      }
+    } catch (err) {
+      bridgeFlow(config, "events-connect-refresh-failed", {
+        sessionId,
+        activeSessionId: activeEventSession?.id || "",
+        reason: safeJsonError(err),
+      });
     }
     res.setHeader("Content-Type", "text/event-stream");
     res.setHeader("Cache-Control", "no-cache");
@@ -4455,11 +4595,21 @@ function createBridge(options = {}) {
 
     const transcriptAllowed = (msg) => transcriptStreamAllowed(state, sessionId, requestedSessionId, msg);
     const buffer = cleanMessageState(state, sessionId);
-    if (transcriptAllowed()) {
-      for (const entry of getMessages(state, sessionId, Number.isFinite(lastEventId) ? lastEventId : 0)) {
-        if (!transcriptAllowed(entry)) continue;
-        res.write(`id: ${entry.id}\ndata: ${JSON.stringify(sseMessagePayload(entry))}\n\n`);
+    let replayAfter = replayRequested ? 0 : safeLastEventId;
+    let replayEntries = transcriptAllowed() ? getMessages(state, sessionId, replayAfter) : [];
+    if (!replayEntries.length && replayAfter > 0 && transcriptAllowed()) {
+      replayAfter = 0;
+      replayEntries = getMessages(state, sessionId, replayAfter);
+    }
+    let replayed = 0;
+    let dropped = 0;
+    for (const entry of replayEntries) {
+      if (!transcriptAllowed(entry)) {
+        dropped += 1;
+        continue;
       }
+      res.write(`id: ${entry.id}\ndata: ${JSON.stringify(sseMessagePayload(entry))}\n\n`);
+      replayed += 1;
     }
     res.write(":ok\n\n");
     const client = { res, filter: transcriptAllowed };
@@ -4468,7 +4618,26 @@ function createBridge(options = {}) {
       sessionId,
       requestedSessionId,
       selectedSessionId: state.selectedSession?.id || "",
+      activeSessionId: activeEventSession?.id || "",
       clients: buffer.clients.size,
+      replayed,
+      dropped,
+    });
+    bridgeFlow(config, "events-connect", {
+      sessionId,
+      requestedSessionId,
+      selectedProjectId: projectKey(state.selectedProject) || "",
+      selectedSessionId: state.selectedSession?.id || "",
+      activeSessionId: activeEventSession?.id || "",
+      clients: buffer.clients.size,
+      replayRequested,
+      lastEventId: safeLastEventId,
+      replayAfter,
+      replayed,
+      dropped,
+      bufferedMessages: buffer.messages.length,
+      latestId: latestMessageId(state, sessionId),
+      allowed: transcriptAllowed(),
     });
     const heartbeat = setInterval(() => {
       res.write(":heartbeat\n\n");
@@ -4477,6 +4646,11 @@ function createBridge(options = {}) {
       clearInterval(heartbeat);
       buffer.clients.delete(client);
       bridgeDebug(config, "events-close", {
+        sessionId,
+        requestedSessionId,
+        clients: buffer.clients.size,
+      });
+      bridgeFlow(config, "events-close", {
         sessionId,
         requestedSessionId,
         clients: buffer.clients.size,
