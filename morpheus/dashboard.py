@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import fcntl
 import json
+import os
 import random
 import re
 import shlex
@@ -74,6 +75,7 @@ MAX_FALLING_STREAM_SHARDS = 12
 STATUS_IDLE_PULSE_SECONDS = 1.0
 TABLE_REFRESH_SECONDS = 1.0
 TERMINAL_TAIL_SCAN_CHARS = 20_000
+DEFAULT_CODEX_APP_SERVER_PORT = "8765"
 COMPACT_LAYOUT_WIDTH = 120
 COMPACT_LAYOUT_HEIGHT = 32
 
@@ -1544,11 +1546,45 @@ def _closed_resume_prompt(memory: db.MissionMemory) -> str:
 def _closed_resume_command(memory: db.MissionMemory) -> str:
     if not memory.resume_command:
         return ""
+    if memory.agent_kind == "codex":
+        return _repair_stale_codex_remote_resume_command(memory.resume_command)
     return memory.resume_command
+
+
+def _default_codex_remote_addr() -> str:
+    port = os.environ.get("CODEX_APP_SERVER_PORT", DEFAULT_CODEX_APP_SERVER_PORT).strip()
+    return f"ws://127.0.0.1:{port or DEFAULT_CODEX_APP_SERVER_PORT}"
+
+
+def _repair_stale_codex_remote_resume_command(command: str) -> str:
+    """Recover rows stored before Morpheus knew --remote takes an address."""
+    if "--remote" not in command:
+        return command
+    addr = shlex.quote(_default_codex_remote_addr())
+    fixed = re.sub(
+        r"(?<!\S)--remote\s+(?=resume(?:\s|$))",
+        f"--remote {addr} ",
+        command,
+    )
+    fixed = re.sub(
+        r"(?<!\S)--remote=resume(?=\s|$)",
+        f"--remote={addr} resume",
+        fixed,
+    )
+    return fixed
+
+
+def _closed_resume_launch_command(memory: db.MissionMemory, base_command: str = "") -> str:
+    command = base_command or _closed_resume_command(memory)
+    if memory.agent_kind == "codex" and memory.resume_ref and memory.resume_confidence == "exact":
+        return f"{command} {shlex.quote(_closed_resume_prompt(memory))}"
+    return command
 
 
 def _post_spawn_resume_text(memory: db.MissionMemory) -> str:
     prompt = _closed_resume_prompt(memory)
+    if memory.agent_kind == "codex" and memory.resume_ref and memory.resume_confidence == "exact":
+        return ""
     if memory.agent_kind in {"codex", "claude"}:
         return iterm_client.text_with_enter(prompt)
     if memory.agent_kind == "gemini" and memory.resume_ref:
@@ -5565,9 +5601,10 @@ class MorpheusApp(App):
                 f"mission [{mission_id[:12]}] has no provider resume command; use snapshot/manual resume",
             ))
             return
+        launch_cmd = _closed_resume_launch_command(memory, cmd)
         goal = memory.title or mission_id
         try:
-            info = await iterm_client.spawn_tab(self.iterm_conn, command=cmd, goal=goal)
+            info = await iterm_client.spawn_tab(self.iterm_conn, command=launch_cmd, goal=goal)
         except Exception as e:
             self._push_alert(Alert(time.time(), "error", f"closed resume failed: {e}"))
             return
@@ -5596,6 +5633,7 @@ class MorpheusApp(App):
             created_at=now,
         )
         db.upsert(mission)
+        memory.resume_command = cmd
         memory.archived_at = None
         if memory.phase == "archived":
             memory.phase = "working"

@@ -70,6 +70,33 @@ class ResumeMetadataTest(unittest.TestCase):
         self.assertIn(f"codex --yolo resume {resume_id}", archived.resume_command)
         self.assertNotIn("--last", archived.resume_command)
 
+    def test_codex_resume_metadata_preserves_remote_address_and_cwd(self) -> None:
+        resume_id = "019eb403-2783-7801-a362-37ae90406a1d"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with patch.object(db, "DB_DIR", root), patch.object(db, "DB_PATH", root / "morpheus.db"):
+                mission = db.Mission(
+                    tab_id="tab-codex",
+                    session_id="session-codex",
+                    goal="resume remote codex",
+                    cmd="codex --remote ws://127.0.0.1:8765 -C /tmp/project",
+                    state="working",
+                )
+                db.upsert(mission)
+
+                changed = db.refresh_resume_metadata_from_buffer(
+                    mission,
+                    f"To continue this session, run codex resume {resume_id}",
+                )
+
+                self.assertTrue(changed)
+                memory = db.get_memory(mission.mission_id)
+
+        self.assertEqual(
+            memory.resume_command,
+            f"codex --remote ws://127.0.0.1:8765 -C /tmp/project resume {resume_id}",
+        )
+
     def test_dismiss_closed_resume_hides_archived_resumable_row(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

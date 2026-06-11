@@ -37,19 +37,28 @@ CODEX_SESSION_ID_LINE_RE = re.compile(
 )
 CODEX_VALUE_OPTIONS = {
     "-c",
+    "-a",
     "-C",
+    "-i",
     "-m",
     "-p",
     "-s",
+    "--add-dir",
     "--approval-policy",
     "--ask-for-approval",
     "--cd",
     "--config",
     "--cwd",
+    "--disable",
+    "--enable",
+    "--image",
+    "--local-provider",
     "--model",
     "--model-provider",
     "--output-schema",
     "--profile",
+    "--remote",
+    "--remote-auth-token-env",
     "--sandbox",
 }
 CLAUDE_VALUE_OPTIONS = {

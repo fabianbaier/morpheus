@@ -1,4 +1,5 @@
 import asyncio
+import shlex
 import tempfile
 import time
 import unittest
@@ -2027,17 +2028,36 @@ class DashboardTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(captured["spawn"]["goal"], "Closed Codex mission")
         self.assertEqual(
             captured["spawn"]["command"],
-            f"cd /tmp/work && codex --yolo resume {resume_id}",
+            f"cd /tmp/work && codex --yolo resume {resume_id} "
+            f"{shlex.quote(dashboard._closed_resume_prompt(memory))}",
         )
-        self.assertIn("Resume this Morpheus mission", captured["send_text"]["text"])
-        self.assertTrue(captured["send_text"]["text"].endswith("\r"))
-        self.assertEqual(captured["send_text"]["tab_ids"], ["tab-new"])
+        self.assertNotIn("send_text", captured)
         self.assertEqual(captured["mission"].mission_id, "m_closed")
         self.assertEqual(captured["mission"].tab_id, "tab-new")
+        self.assertEqual(captured["mission"].cmd, f"cd /tmp/work && codex --yolo resume {resume_id}")
         self.assertIsNone(captured["memory"].archived_at)
         self.assertEqual(captured["memory"].phase, "working")
         self.assertEqual(captured["event"]["kind"], "resume")
         self.assertEqual(captured["event"]["metadata"]["agent_kind"], "codex")
+
+    def test_closed_resume_command_repairs_stale_codex_remote_command(self) -> None:
+        resume_id = "019eb403-2783-7801-a362-37ae90406a1d"
+        memory = dashboard.db.MissionMemory(
+            mission_id="m_closed",
+            title="Closed Codex mission",
+            agent_kind="codex",
+            resume_ref=resume_id,
+            resume_command=f"cd /tmp/work && codex --remote resume {resume_id}",
+            resume_confidence="exact",
+        )
+
+        with patch.dict(dashboard.os.environ, {"CODEX_APP_SERVER_PORT": "9876"}):
+            command = dashboard._closed_resume_command(memory)
+
+        self.assertEqual(
+            command,
+            f"cd /tmp/work && codex --remote ws://127.0.0.1:9876 resume {resume_id}",
+        )
 
     def test_post_spawn_resume_text_submits_gemini_resume_and_prompt(self) -> None:
         memory = dashboard.db.MissionMemory(
