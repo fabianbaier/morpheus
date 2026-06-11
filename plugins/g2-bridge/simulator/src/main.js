@@ -1,14 +1,16 @@
 import "../styles/main.css";
-import { G2BridgeClient, DEFAULT_BRIDGE_URL } from "./bridge-client.js";
+import { G2BridgeClient, DEFAULT_BRIDGE_URL, buildEvenClientModel } from "./bridge-client.js";
 
 const params = new URLSearchParams(window.location.search);
 const savedBridgeUrl = window.localStorage.getItem("morpheus:g2:bridgeUrl") || "";
 const savedToken = window.localStorage.getItem("morpheus:g2:token") || "";
+const savedSkin = window.localStorage.getItem("morpheus:g2:skin") || "";
 
 const elements = {
   bridgeUrl: document.querySelector("#bridgeUrl"),
   bridgeToken: document.querySelector("#bridgeToken"),
   glassesText: document.querySelector("#glassesText"),
+  evenClientFrame: document.querySelector("#evenClientFrame"),
   debugLog: document.querySelector("#debugLog"),
   transcriptText: document.querySelector("#transcriptText"),
   connectButton: document.querySelector("#connectButton"),
@@ -18,12 +20,15 @@ const elements = {
   clickButton: document.querySelector("#clickButton"),
   downButton: document.querySelector("#downButton"),
   backButton: document.querySelector("#backButton"),
+  morpheusSkinButton: document.querySelector("#morpheusSkinButton"),
+  evenSkinButton: document.querySelector("#evenSkinButton"),
 };
 
 elements.bridgeUrl.value = params.get("bridge") || savedBridgeUrl || DEFAULT_BRIDGE_URL;
 elements.bridgeToken.value = params.get("token") || savedToken || "";
 
 const logs = [];
+let previewSkin = normalizeSkin(params.get("skin") || savedSkin);
 let evenDisplay = null;
 let pendingRender = Promise.resolve();
 
@@ -40,6 +45,21 @@ function log(message) {
   while (logs.length > 80) logs.shift();
   elements.debugLog.textContent = logs.join("\n");
   elements.debugLog.scrollTop = elements.debugLog.scrollHeight;
+}
+
+function normalizeSkin(value) {
+  return value === "even" ? "even" : "morpheus";
+}
+
+function setPreviewSkin(skin) {
+  previewSkin = normalizeSkin(skin);
+  window.localStorage.setItem("morpheus:g2:skin", previewSkin);
+  for (const button of [elements.morpheusSkinButton, elements.evenSkinButton]) {
+    const isActive = button.dataset.skin === previewSkin;
+    button.setAttribute("aria-pressed", String(isActive));
+    button.classList.toggle("is-active", isActive);
+  }
+  render(client.snapshot());
 }
 
 function setBusy(isBusy) {
@@ -66,10 +86,56 @@ function saveConfig() {
 
 function render(snapshot) {
   const text = snapshot.glassesText || "Morpheus G2 simulator";
-  elements.glassesText.textContent = text;
+  const isEvenSkin = previewSkin === "even";
+  elements.glassesText.hidden = isEvenSkin;
+  elements.evenClientFrame.hidden = !isEvenSkin;
+  if (isEvenSkin) renderEvenClient(snapshot);
+  else elements.glassesText.textContent = text;
   pendingRender = pendingRender.then(() => renderEvenDisplay(text)).catch((err) => {
     log(`Even display render failed: ${err.message}`);
   });
+}
+
+function renderEvenClient(snapshot) {
+  const model = buildEvenClientModel(snapshot);
+  const frame = elements.evenClientFrame;
+  frame.replaceChildren();
+
+  const viewport = document.createElement("div");
+  viewport.className = "even-client-viewport";
+
+  const topRow = document.createElement("div");
+  topRow.className = "even-client-top-row";
+  const primaryAction = document.createElement("div");
+  primaryAction.className = "even-client-primary-action";
+  primaryAction.textContent = model.mode === "session" ? model.title : model.addSessionLabel;
+  topRow.append(primaryAction);
+  viewport.append(topRow);
+
+  const content = document.createElement("div");
+  content.className = "even-client-content";
+  if (model.error) {
+    content.append(lineElement(`/ error ${model.error}`, "is-error"));
+  } else if (model.mode === "session") {
+    const messages = model.messages.length ? model.messages : ["/ waiting for stream"];
+    for (const message of messages) content.append(lineElement(message));
+  } else {
+    const rows = model.rows.length
+      ? model.rows
+      : [{ label: model.mode === "projects" ? "/ no projects" : "/ no sessions", selected: false }];
+    for (const row of rows) {
+      content.append(lineElement(row.label, row.selected ? "is-selected" : ""));
+    }
+  }
+  viewport.append(content);
+  frame.append(viewport);
+}
+
+function lineElement(text, extraClass = "") {
+  const line = document.createElement("div");
+  line.className = ["even-client-line", extraClass].filter(Boolean).join(" ");
+  line.textContent = text;
+  return line;
 }
 
 async function renderEvenDisplay(text) {
@@ -187,6 +253,8 @@ elements.upButton.addEventListener("click", () => client.move(-1));
 elements.downButton.addEventListener("click", () => client.move(1));
 elements.clickButton.addEventListener("click", () => runAction(() => client.activateSelected()));
 elements.backButton.addEventListener("click", () => runAction(() => client.navigateBack()));
+elements.morpheusSkinButton.addEventListener("click", () => setPreviewSkin("morpheus"));
+elements.evenSkinButton.addEventListener("click", () => setPreviewSkin("even"));
 
 window.addEventListener("keydown", (event) => {
   if (event.target instanceof HTMLInputElement || event.target instanceof HTMLTextAreaElement) return;
@@ -205,5 +273,5 @@ window.addEventListener("keydown", (event) => {
   }
 });
 
-render(client.snapshot());
+setPreviewSkin(previewSkin);
 void initEvenDisplay();

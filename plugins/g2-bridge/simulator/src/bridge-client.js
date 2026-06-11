@@ -168,6 +168,55 @@ export function buildGlassesText(state) {
   return lines.filter((line) => line !== undefined).join("\n").slice(0, 1800);
 }
 
+function stockClientTitle(state) {
+  const mode = state.mode || "projects";
+  if (state.selectedSession?.title) return state.selectedSession.title;
+  if (mode === "session") return "Session";
+  if (state.selectedProject?.name || state.selectedProject?.id) {
+    return state.selectedProject.name || state.selectedProject.id;
+  }
+  return "Sessions";
+}
+
+function stockRowLabel(row) {
+  const title = row?.title || row?.name || row?.id || "Untitled";
+  if (row?.id === NAV_PROJECTS_ID || row?.id === LEGACY_NAV_PROJECTS_ID) return title;
+  return title.startsWith("/") ? title : `/ ${title}`;
+}
+
+function stockMessageLabel(message) {
+  const text = textFromMessage(message);
+  if (!text) return "";
+  const role = roleFromMessage(message);
+  if (role === "user") return `/ you ${truncateLine(text, 84)}`;
+  if (role === "assistant") return `/ codex ${truncateLine(text, 80)}`;
+  return `/ ${truncateLine(text, 88)}`;
+}
+
+export function buildEvenClientModel(state) {
+  const mode = state.mode || "projects";
+  const rows = coerceArray(state.rows).slice(0, 8).map((row, index) => ({
+    id: row?.id || "",
+    label: stockRowLabel(row),
+    status: row?.status || "",
+    selected: index === state.selectedIndex,
+  }));
+  const messages = coerceArray(state.messages)
+    .slice(-7)
+    .map((message) => stockMessageLabel(message))
+    .filter(Boolean);
+
+  return {
+    mode,
+    title: stockClientTitle(state),
+    addSessionLabel: "+ Add session",
+    rows,
+    messages,
+    status: state.status || state.selectedSession?.status || "idle",
+    error: state.error || "",
+  };
+}
+
 export class G2BridgeClient {
   constructor(options = {}) {
     this.bridgeUrl = trimTrailingSlash(options.bridgeUrl || DEFAULT_BRIDGE_URL);

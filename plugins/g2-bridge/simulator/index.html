@@ -10,6 +10,7 @@
       <section class="glasses-panel" aria-label="Simulated G2 display">
         <div class="glasses-frame">
           <pre id="glassesText" class="glasses-text">Morpheus G2 simulator booting...</pre>
+          <div id="evenClientFrame" class="even-client-frame" hidden></div>
         </div>
         <div class="gesture-row" aria-label="G2 gesture controls">
           <button id="upButton" type="button">Up</button>
@@ -20,6 +21,13 @@
       </section>
 
       <section class="control-panel" aria-label="Bridge controls">
+        <div class="field-row">
+          <span class="field-label">Preview</span>
+          <div class="segmented-control" role="group" aria-label="Preview mode">
+            <button id="morpheusSkinButton" type="button" data-skin="morpheus">Morpheus</button>
+            <button id="evenSkinButton" type="button" data-skin="even">Even</button>
+          </div>
+        </div>
         <div class="field-row">
           <label for="bridgeUrl">Bridge</label>
           <input id="bridgeUrl" autocomplete="off" spellcheck="false" />

@@ -70,6 +70,12 @@ Open:
 http://127.0.0.1:5173/?bridge=http://127.0.0.1:3456&token=dev-token
 ```
 
+Open the stock Even-style browser skin with:
+
+```text
+http://127.0.0.1:5173/?skin=even&bridge=http://127.0.0.1:3456&token=dev-token
+```
+
 The mock bridge exposes Morpheus project rows and a fake Codex provider, so the
 simulator can select a project, submit a final transcript, create a session, and
 watch streamed answer events locally.
