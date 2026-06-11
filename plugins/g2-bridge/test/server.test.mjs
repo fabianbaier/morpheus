@@ -1418,6 +1418,40 @@ test("project row history returns the session menu after leaving a live session"
   assert.equal(historyBody.history.at(-1).text, "answer for: answer visible through project history");
 });
 
+test("project row history returns the session menu after leaving a busy active session", async (t) => {
+  const { baseUrl } = await withBridge(t, {
+    agentBackend: "codex_app_server",
+    createCodexAgentProvider: fakeCodexAgentProvider({ asyncResultMs: 500 }),
+    mirrorCodexTui: false,
+    showProjectsFirst: true,
+    waitForPromptResult: false,
+  });
+  const prompt = await request(baseUrl, "/api/prompt", {
+    body: {
+      sessionId: "project:p_alpha",
+      text: "busy project should not auto-open",
+      clientRequestId: "codex-project-history-busy-menu-prompt",
+    },
+  });
+  assert.equal(prompt.status, 202);
+  assert.equal((await prompt.json()).state, "busy");
+
+  await request(baseUrl, "/api/sessions/project:__projects__/history");
+
+  const projectHistory = await request(baseUrl, "/api/sessions/project:p_alpha/history");
+  assert.equal(projectHistory.status, 200);
+  const projectHistoryBody = await projectHistory.json();
+  assert.equal(projectHistoryBody.mode, "sessions");
+  assert.equal(projectHistoryBody.navigation.view, "sessions");
+  assert.equal(projectHistoryBody.navigation.action, "select_project");
+  assert.equal(projectHistoryBody.selectedProject.id, "p_alpha");
+  assert.equal(projectHistoryBody.selectedSession, null);
+  assert.equal(projectHistoryBody.sessions[0].id, "project:__projects__");
+  assert.equal(projectHistoryBody.sessions[1].id, "project-session:p_alpha");
+  assert.equal(projectHistoryBody.sessions[1].status, "busy");
+  assert.deepEqual(projectHistoryBody.history, []);
+});
+
 test("project row event stream receives codex final result via query-token auth", async (t) => {
   const { baseUrl } = await withBridge(t, {
     agentBackend: "codex_app_server",

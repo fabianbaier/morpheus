@@ -393,8 +393,7 @@ function activeProjectHistoryShouldStayLive(state, projectId, activeSession) {
   if (!activeSession?.id) return false;
   const selectedMatches =
     state.selectedSession && sessionMatches(state.selectedSession, activeSession.id);
-  const status = statusFromBufferedMessages(state, activeSession.id, activeSession.status || "idle");
-  return Boolean(selectedMatches || status === "busy");
+  return Boolean(selectedMatches);
 }
 
 function messageBelongsToSession(msg, session) {
