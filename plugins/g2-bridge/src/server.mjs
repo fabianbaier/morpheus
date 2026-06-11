@@ -46,6 +46,7 @@ const SECRET_LIKE_RE =
   /\b(sk-[A-Za-z0-9_-]{20,}|AKIA[0-9A-Z]{16}|BEGIN [A-Z ]*PRIVATE KEY)\b/;
 const ANSI_ESCAPE_RE = /\x1b\[[0-9;?]*[ -/]*[@-~]/g;
 const UUID_RE = /\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/i;
+const UUID_FRAGMENT_RE = /\b[0-9a-f]{4,12}(?:-[0-9a-f]{4,12}){2,5}\b/i;
 
 function envInt(env, key, fallback, { min = 1, max = Number.MAX_SAFE_INTEGER } = {}) {
   const raw = env[key];
@@ -175,6 +176,7 @@ function isTerminalMirrorNoiseLine(rawLine, text, { sessionId = "", latestUserTe
   if (/\bresume\b\s+['"]?[0-9a-f-]{20,}/i.test(clean)) return true;
   if (sessionId && clean.includes(sessionId)) return true;
   if (UUID_RE.test(clean) && /\b(G2:|codex|resume|remote)\b/i.test(clean)) return true;
+  if (UUID_FRAGMENT_RE.test(clean) && /\b(G2:|codex|resume|remote)\b|['"]/.test(clean)) return true;
   if (/^ERROR: remote app server .* transport failed/i.test(clean)) return true;
   if (/^morpheus timed out after \d+ms$/i.test(clean)) return true;
   if (/^G2:\s*/i.test(clean)) return true;
@@ -385,6 +387,27 @@ function addSessionAlias(state, sessionId, alias) {
 function messageFingerprint(msg) {
   const { id: _id, ...payload } = msg || {};
   return JSON.stringify(payload);
+}
+
+function mergeBufferedMessages(...groups) {
+  const seen = new Set();
+  const merged = [];
+  for (const group of groups) {
+    for (const msg of Array.isArray(group) ? group : []) {
+      const fingerprint = messageFingerprint(msg);
+      if (seen.has(fingerprint)) continue;
+      seen.add(fingerprint);
+      merged.push(msg);
+    }
+  }
+  return merged.sort((left, right) => {
+    const leftTime = Date.parse(left?.at || "");
+    const rightTime = Date.parse(right?.at || "");
+    if (Number.isFinite(leftTime) && Number.isFinite(rightTime) && leftTime !== rightTime) {
+      return leftTime - rightTime;
+    }
+    return Number(left?.id || 0) - Number(right?.id || 0);
+  });
 }
 
 function replayMessagesToAlias(state, sessionId, alias) {
@@ -1148,7 +1171,7 @@ function selectedSessionResponse(state) {
     activeSessionId && activeSessionId !== displaySessionId
       ? getMessages(state, activeSessionId, 0)
       : [];
-  const messages = displayMessages.length ? displayMessages : activeMessages;
+  const messages = mergeBufferedMessages(displayMessages, activeMessages);
   const history = selected.history || bufferedHistoryForRow(state, displaySessionId, 10, {
     preferredSessionIds: [activeSessionId],
   });
@@ -1750,9 +1773,10 @@ function codexResumeCommand({ sessionId, cwd, port }) {
 }
 
 function codexPassiveMirrorCommand(options) {
-  // The mirror tab is display-only. The trailing shell comment prevents any
-  // accidentally appended mission goal from becoming a second Codex prompt.
-  return `${codexResumeCommand(options)} #`;
+  // The mirror tab is display-only because Morpheus receives --prompt "".
+  // Do not append a shell comment here: interactive zsh can pass "#" through
+  // as a real Codex prompt when interactive comments are disabled.
+  return codexResumeCommand(options);
 }
 
 function mergeSessionRows(...groups) {
@@ -1816,6 +1840,13 @@ function createCodexAppServerBridgeProvider(options = {}) {
       at: nowIso(config.clock),
       ...msg,
     };
+    bridgeDebug(config, "codex-event", {
+      sessionId,
+      type: entry.type,
+      state: entry.state || "",
+      textChars: String(entry.text || "").length,
+      targets: sessionMessageTargets(state, sessionId).length,
+    });
     pushMessageForSession(state, sessionId, entry);
 
     const existing =
@@ -2003,6 +2034,7 @@ function createCodexAppServerBridgeProvider(options = {}) {
       const mirroredSession = result?.session ? sessionRowToEvenSession(result.session) : null;
       if (mirroredSession?.id) {
         codexMirrorSessions.set(sessionId, mirroredSession);
+        scheduleOutputRefresh({ config, provider: providerApi, state }, sessionId);
       }
       audit("codex_tui_mirrored", {
         sessionId,
@@ -2033,7 +2065,7 @@ function createCodexAppServerBridgeProvider(options = {}) {
     }
   }
 
-  return {
+  const providerApi = {
     name: "morpheus-codex",
     agentBackend: AGENT_BACKEND_CODEX_APP_SERVER,
     promptBehavior: "codex_app_server",
@@ -2231,6 +2263,7 @@ function createCodexAppServerBridgeProvider(options = {}) {
       codex.interrupt?.(sessionId);
     },
   };
+  return providerApi;
 }
 
 async function spawnSessionFromText({ req, res, context, requestId, text, project }) {
@@ -2673,6 +2706,7 @@ async function refreshSessionForSessionsPoll({ provider, state, config, sessionI
   const beforeLatestId = latestMessageId(state, sessionId);
   const beforeHash = state.outputHashes.get(sessionId) || "";
   const preferThreadHistory = shouldPreferThreadHistoryForClientPoll(provider, state, sessionId);
+  const outputPollActive = outputPollIsActive(state, sessionId);
   const firstHistoryResult = preferThreadHistory
     ? await refreshSessionHistory({
         provider,
@@ -2683,11 +2717,12 @@ async function refreshSessionForSessionsPoll({ provider, state, config, sessionI
       })
     : null;
   const firstHistoryText = String(firstHistoryResult?.text || "").trim();
+  const shouldUseOutputFallback = !firstHistoryText && (!preferThreadHistory || !outputPollActive);
   const outputResult = firstHistoryText
     ? null
-    : preferThreadHistory
-      ? null
-      : await refreshSessionOutput({ provider, state, config, sessionId });
+    : shouldUseOutputFallback
+      ? await refreshSessionOutput({ provider, state, config, sessionId })
+      : null;
   const outputText = String(outputResult?.output?.text || "").trim();
   let historyResult = null;
   if (firstHistoryText) {
@@ -2718,6 +2753,8 @@ async function refreshSessionForSessionsPoll({ provider, state, config, sessionI
     sessionId,
     status,
     preferThreadHistory,
+    outputPollActive,
+    outputPollStopReason: state.outputPollStats?.get(sessionId)?.stopReason || "",
     outputChars: outputText.length,
     historyChars: String(historyResult?.text || "").length,
     published,
@@ -2753,12 +2790,31 @@ async function refreshSelectedSessionForSessionsPoll({ provider, state, config, 
   return { published };
 }
 
-function stopOutputPoller(state, sessionId) {
+function rememberOutputPollState(state, sessionId, patch) {
+  if (!sessionId) return;
+  const previous = state.outputPollStats?.get(sessionId) || {};
+  state.outputPollStats?.set(sessionId, {
+    ...previous,
+    sessionId,
+    ...patch,
+  });
+}
+
+function outputPollIsActive(state, sessionId) {
+  return Boolean(sessionId && state.outputPollers.has(sessionId));
+}
+
+function stopOutputPoller(state, sessionId, reason = "stop") {
   const timer = state.outputPollers.get(sessionId);
   if (timer) {
     clearInterval(timer);
     state.outputPollers.delete(sessionId);
   }
+  rememberOutputPollState(state, sessionId, {
+    active: false,
+    stoppedAt: Date.now(),
+    stopReason: reason,
+  });
 }
 
 function scheduleOutputRefresh(context, sessionId) {
@@ -2770,13 +2826,34 @@ function scheduleOutputRefresh(context, sessionId) {
   let attempts = 0;
   let skippedAttempts = 0;
   let running = false;
+  rememberOutputPollState(state, sessionId, {
+    active: true,
+    startedAt: config.clock(),
+    pollAfterId,
+    attempts,
+    skippedAttempts,
+    published: false,
+    stopReason: "",
+  });
+  bridgeDebug(config, "output-poller-start", {
+    sessionId,
+    pollAfterId,
+    intervalMs: config.outputPollIntervalMs,
+    maxAttempts: config.outputPollAttempts,
+  });
   const tick = async () => {
     if (!state.outputPollers.has(sessionId)) return;
     if (running) return;
     running = true;
     try {
       if (latestTerminalMessage(state, sessionId, pollAfterId)) {
-        stopOutputPoller(state, sessionId);
+        bridgeDebug(config, "output-poller-stop", {
+          sessionId,
+          reason: "result-message-already-present",
+          attempts,
+          skippedAttempts,
+        });
+        stopOutputPoller(state, sessionId, "result-message-already-present");
         return;
       }
       const before = state.outputHashes.get(sessionId);
@@ -2812,14 +2889,49 @@ function scheduleOutputRefresh(context, sessionId) {
       const published =
         Boolean(firstHistoryResult?.published) ||
         Boolean(historyResult?.published) ||
-        Boolean(result?.output?.text && after && after !== before && !isBusy);
+        Boolean(result?.output?.text && after && after !== before);
+      rememberOutputPollState(state, sessionId, {
+        active: true,
+        lastAttemptAt: config.clock(),
+        attempts,
+        skippedAttempts,
+        preferThreadHistory,
+        firstHistoryChars: firstHistoryText.length,
+        outputChars: String(result?.output?.text || "").length,
+        outputStatus,
+        isBusy,
+        published,
+      });
+      bridgeDebug(config, "output-poller-tick", {
+        sessionId,
+        attempts,
+        skippedAttempts,
+        preferThreadHistory,
+        firstHistoryChars: firstHistoryText.length,
+        outputChars: String(result?.output?.text || "").length,
+        outputStatus,
+        isBusy,
+        published,
+      });
       if (published || attempts >= config.outputPollAttempts) {
-        stopOutputPoller(state, sessionId);
+        bridgeDebug(config, "output-poller-stop", {
+          sessionId,
+          reason: published ? "published" : "attempts-exhausted",
+          attempts,
+          skippedAttempts,
+        });
+        stopOutputPoller(state, sessionId, published ? "published" : "attempts-exhausted");
       } else if (skipped && skippedAttempts < Math.max(3, config.outputPollAttempts)) {
         const retry = setTimeout(tick, Math.min(750, config.outputPollIntervalMs));
         if (typeof retry.unref === "function") retry.unref();
       } else if (skipped) {
-        stopOutputPoller(state, sessionId);
+        bridgeDebug(config, "output-poller-stop", {
+          sessionId,
+          reason: "skipped-exhausted",
+          attempts,
+          skippedAttempts,
+        });
+        stopOutputPoller(state, sessionId, "skipped-exhausted");
       }
     } finally {
       running = false;
@@ -3280,6 +3392,7 @@ function createBridge(options = {}) {
     rateLimits: new Map(),
     outputHashes: new Map(),
     outputPollers: new Map(),
+    outputPollStats: new Map(),
     mirroredCodexSessions: new Set(),
     sessionAliases: new Map(),
     resultWaiters: new Map(),
@@ -3391,6 +3504,17 @@ function createBridge(options = {}) {
         );
         const selected = selectedSessionResponse(state);
         const responseText = selected.text;
+        bridgeDebug(config, "sessions-response", {
+          view: "session",
+          state: selected.state,
+          selectedSessionId: selected.selectedSession?.id || "",
+          activeSessionId: selected.activeSessionId || "",
+          displaySessionId: selected.displaySessionId || "",
+          messages: selected.messages.length,
+          textChars: String(responseText || "").length,
+          outputPollActive: outputPollIsActive(state, selected.activeSessionId),
+          outputPollStopReason: state.outputPollStats?.get(selected.activeSessionId)?.stopReason || "",
+        });
         res.json({
           sessions,
           snapshot,
@@ -3439,6 +3563,18 @@ function createBridge(options = {}) {
       const selected = selectedSessionResponse(state);
       const responseText = selected.text;
       const view = navigationView(state);
+      bridgeDebug(config, "sessions-response", {
+        view,
+        state: selected.state,
+        selectedSessionId: selected.selectedSession?.id || "",
+        activeSessionId: selected.activeSessionId || "",
+        displaySessionId: selected.displaySessionId || "",
+        rowCount: sessions.length,
+        messages: selected.messages.length,
+        textChars: String(responseText || "").length,
+        outputPollActive: outputPollIsActive(state, selected.activeSessionId),
+        outputPollStopReason: state.outputPollStats?.get(selected.activeSessionId)?.stopReason || "",
+      });
       res.json({
         sessions,
         snapshot,

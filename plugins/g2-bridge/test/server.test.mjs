@@ -1841,12 +1841,8 @@ test("client polling prefers codex thread history over slow terminal mirror outp
   assert.equal(outputCalls, 0);
 });
 
-test("client polling skips terminal fallback while codex thread history is not ready", async (t) => {
+test("client polling stays fast while background output poller owns missing codex history", async (t) => {
   let outputCalls = 0;
-  let resolveMirrorDone;
-  const mirrorDone = new Promise((resolve) => {
-    resolveMirrorDone = resolve;
-  });
   const { baseUrl } = await withBridge(t, {
     agentBackend: "codex_app_server",
     createCodexAgentProvider: fakeCodexAgentProvider({
@@ -1857,11 +1853,11 @@ test("client polling skips terminal fallback while codex thread history is not r
     showProjectsFirst: true,
     waitForPromptResult: false,
     outputPollIntervalMs: 30000,
-    outputPollAttempts: 0,
+    outputPollAttempts: 45,
     runner: fakeMorpheusRunner({
       mirrorOutputText: "terminal mirror answer is only for the background poller",
+      mirrorDelayMs: 1200,
       outputDelayMs: 1200,
-      onMirrorDone: () => resolveMirrorDone(),
       onOutputStart: () => {
         outputCalls += 1;
       },
@@ -1876,7 +1872,6 @@ test("client polling skips terminal fallback while codex thread history is not r
     },
   });
   assert.equal(prompt.status, 202);
-  await mirrorDone;
 
   const started = Date.now();
   const sessions = await request(baseUrl, `/api/sessions?token=${TOKEN}`, { token: null });
@@ -1898,6 +1893,7 @@ test("client polling skips terminal fallback while codex thread history is not r
 
 test("mirrored terminal output is streamed when codex app-server misses final result", async (t) => {
   let mirrorCommand = "";
+  let mirrorArgs = [];
   const { baseUrl } = await withBridge(t, {
     agentBackend: "codex_app_server",
     createCodexAgentProvider: fakeCodexAgentProvider({
@@ -1911,8 +1907,9 @@ test("mirrored terminal output is streamed when codex app-server misses final re
     outputPollAttempts: 20,
     runner: fakeMorpheusRunner({
       mirrorOutputText: "terminal mirror answer: 2",
-      onSpawnCommand: (command) => {
+      onSpawnCommand: (command, args) => {
         mirrorCommand = command;
+        mirrorArgs = args;
       },
     }),
   });
@@ -1937,7 +1934,10 @@ test("mirrored terminal output is streamed when codex app-server misses final re
     messagesBody.messages.find((message) => message.type === "result")?.text,
     "terminal mirror answer: 2",
   );
-  assert.match(mirrorCommand, /resume 'codex-thread-1' #$/);
+  assert.match(mirrorCommand, /resume 'codex-thread-1'$/);
+  assert.doesNotMatch(mirrorCommand, / #$/);
+  assert.notEqual(mirrorArgs.indexOf("--prompt"), -1);
+  assert.equal(mirrorArgs[mirrorArgs.indexOf("--prompt") + 1], "");
 });
 
 test("mirrored terminal output strips command echoes and duplicate resumed prompts", async (t) => {
