@@ -35,6 +35,7 @@ const EVEN_APP_ORIGINS = [
   "https://localhost",
   "null",
 ];
+const DEFAULT_ALLOWED_HOSTNAMES = ["localhost", "127.0.0.1", "::1"];
 const REQUEST_ID_RE = /^[A-Za-z0-9._:-]{8,128}$/;
 const PROJECT_SESSION_PREFIX = "project:";
 const PROJECT_ACTIVE_SESSION_PREFIX = "project-session:";
@@ -80,6 +81,49 @@ function publicUrlHint(publicUrl) {
     return "MORPHEUS_G2_PUBLIC_URL is not a valid URL.";
   }
   return "";
+}
+
+function normalizeHostname(value) {
+  return String(value || "").trim().toLowerCase();
+}
+
+function hostnameFromHostHeader(value) {
+  const raw = String(value || "").trim();
+  if (!raw || raw.includes("/") || raw.includes("@")) return "";
+  if (raw.startsWith("[")) {
+    const match = raw.match(/^\[([^\]]+)\](?::[0-9]+)?$/);
+    return normalizeHostname(match?.[1] || "");
+  }
+  const colonCount = (raw.match(/:/g) || []).length;
+  if (colonCount > 1) return normalizeHostname(raw);
+  if (colonCount === 1) {
+    const [host, port] = raw.split(":");
+    if (!host || !/^[0-9]+$/.test(port)) return "";
+    return normalizeHostname(host);
+  }
+  return normalizeHostname(raw);
+}
+
+function hostnameFromUrlOrHost(value) {
+  const raw = String(value || "").trim();
+  if (!raw) return "";
+  if (/^[A-Za-z][A-Za-z0-9+.-]*:\/\//.test(raw)) {
+    try {
+      return normalizeHostname(new URL(raw).hostname);
+    } catch {
+      return "";
+    }
+  }
+  return hostnameFromHostHeader(raw);
+}
+
+function isLocalBindHost(host) {
+  const hostname = normalizeHostname(host);
+  return hostname === "127.0.0.1" || hostname === "localhost" || hostname === "::1";
+}
+
+function allowUnsafeBind(config) {
+  return config.allowUnsafeBind === true || config.allowUnsafeBind === "1";
 }
 
 function nowIso(clock) {
@@ -1362,6 +1406,37 @@ function parseAllowedOrigins(config) {
   return exact;
 }
 
+function configHostList(value) {
+  if (Array.isArray(value)) return value;
+  if (typeof value === "string") return envList(value);
+  return [];
+}
+
+function parseAllowedHosts(config) {
+  const exact = new Set(DEFAULT_ALLOWED_HOSTNAMES);
+  for (const value of [config.localUrl, config.publicUrl, ...(configHostList(config.allowedHosts))]) {
+    const hostname = hostnameFromUrlOrHost(value);
+    if (hostname) exact.add(hostname);
+  }
+  return exact;
+}
+
+function createHostValidationMiddleware(config) {
+  const allowed = parseAllowedHosts(config);
+  return (req, res, next) => {
+    if (config.allowAnyHost || req.path === "/healthz") {
+      next();
+      return;
+    }
+    const hostname = hostnameFromHostHeader(req.headers.host);
+    if (!hostname || !allowed.has(hostname)) {
+      res.status(403).json({ error: "Host is not allowed", code: "host_not_allowed" });
+      return;
+    }
+    next();
+  };
+}
+
 function createCorsMiddleware(config) {
   const allowed = parseAllowedOrigins(config);
   return (req, res, next) => {
@@ -2522,6 +2597,78 @@ function navigationPayload(state, extra = {}) {
   };
 }
 
+function bridgeLimits(config) {
+  return {
+    maxPromptChars: config.maxPromptChars,
+    requestIdTtlMs: config.requestIdTtlMs,
+    rateLimitWindowMs: config.rateLimitWindowMs,
+    rateLimitMax: config.rateLimitMax,
+    sessionLimit: config.sessionLimit,
+    projectLimit: config.projectLimit,
+  };
+}
+
+function bridgePolicy(config, provider) {
+  return {
+    rawTerminalKeystrokes: false,
+    remoteApprovals: false,
+    destructiveActions: false,
+    promptBehavior: provider.promptBehavior,
+    agentBackend: config.agentBackend,
+    codexAppServerPort: config.codexAppServerPort,
+    mirrorCodexTui: config.mirrorCodexTui,
+    includeCodexHistory: config.includeCodexHistory,
+    waitForPromptResult: config.waitForPromptResult,
+    promptWaitForResultMs: config.promptWaitForResultMs,
+    spawnCommand: config.spawnCommand,
+    remoteSpawn: config.allowSpawn,
+    terminalPromptSubmit: config.allowTerminalPrompts,
+    interruptNavigatesBack: config.interruptNavigatesBack,
+    directBackToProjects: config.directBackToProjects,
+    showBackToProjectsRow: config.showBackToProjectsRow,
+    voiceInputTrust: "untrusted_final_transcript_only",
+  };
+}
+
+function deviceStateSnapshot({ state, config, provider }) {
+  const view = navigationView(state);
+  const selected = selectedSessionResponse(state);
+  const selectedProjectId = projectKey(state.selectedProject) || null;
+  const activeProjectSession = state.selectedProject
+    ? activeSessionForProject(state, state.selectedProject)
+    : null;
+  const pendingProjectSession = state.selectedProject
+    ? pendingProjectPromptForProject(state, state.selectedProject)
+    : null;
+  const selectedSession = selected.selectedSession || state.selectedSession || null;
+  const selectedSessionId = selectedSession?.id || state.selectedSession?.id || null;
+  const projectActiveSessionIdValue =
+    selected.projectActiveSessionId ||
+    (activeProjectSession?.id && state.selectedProject
+      ? activeProjectSessionId(state.selectedProject)
+      : pendingProjectSession?.projectActiveSessionId || pendingProjectSession?.id || null);
+  const status = selected.state || selectedSession?.status || pendingProjectSession?.status || "idle";
+  return {
+    ok: true,
+    bridge: "g2",
+    provider: provider.name,
+    view,
+    mode: view,
+    selectedProject: state.selectedProject,
+    selectedSession,
+    selectedProjectId,
+    selectedSessionId,
+    activeSessionId: selected.activeSessionId || activeProjectSession?.id || null,
+    projectActiveSessionId: projectActiveSessionIdValue,
+    state: status,
+    status,
+    stale: false,
+    allowedActions: provider.allowedActions || [],
+    limits: bridgeLimits(config),
+    policy: bridgePolicy(config, provider),
+  };
+}
+
 function navigateBack(state, options = {}) {
   const { directBackToProjects = true } = options;
   const from = navigationView(state);
@@ -2768,6 +2915,9 @@ function buildConfigFromEnv(env = process.env, argv = process.argv.slice(2)) {
     tokenSource: tokenFromEnv ? "env" : "ephemeral",
     morpheusBin: env.MORPHEUS_BIN || "morpheus",
     allowedOrigins: envList(env.MORPHEUS_G2_ALLOWED_ORIGINS),
+    allowedHosts: envList(env.MORPHEUS_G2_ALLOWED_HOSTS),
+    allowAnyHost: env.MORPHEUS_G2_ALLOW_ANY_HOST === "1",
+    allowUnsafeBind: env.MORPHEUS_G2_ALLOW_UNSAFE_BIND === "1",
     allowWildcardOrigin: env.MORPHEUS_G2_ALLOW_WILDCARD_ORIGIN === "1",
     evenAppCors: env.MORPHEUS_G2_EVEN_APP_CORS !== "0",
     acceptQueryToken: env.MORPHEUS_G2_ACCEPT_QUERY_TOKEN !== "0",
@@ -2868,6 +3018,7 @@ function createBridge(options = {}) {
   };
   config.publicUrl = trimTrailingSlash(config.publicUrl || "");
   config.localUrl = trimTrailingSlash(config.localUrl || `http://${config.host}:${config.port}`);
+  config.allowAnyHost = config.allowAnyHost === true || config.allowAnyHost === "1";
   config.clock = config.clock || Date.now;
   config.logger = config.logger || console;
   const state = {
@@ -2914,6 +3065,7 @@ function createBridge(options = {}) {
   const app = express();
 
   app.disable("x-powered-by");
+  app.use(createHostValidationMiddleware(config));
   app.use(createCorsMiddleware(config));
   app.use(express.json({ limit: config.jsonLimit }));
   app.use((err, _req, res, next) => {
@@ -2930,8 +3082,6 @@ function createBridge(options = {}) {
       ok: true,
       provider: provider.name,
       bridge: "g2",
-      selectedProjectId: state.selectedProject?.id || state.selectedProject?.tenant_id || null,
-      selectedSessionId: state.selectedSession?.id || null,
     });
   });
 
@@ -2950,31 +3100,13 @@ function createBridge(options = {}) {
       selectedProject: state.selectedProject,
       selectedSession: state.selectedSession,
       allowedActions: provider.allowedActions,
-      limits: {
-        maxPromptChars: config.maxPromptChars,
-        requestIdTtlMs: config.requestIdTtlMs,
-        projectLimit: config.projectLimit,
-      },
-      policy: {
-        rawTerminalKeystrokes: false,
-        remoteApprovals: false,
-        destructiveActions: false,
-        promptBehavior: provider.promptBehavior,
-        agentBackend: config.agentBackend,
-        codexAppServerPort: config.codexAppServerPort,
-        mirrorCodexTui: config.mirrorCodexTui,
-        includeCodexHistory: config.includeCodexHistory,
-        waitForPromptResult: config.waitForPromptResult,
-        promptWaitForResultMs: config.promptWaitForResultMs,
-        spawnCommand: config.spawnCommand,
-        remoteSpawn: config.allowSpawn,
-        terminalPromptSubmit: config.allowTerminalPrompts,
-        interruptNavigatesBack: config.interruptNavigatesBack,
-        directBackToProjects: config.directBackToProjects,
-        showBackToProjectsRow: config.showBackToProjectsRow,
-        voiceInputTrust: "untrusted_final_transcript_only",
-      },
+      limits: bridgeLimits(config),
+      policy: bridgePolicy(config, provider),
     });
+  });
+
+  app.get("/api/device/state", (_req, res) => {
+    res.json(deviceStateSnapshot({ state, config, provider }));
   });
 
   app.get("/api/sessions", async (req, res) => {
@@ -3903,6 +4035,13 @@ function createBridge(options = {}) {
 
 function startBridge(options = {}) {
   const config = { ...buildConfigFromEnv(), ...options };
+  if (!isLocalBindHost(config.host) && !allowUnsafeBind(config)) {
+    throw new Error(
+      `Refusing to bind Morpheus G2 bridge to non-local host '${config.host}'. ` +
+        "Keep the bridge on loopback and publish it with Tailscale Serve, or set " +
+        "MORPHEUS_G2_ALLOW_UNSAFE_BIND=1 only behind trusted ACLs.",
+    );
+  }
   const { app } = createBridge(config);
   const server = app.listen(config.port, config.host, () => {
     const localUrl = trimTrailingSlash(config.localUrl || `http://${config.host}:${config.port}`);

@@ -1,10 +1,11 @@
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import http from "node:http";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
-import { createBridge } from "../src/server.mjs";
+import { createBridge, startBridge } from "../src/server.mjs";
 import { G2BridgeClient } from "../simulator/src/bridge-client.js";
 
 const TOKEN = "test-token-123456";
@@ -237,6 +238,54 @@ async function request(baseUrl, pathname, options = {}) {
   });
 }
 
+async function requestWithHost(baseUrl, pathname, host, options = {}) {
+  const url = new URL(pathname, baseUrl);
+  const headers = { ...(options.headers || {}), Host: host };
+  if (options.token !== null) {
+    headers.Authorization = `Bearer ${options.token || TOKEN}`;
+  }
+  let body = "";
+  if (options.body !== undefined) {
+    headers["Content-Type"] = "application/json";
+    body = JSON.stringify(options.body);
+  }
+  return new Promise((resolve, reject) => {
+    const req = http.request(
+      {
+        hostname: url.hostname,
+        port: url.port,
+        path: `${url.pathname}${url.search}`,
+        method: options.method || (body ? "POST" : "GET"),
+        headers,
+      },
+      (res) => {
+        const chunks = [];
+        res.on("data", (chunk) => chunks.push(chunk));
+        res.on("end", () => {
+          const text = Buffer.concat(chunks).toString("utf8");
+          resolve({
+            status: res.statusCode,
+            headers: {
+              get(name) {
+                return res.headers[String(name).toLowerCase()] || null;
+              },
+            },
+            async json() {
+              return text ? JSON.parse(text) : {};
+            },
+            async text() {
+              return text;
+            },
+          });
+        });
+      },
+    );
+    req.on("error", reject);
+    if (body) req.write(body);
+    req.end();
+  });
+}
+
 async function readStreamUntil(body, needle, timeoutMs = 1000) {
   const reader = body.getReader();
   const decoder = new TextDecoder();
@@ -444,6 +493,55 @@ test("rejects unlisted browser origins before processing API requests", async (t
   assert.equal((await res.json()).code, "origin_not_allowed");
 });
 
+test("rejects unlisted Host headers before processing API requests", async (t) => {
+  const { baseUrl } = await withBridge(t);
+  const res = await requestWithHost(baseUrl, "/api/info", "evil.example:443");
+  assert.equal(res.status, 403);
+  assert.equal((await res.json()).code, "host_not_allowed");
+
+  const unauthenticated = await requestWithHost(baseUrl, "/api/info", "evil.example:443", {
+    token: null,
+  });
+  assert.equal(unauthenticated.status, 403);
+  assert.equal((await unauthenticated.json()).code, "host_not_allowed");
+});
+
+test("allows configured public and local Host headers", async (t) => {
+  const { baseUrl } = await withBridge(t);
+
+  const local = await request(baseUrl, "/api/info");
+  assert.equal(local.status, 200);
+
+  const publicHost = await requestWithHost(baseUrl, "/api/info", "mac.tailnet.ts.net:443");
+  assert.equal(publicHost.status, 200);
+  const body = await publicHost.json();
+  assert.equal(body.publicUrl, "https://mac.tailnet.ts.net");
+});
+
+test("keeps healthz public for unlisted Host headers", async (t) => {
+  const { baseUrl } = await withBridge(t);
+  const res = await requestWithHost(baseUrl, "/healthz", "evil.example", { token: null });
+  assert.equal(res.status, 200);
+  const body = await res.json();
+  assert.equal(body.ok, true);
+  assert.equal(body.selectedProjectId, undefined);
+  assert.equal(body.selectedSessionId, undefined);
+});
+
+test("rejects unsafe bind hosts unless explicitly allowed", () => {
+  assert.throws(
+    () =>
+      startBridge({
+        host: "0.0.0.0",
+        port: 0,
+        token: TOKEN,
+        tokenSource: "env",
+        logger: silentLogger(),
+      }),
+    /Refusing to bind Morpheus G2 bridge to non-local host/,
+  );
+});
+
 test("allows listed origins and returns policy metadata", async (t) => {
   const { baseUrl } = await withBridge(t);
   const res = await request(baseUrl, "/api/info", { origin: "https://phone.example" });
@@ -455,6 +553,60 @@ test("allows listed origins and returns policy metadata", async (t) => {
   assert.equal(body.policy.remoteApprovals, false);
   assert.equal(body.policy.promptBehavior, "spawn_or_send_prompt");
   assert.equal(body.policy.interruptNavigatesBack, true);
+});
+
+test("device state requires authentication", async (t) => {
+  const { baseUrl } = await withBridge(t);
+  const res = await request(baseUrl, "/api/device/state", { token: null });
+  assert.equal(res.status, 401);
+});
+
+test("device state returns selected project and session ids", async (t) => {
+  const { baseUrl } = await withBridge(t);
+  await request(baseUrl, "/api/select-project", {
+    body: { projectId: "p_alpha", clientRequestId: "device-state-project" },
+  });
+  await request(baseUrl, "/api/select-session", {
+    body: { sessionId: "abc123", clientRequestId: "device-state-session" },
+  });
+
+  const res = await request(baseUrl, "/api/device/state");
+  assert.equal(res.status, 200);
+  const body = await res.json();
+  assert.equal(body.ok, true);
+  assert.equal(body.bridge, "g2");
+  assert.equal(body.view, "session");
+  assert.equal(body.mode, "session");
+  assert.equal(body.selectedProjectId, "p_alpha");
+  assert.equal(body.selectedSessionId, "abc123");
+  assert.equal(body.selectedProject.id, "p_alpha");
+  assert.equal(body.selectedSession.id, "abc123");
+  assert.equal(body.stale, false);
+  assert.equal(body.policy.rawTerminalKeystrokes, false);
+  assert.equal(body.policy.remoteApprovals, false);
+});
+
+test("device state separates project row id from active session id", async (t) => {
+  const { baseUrl } = await withBridge(t);
+  await request(baseUrl, "/api/select-project", {
+    body: { projectId: "p_beta", clientRequestId: "device-active-project" },
+  });
+  const prompt = await request(baseUrl, "/api/prompt", {
+    body: {
+      text: "start active device state session",
+      clientRequestId: "device-active-prompt",
+    },
+  });
+  assert.equal(prompt.status, 202);
+
+  const res = await request(baseUrl, "/api/device/state");
+  assert.equal(res.status, 200);
+  const body = await res.json();
+  assert.equal(body.selectedProjectId, "p_beta");
+  assert.equal(body.selectedSessionId, "project-session:p_beta");
+  assert.equal(body.selectedSession.id, "project-session:p_beta");
+  assert.equal(body.activeSessionId, "g2spawn");
+  assert.equal(body.projectActiveSessionId, "project-session:p_beta");
 });
 
 test("spawns a session for prompt submission without an existing selected session", async (t) => {

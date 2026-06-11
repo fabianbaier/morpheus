@@ -1,10 +1,19 @@
 import "../styles/main.css";
 import { G2BridgeClient, DEFAULT_BRIDGE_URL, buildEvenClientModel } from "./bridge-client.js";
+import {
+  clearLegacyTokenStorage,
+  saveBridgeConfig,
+  savePreviewSkin,
+  storedBridgeUrl,
+  storedSkin,
+  storedToken,
+} from "./storage.js";
 
 const params = new URLSearchParams(window.location.search);
-const savedBridgeUrl = window.localStorage.getItem("morpheus:g2:bridgeUrl") || "";
-const savedToken = window.localStorage.getItem("morpheus:g2:token") || "";
-const savedSkin = window.localStorage.getItem("morpheus:g2:skin") || "";
+clearLegacyTokenStorage(window);
+const savedBridgeUrl = storedBridgeUrl(window);
+const savedToken = storedToken(window, params);
+const savedSkin = storedSkin(window);
 
 const elements = {
   bridgeUrl: document.querySelector("#bridgeUrl"),
@@ -25,7 +34,7 @@ const elements = {
 };
 
 elements.bridgeUrl.value = params.get("bridge") || savedBridgeUrl || DEFAULT_BRIDGE_URL;
-elements.bridgeToken.value = params.get("token") || savedToken || "";
+elements.bridgeToken.value = params.has("token") ? params.get("token") || "" : savedToken;
 
 const logs = [];
 let previewSkin = normalizeSkin(params.get("skin") || savedSkin);
@@ -53,7 +62,7 @@ function normalizeSkin(value) {
 
 function setPreviewSkin(skin) {
   previewSkin = normalizeSkin(skin);
-  window.localStorage.setItem("morpheus:g2:skin", previewSkin);
+  savePreviewSkin(window, previewSkin);
   for (const button of [elements.morpheusSkinButton, elements.evenSkinButton]) {
     const isActive = button.dataset.skin === previewSkin;
     button.setAttribute("aria-pressed", String(isActive));
@@ -79,8 +88,7 @@ function setBusy(isBusy) {
 function saveConfig() {
   const bridgeUrl = elements.bridgeUrl.value.trim();
   const token = elements.bridgeToken.value.trim();
-  window.localStorage.setItem("morpheus:g2:bridgeUrl", bridgeUrl);
-  window.localStorage.setItem("morpheus:g2:token", token);
+  saveBridgeConfig(window, { bridgeUrl, token });
   client.configure({ bridgeUrl, token });
 }
 
