@@ -139,10 +139,12 @@ function fakeCodexAgentProvider({
 function fakeMorpheusRunner({
   mirrorDelayMs = 0,
   mirrorOutputText = "",
+  outputDelayMs = 0,
   outputFailuresBeforeSuccess = 0,
   outputErrorMessage = "morpheus timed out after 10000ms",
   onMirrorStart = () => {},
   onMirrorDone = () => {},
+  onOutputStart = () => {},
 } = {}) {
   let mirroredTabRef = "";
   let outputCalls = 0;
@@ -193,6 +195,8 @@ function fakeMorpheusRunner({
     if (args[1] === "output") {
       const ref = args[args.length - 1];
       if (ref !== mirroredTabRef) throw new Error(`unexpected output target: ${ref}`);
+      onOutputStart(ref);
+      if (outputDelayMs > 0) await sleep(outputDelayMs);
       outputCalls += 1;
       if (outputCalls <= outputFailuresBeforeSuccess) {
         throw new Error(outputErrorMessage);
@@ -1740,6 +1744,141 @@ test("project history polling while codex thread id is pending keeps glasses str
   const promptRes = await prompt;
   assert.equal(promptRes.status, 202);
   assert.match(await streamed, /"type":"result"/);
+});
+
+test("client polling prefers codex thread history over slow terminal mirror output", async (t) => {
+  let outputCalls = 0;
+  let resolveMirrorDone;
+  const mirrorDone = new Promise((resolve) => {
+    resolveMirrorDone = resolve;
+  });
+  const { baseUrl } = await withBridge(t, {
+    agentBackend: "codex_app_server",
+    createCodexAgentProvider: fakeCodexAgentProvider({
+      emitFinalResult: false,
+      promptReturnDelayMs: 20,
+      history: {
+        "codex-thread-1": [
+          { role: "user", text: "history first, mirror slow" },
+          { role: "assistant", text: "answer from real codex thread history" },
+        ],
+      },
+    }),
+    mirrorCodexTui: true,
+    showProjectsFirst: true,
+    waitForPromptResult: false,
+    outputPollIntervalMs: 30000,
+    outputPollAttempts: 0,
+    runner: fakeMorpheusRunner({
+      mirrorOutputText: "terminal mirror should not block client polling",
+      outputDelayMs: 1200,
+      onMirrorDone: () => resolveMirrorDone(),
+      onOutputStart: () => {
+        outputCalls += 1;
+      },
+    }),
+  });
+
+  const prompt = await request(baseUrl, "/api/prompt", {
+    body: {
+      sessionId: "project:p_alpha",
+      text: "history first, mirror slow",
+      clientRequestId: "codex-thread-history-before-slow-mirror",
+    },
+  });
+  assert.equal(prompt.status, 202);
+  await mirrorDone;
+
+  const sessionsStarted = Date.now();
+  const sessions = await request(baseUrl, `/api/sessions?token=${TOKEN}`, { token: null });
+  const sessionsElapsedMs = Date.now() - sessionsStarted;
+  assert.equal(sessions.status, 200);
+  assert.ok(
+    sessionsElapsedMs < 700,
+    `/api/sessions waited ${sessionsElapsedMs}ms, which means it likely blocked on terminal output`,
+  );
+  const sessionsBody = await sessions.json();
+  assert.equal(sessionsBody.mode, "session");
+  assert.equal(sessionsBody.state, "idle");
+  assert.equal(sessionsBody.text, "answer from real codex thread history");
+  assert.equal(sessionsBody.output.text, "answer from real codex thread history");
+  assert.equal(sessionsBody.history.at(-1).text, "answer from real codex thread history");
+  assert.equal(
+    sessionsBody.messages.find((message) => message.type === "result")?.text,
+    "answer from real codex thread history",
+  );
+  assert.equal(outputCalls, 0);
+
+  const messagesStarted = Date.now();
+  const messages = await request(baseUrl, "/api/messages?sessionId=project-session:p_alpha");
+  const messagesElapsedMs = Date.now() - messagesStarted;
+  assert.equal(messages.status, 200);
+  assert.ok(
+    messagesElapsedMs < 700,
+    `/api/messages waited ${messagesElapsedMs}ms, which means it likely blocked on terminal output`,
+  );
+  const messagesBody = await messages.json();
+  assert.equal(messagesBody.state, "idle");
+  assert.equal(
+    messagesBody.messages.find((message) => message.type === "result")?.text,
+    "answer from real codex thread history",
+  );
+  assert.equal(outputCalls, 0);
+});
+
+test("client polling skips terminal fallback while codex thread history is not ready", async (t) => {
+  let outputCalls = 0;
+  let resolveMirrorDone;
+  const mirrorDone = new Promise((resolve) => {
+    resolveMirrorDone = resolve;
+  });
+  const { baseUrl } = await withBridge(t, {
+    agentBackend: "codex_app_server",
+    createCodexAgentProvider: fakeCodexAgentProvider({
+      emitFinalResult: false,
+      promptReturnDelayMs: 20,
+    }),
+    mirrorCodexTui: true,
+    showProjectsFirst: true,
+    waitForPromptResult: false,
+    outputPollIntervalMs: 30000,
+    outputPollAttempts: 0,
+    runner: fakeMorpheusRunner({
+      mirrorOutputText: "terminal mirror answer is only for the background poller",
+      outputDelayMs: 1200,
+      onMirrorDone: () => resolveMirrorDone(),
+      onOutputStart: () => {
+        outputCalls += 1;
+      },
+    }),
+  });
+
+  const prompt = await request(baseUrl, "/api/prompt", {
+    body: {
+      sessionId: "project:p_alpha",
+      text: "history not ready, mirror slow",
+      clientRequestId: "codex-thread-history-not-ready-slow-mirror",
+    },
+  });
+  assert.equal(prompt.status, 202);
+  await mirrorDone;
+
+  const started = Date.now();
+  const sessions = await request(baseUrl, `/api/sessions?token=${TOKEN}`, { token: null });
+  const elapsedMs = Date.now() - started;
+  assert.equal(sessions.status, 200);
+  assert.ok(
+    elapsedMs < 700,
+    `/api/sessions waited ${elapsedMs}ms, which means it likely used terminal fallback`,
+  );
+  const body = await sessions.json();
+  assert.equal(body.mode, "session");
+  assert.equal(body.text || "", "");
+  assert.equal(
+    body.messages.some((message) => String(message.text || "").includes("terminal mirror answer")),
+    false,
+  );
+  assert.equal(outputCalls, 0);
 });
 
 test("mirrored terminal output is streamed when codex app-server misses final result", async (t) => {

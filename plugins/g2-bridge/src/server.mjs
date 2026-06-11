@@ -2006,11 +2006,12 @@ function createCodexAppServerBridgeProvider(options = {}) {
       return codex.getSessionStatus?.(sessionId) || codex.getStatus?.(sessionId)?.state || "idle";
     },
 
-    async getHistory(sessionId, limit) {
+    async getHistory(sessionId, limit, options = {}) {
       const buffered = historyFromBufferedMessages(getMessages(state, sessionId, 0), limit);
       if (hasAssistantHistory(buffered)) {
         return buffered;
       }
+      const allowOutputFallback = options.allowOutputFallback !== false;
       if (codex.getHistory) {
         let persisted = [];
         try {
@@ -2026,6 +2027,7 @@ function createCodexAppServerBridgeProvider(options = {}) {
           });
         }
         if (hasAssistantHistory(persisted)) return persisted;
+        if (!allowOutputFallback) return buffered.length ? buffered : persisted;
         const outputHistory = await morpheusOutputHistory(
           sessionId,
           limit,
@@ -2034,6 +2036,7 @@ function createCodexAppServerBridgeProvider(options = {}) {
         if (hasAssistantHistory(outputHistory)) return outputHistory;
         return buffered.length ? buffered : persisted;
       }
+      if (!allowOutputFallback) return buffered;
       const outputHistory = await morpheusOutputHistory(
         sessionId,
         limit,
@@ -2413,6 +2416,7 @@ async function refreshSessionOutput({ provider, state, config, sessionId, publis
       lines: 10,
     });
     const text = String(result?.output?.text || "").trim();
+    if (result?.skipped) return result;
     if (!text) return null;
     const outputStatus = toEvenStatus(result?.session?.state) || result?.session?.state || "idle";
     const fingerprint = outputStatus === "busy" || outputStatus === "working"
@@ -2453,10 +2457,16 @@ async function refreshSessionOutput({ provider, state, config, sessionId, publis
   }
 }
 
-async function refreshSessionHistory({ provider, state, config, sessionId }) {
+async function refreshSessionHistory({
+  provider,
+  state,
+  config,
+  sessionId,
+  allowOutputFallback = true,
+}) {
   if (!sessionId || !provider.getHistory) return null;
   try {
-    const history = await provider.getHistory(sessionId, 10);
+    const history = await provider.getHistory(sessionId, 10, { allowOutputFallback });
     const text = latestHistoryText(history, "assistant");
     if (!text) return { history, text: "", published: false };
     const published = publishAssistantResultIfNew(state, config, sessionId, text, provider.name || "codex");
@@ -2470,21 +2480,56 @@ async function refreshSessionHistory({ provider, state, config, sessionId }) {
   }
 }
 
+function shouldPreferThreadHistoryForClientPoll(provider, state, sessionId) {
+  if (provider.agentBackend !== AGENT_BACKEND_CODEX_APP_SERVER) return false;
+  const id = String(sessionId || "");
+  const selectedIsMorpheus =
+    state.selectedSession?.morpheus && sessionMatches(state.selectedSession, id);
+  if (selectedIsMorpheus) return false;
+  for (const session of state.projectActiveSessions.values()) {
+    if (session?.morpheus && sessionMatches(session, id)) return false;
+  }
+  return true;
+}
+
 async function refreshSessionForSessionsPoll({ provider, state, config, sessionId, reason = "sessions_poll" }) {
   if (!sessionId) return { refreshed: false, published: false };
   const beforeLatestId = latestMessageId(state, sessionId);
   const beforeHash = state.outputHashes.get(sessionId) || "";
-  const outputResult = await refreshSessionOutput({ provider, state, config, sessionId });
-  const outputText = String(outputResult?.output?.text || "").trim();
-  const historyResult = outputText
+  const preferThreadHistory = shouldPreferThreadHistoryForClientPoll(provider, state, sessionId);
+  const firstHistoryResult = preferThreadHistory
+    ? await refreshSessionHistory({
+        provider,
+        state,
+        config,
+        sessionId,
+        allowOutputFallback: false,
+      })
+    : null;
+  const firstHistoryText = String(firstHistoryResult?.text || "").trim();
+  const outputResult = firstHistoryText
     ? null
-    : await refreshSessionHistory({ provider, state, config, sessionId });
+    : preferThreadHistory
+      ? null
+      : await refreshSessionOutput({ provider, state, config, sessionId });
+  const outputText = String(outputResult?.output?.text || "").trim();
+  let historyResult = null;
+  if (firstHistoryText) {
+    historyResult = firstHistoryResult;
+  } else if (!outputText && !preferThreadHistory) {
+    historyResult = await refreshSessionHistory({ provider, state, config, sessionId });
+  } else if (preferThreadHistory) {
+    historyResult = firstHistoryResult;
+  }
   const directStatus = provider.getStatus?.(sessionId);
-  const status =
+  const bufferedStatus = statusFromBufferedMessages(state, sessionId, "idle");
+  const outputStatus =
     toEvenStatus(outputResult?.session?.state) ||
     outputResult?.session?.state ||
-    directStatus?.state ||
-    statusFromBufferedMessages(state, sessionId, "idle");
+    "";
+  const status = String(historyResult?.text || "").trim()
+    ? bufferedStatus
+    : outputStatus || directStatus?.state || bufferedStatus;
   const afterLatestId = latestMessageId(state, sessionId);
   const afterHash = state.outputHashes.get(sessionId) || "";
   const published =
@@ -2496,6 +2541,7 @@ async function refreshSessionForSessionsPoll({ provider, state, config, sessionI
     reason,
     sessionId,
     status,
+    preferThreadHistory,
     outputChars: outputText.length,
     historyChars: String(historyResult?.text || "").length,
     published,
@@ -2542,11 +2588,14 @@ function stopOutputPoller(state, sessionId) {
 function scheduleOutputRefresh(context, sessionId) {
   const { config, provider, state } = context;
   if (!sessionId || !provider.sessionOutput || state.outputPollers.has(sessionId)) return;
+  if (config.outputPollAttempts <= 0) return;
   if (latestTerminalMessageAfterLatestPrompt(state, sessionId)) return;
   const pollAfterId = latestMessageId(state, sessionId);
   let attempts = 0;
+  let skippedAttempts = 0;
   let running = false;
   const tick = async () => {
+    if (!state.outputPollers.has(sessionId)) return;
     if (running) return;
     running = true;
     try {
@@ -2554,19 +2603,46 @@ function scheduleOutputRefresh(context, sessionId) {
         stopOutputPoller(state, sessionId);
         return;
       }
-      attempts += 1;
       const before = state.outputHashes.get(sessionId);
-      const result = await refreshSessionOutput({ provider, state, config, sessionId });
-      const historyResult = result?.output?.text
+      const preferThreadHistory = shouldPreferThreadHistoryForClientPoll(provider, state, sessionId);
+      const firstHistoryResult = preferThreadHistory
+        ? await refreshSessionHistory({
+            provider,
+            state,
+            config,
+            sessionId,
+            allowOutputFallback: false,
+          })
+        : null;
+      const firstHistoryText = String(firstHistoryResult?.text || "").trim();
+      const result = firstHistoryText
         ? null
-        : await refreshSessionHistory({ provider, state, config, sessionId });
+        : await refreshSessionOutput({ provider, state, config, sessionId });
+      const skipped = Boolean(result?.skipped);
+      if (skipped) {
+        skippedAttempts += 1;
+      } else {
+        attempts += 1;
+      }
+      let historyResult = null;
+      if (firstHistoryText) {
+        historyResult = firstHistoryResult;
+      } else if (!result?.output?.text && !preferThreadHistory) {
+        historyResult = await refreshSessionHistory({ provider, state, config, sessionId });
+      }
       const after = state.outputHashes.get(sessionId);
       const outputStatus = toEvenStatus(result?.session?.state) || result?.session?.state || "idle";
       const isBusy = outputStatus === "busy" || outputStatus === "working";
       const published =
+        Boolean(firstHistoryResult?.published) ||
         Boolean(historyResult?.published) ||
         Boolean(result?.output?.text && after && after !== before && !isBusy);
       if (published || attempts >= config.outputPollAttempts) {
+        stopOutputPoller(state, sessionId);
+      } else if (skipped && skippedAttempts < Math.max(3, config.outputPollAttempts)) {
+        const retry = setTimeout(tick, Math.min(750, config.outputPollIntervalMs));
+        if (typeof retry.unref === "function") retry.unref();
+      } else if (skipped) {
         stopOutputPoller(state, sessionId);
       }
     } finally {
@@ -3747,7 +3823,13 @@ function createBridge(options = {}) {
         state.selectedSession = activeSession;
         bumpNavigationEpoch(state);
         addSessionAlias(state, activeSession.id, sessionId);
-        await refreshSessionOutput({ provider, state, config, sessionId: activeSession.id });
+        await refreshSessionForSessionsPoll({
+          provider,
+          state,
+          config,
+          sessionId: activeSession.id,
+          reason: "history_active_session",
+        });
         let history = bufferedHistoryForRow(state, sessionId, limit, {
           preferredSessionIds: [activeSession.id],
         });
@@ -3826,7 +3908,13 @@ function createBridge(options = {}) {
             timestamp: activeSession.timestamp || nowIso(config.clock),
           };
           addSessionAlias(state, activeSession.id, sessionId);
-          await refreshSessionOutput({ provider, state, config, sessionId: activeSession.id });
+          await refreshSessionForSessionsPoll({
+            provider,
+            state,
+            config,
+            sessionId: activeSession.id,
+            reason: "history_project_live_session",
+          });
           let history = bufferedHistoryForRow(state, sessionId, limit, {
             preferredSessionIds: [activeSession.id],
           });
@@ -3926,14 +4014,32 @@ function createBridge(options = {}) {
       : null;
     if (activeSession?.id) {
       addSessionAlias(state, activeSession.id, sessionId);
-      await refreshSessionOutput({ provider, state, config, sessionId: activeSession.id });
+      await refreshSessionForSessionsPoll({
+        provider,
+        state,
+        config,
+        sessionId: activeSession.id,
+        reason: "messages_active_session",
+      });
     } else if (!projectId) {
-      await refreshSessionOutput({ provider, state, config, sessionId });
+      await refreshSessionForSessionsPoll({
+        provider,
+        state,
+        config,
+        sessionId,
+        reason: "messages_session",
+      });
     }
     const projectActiveSession = projectId ? activeSessionForProject(state, projectId) : null;
     if (projectActiveSession?.id) {
       addSessionAlias(state, projectActiveSession.id, sessionId);
-      await refreshSessionOutput({ provider, state, config, sessionId: projectActiveSession.id });
+      await refreshSessionForSessionsPoll({
+        provider,
+        state,
+        config,
+        sessionId: projectActiveSession.id,
+        reason: "messages_project_session",
+      });
     }
     const pendingProjectRow = projectId && !projectActiveSession
       ? pendingProjectPromptForProject(state, projectId)
@@ -3945,6 +4051,12 @@ function createBridge(options = {}) {
       bufferedStatusTarget,
       activeSession?.status || projectActiveSession?.status || pendingProjectRow?.status || selected?.status || "idle",
     );
+    const hasBufferedResult = getMessages(state, bufferedStatusTarget, 0).some(
+      (message) => message.type === "result",
+    );
+    const responseStatus = hasBufferedResult
+      ? bufferedStatus
+      : directStatus?.state || bufferedStatus;
     const projectRowIsLiveRequest =
       projectId &&
       projectActiveSession &&
@@ -3953,7 +4065,7 @@ function createBridge(options = {}) {
     if (projectId && !projectRowIsLiveRequest) {
       res.json({
         messages: [],
-        state: directStatus?.state || bufferedStatus,
+        state: responseStatus,
         sessionId,
         activeSessionId: projectActiveSession?.id || undefined,
         pendingSessionId: pendingProjectRow?.id || undefined,
@@ -3964,9 +4076,7 @@ function createBridge(options = {}) {
     }
     res.json({
       messages: getMessages(state, sessionId, Number.isFinite(after) ? after : 0),
-      state:
-        directStatus?.state ||
-        bufferedStatus,
+      state: responseStatus,
       sessionId,
       activeSessionId: activeSession?.id || projectActiveSession?.id || undefined,
       projectActiveSessionId: projectActiveSession ? `${PROJECT_ACTIVE_SESSION_PREFIX}${projectId}` : undefined,
