@@ -26,6 +26,8 @@ const DEFAULT_PROJECT_LIMIT = 25;
 const DEFAULT_OUTPUT_POLL_INTERVAL_MS = 2000;
 const DEFAULT_OUTPUT_POLL_ATTEMPTS = 45;
 const DEFAULT_CODEX_APP_SERVER_PORT = 8765;
+const DEFAULT_CODEX_APP_SERVER_STARTUP_WAIT_MS = 30_000;
+const CODEX_APP_SERVER_RETRY_DELAY_MS = 1_000;
 const DEFAULT_PROMPT_WAIT_FOR_RESULT_MS = 90_000;
 const DEFAULT_STALE_MIRROR_GRACE_MS = 4000;
 const CODEX_LIVE_EVENTS_CHECK_MS = 60_000;
@@ -266,6 +268,44 @@ function normalizeTokenHeader(req, { acceptQueryToken = false } = {}) {
 
 function safeJsonError(err) {
   return err instanceof Error ? err.message : String(err || "unknown error");
+}
+
+const CODEX_APP_SERVER_STARTUP_ERROR_RE =
+  /codex app-server (?:failed to start|not connected|ws (?:error|closed))|WebSocket connect timeout|ECONNREFUSED|ECONNRESET|socket hang up/i;
+
+function isCodexAppServerStartupError(err) {
+  return CODEX_APP_SERVER_STARTUP_ERROR_RE.test(safeJsonError(err));
+}
+
+// The upstream even-terminal client lazy-spawns `codex app-server` and only
+// waits 5s for its ready line. A cold start regularly needs longer, which used
+// to fail the first G2 prompt with `spawn_failed` moments before the
+// app-server finished booting. The spawned child keeps running, so retrying
+// inside the configured startup budget converges as soon as it is listening.
+async function retryWhileCodexAppServerStarts(config, label, fn) {
+  const budgetMs = Number(config.codexAppServerStartupWaitMs || 0);
+  const deadline = config.clock() + budgetMs;
+  for (let attempt = 1; ; attempt += 1) {
+    try {
+      return await fn();
+    } catch (err) {
+      const remainingMs = deadline - config.clock();
+      if (!isCodexAppServerStartupError(err) || remainingMs <= 0) throw err;
+      bridgeFlow(config, "codex-app-server-startup-retry", {
+        label,
+        attempt,
+        remainingMs,
+        reason: safeJsonError(err),
+      });
+      await new Promise((resolve) => {
+        const timer = setTimeout(
+          resolve,
+          Math.min(CODEX_APP_SERVER_RETRY_DELAY_MS, Math.max(1, remainingMs)),
+        );
+        if (typeof timer.unref === "function") timer.unref();
+      });
+    }
+  }
 }
 
 function bridgeDebug(config, event, fields = {}) {
@@ -1174,6 +1214,58 @@ function projectMenuRow(project) {
 
 function isProjectMenuSessionId(sessionId) {
   return sessionId === PROJECTS_NAV_SESSION_ID || sessionId === LEGACY_PROJECTS_NAV_SESSION_ID;
+}
+
+// Stock Even clients open a row by fetching its history and render that
+// history as the conversation. Project and projects-menu rows used to return
+// empty history, which left the glasses on a blank "Waiting input" screen.
+// These overviews are returned directly in the history response only; they are
+// never pushed into message buffers, so they cannot be mistaken for a prompt
+// result.
+function projectSessionsOverviewHistory(project, rows) {
+  const name = String(project?.name || project?.id || project?.tenant_id || "this project");
+  const sessionRows = (Array.isArray(rows) ? rows : []).filter(
+    (row) => row?.id && !isProjectMenuSessionId(row.id),
+  );
+  if (!sessionRows.length) {
+    return [
+      {
+        role: "assistant",
+        text: `Project ${name} has no sessions yet.\nSpeak now to start a new session here.`,
+      },
+    ];
+  }
+  const lines = [
+    `Project ${name} — ${sessionRows.length} session${sessionRows.length === 1 ? "" : "s"}:`,
+  ];
+  sessionRows.slice(0, 8).forEach((row, index) => {
+    const status = row.status ? ` [${row.status}]` : "";
+    lines.push(`${index + 1}. ${shortText(row.title || row.id, 56)}${status}`);
+  });
+  if (sessionRows.length > 8) lines.push(`...and ${sessionRows.length - 8} more.`);
+  lines.push("Go back and open a session row to resume it, or speak now to start a new session.");
+  return [{ role: "assistant", text: lines.join("\n") }];
+}
+
+function projectsOverviewHistory(projects, lastProject) {
+  const rows = Array.isArray(projects) ? projects : [];
+  if (!rows.length) {
+    return [{ role: "assistant", text: "No Morpheus projects available yet." }];
+  }
+  const lines = [`Morpheus projects — ${rows.length}:`];
+  rows.slice(0, 8).forEach((project, index) => {
+    const live = Number(project?.usage?.live_sessions || 0);
+    const liveHint = live ? ` [${live} live]` : "";
+    lines.push(`${index + 1}. ${shortText(project?.name || project?.id || "project", 56)}${liveHint}`);
+  });
+  if (rows.length > 8) lines.push(`...and ${rows.length - 8} more.`);
+  const lastName = lastProject?.name || lastProject?.id || "";
+  lines.push(
+    lastName
+      ? `Go back and open a project to see its sessions. Speaking here starts a new session in ${lastName}.`
+      : "Go back and open a project to see its sessions.",
+  );
+  return [{ role: "assistant", text: lines.join("\n") }];
 }
 
 function isProjectsNavProjectId(projectId) {
@@ -2243,6 +2335,15 @@ function createCodexAppServerBridgeProvider(options = {}) {
       };
     },
 
+    // even-terminal lazy-spawns the codex app-server on first use; warming it
+    // at bridge startup means the first glasses prompt does not pay (or lose)
+    // the cold-start race.
+    async warmup() {
+      if (typeof client.connect !== "function") return false;
+      await retryWhileCodexAppServerStarts(config, "warmup", () => client.connect());
+      return true;
+    },
+
     listProjects(limit) {
       return morpheusProvider.listProjects(limit);
     },
@@ -2271,7 +2372,9 @@ function createCodexAppServerBridgeProvider(options = {}) {
       const project = await projectForProvider(morpheusProvider, projectId, state, config.projectLimit);
       if (!project) throw new Error("Select a Morpheus project before starting a Codex session.");
       const cwd = project.root_path || process.cwd();
-      const result = await codex.prompt("", prompt || goal, cwd);
+      const result = await retryWhileCodexAppServerStarts(config, "spawn_session", () =>
+        codex.prompt("", prompt || goal, cwd),
+      );
       const sessionId = result.sessionId;
       if (!sessionId) throw new Error("Codex app-server did not return a session id");
       const evenSession = rememberCodexSession(
@@ -2323,7 +2426,9 @@ function createCodexAppServerBridgeProvider(options = {}) {
       }
       const project = await projectForProvider(morpheusProvider, projectId, state, config.projectLimit);
       const cwd = project?.root_path || state.selectedSession?.cwd || process.cwd();
-      const result = await codex.prompt(sessionId, text, cwd);
+      const result = await retryWhileCodexAppServerStarts(config, "send_prompt", () =>
+        codex.prompt(sessionId, text, cwd),
+      );
       const resolvedSessionId = result.sessionId || sessionId;
       if (state.selectedSession && sessionMatches(state.selectedSession, sessionId)) {
         rememberCodexSession({
@@ -3501,7 +3606,20 @@ async function submitTextToMorpheus(req, res, context) {
     if (await maybeReplay(req, res, state, requestId)) return;
   }
 
-  const bodySessionId = typeof req.body?.sessionId === "string" ? req.body.sessionId : "";
+  const rawBodySessionId = typeof req.body?.sessionId === "string" ? req.body.sessionId : "";
+  // Prompts sent while a projects-menu row is open ("Back to projects") used
+  // to die with selected_session_stale. The menu row is navigation, not a
+  // session, so route the text like a sessionless prompt: project context
+  // (selected or last project) decides between spawn and follow-up.
+  const bodySessionId = isProjectMenuSessionId(rawBodySessionId) ? "" : rawBodySessionId;
+  if (rawBodySessionId && !bodySessionId) {
+    bridgeFlow(config, "prompt-menu-row-redirect", {
+      requestId,
+      requestSessionId: rawBodySessionId,
+      selectedProjectId: projectKey(state.selectedProject) || "",
+      lastProjectId: projectKey(state.lastProject) || "",
+    });
+  }
   const activeProjectSessionProjectId = projectIdFromActiveSessionId(bodySessionId);
   if (activeProjectSessionProjectId) {
     const project = await resolveProject(provider, activeProjectSessionProjectId, config.projectLimit);
@@ -3737,6 +3855,13 @@ function buildConfigFromEnv(env = process.env, argv = process.argv.slice(2)) {
       DEFAULT_CODEX_APP_SERVER_PORT,
       { min: 1, max: 65535 },
     ),
+    codexAppServerStartupWaitMs: envInt(
+      env,
+      "MORPHEUS_G2_CODEX_STARTUP_WAIT_MS",
+      DEFAULT_CODEX_APP_SERVER_STARTUP_WAIT_MS,
+      { min: 0, max: 5 * 60_000 },
+    ),
+    warmCodexAppServer: env.MORPHEUS_G2_WARM_CODEX_APP_SERVER !== "0",
     requestIdTtlMs: envInt(env, "MORPHEUS_G2_REQUEST_ID_TTL_MS", DEFAULT_REQUEST_ID_TTL_MS, {
       min: 1000,
       max: 60 * 60 * 1000,
@@ -3764,7 +3889,7 @@ function buildConfigFromEnv(env = process.env, argv = process.argv.slice(2)) {
     spawnCommand: env.MORPHEUS_G2_SPAWN_COMMAND || "codex",
     agentBackend: env.MORPHEUS_G2_AGENT_BACKEND || AGENT_BACKEND_CODEX_APP_SERVER,
     mirrorCodexTui: env.MORPHEUS_G2_MIRROR_CODEX_TUI !== "0",
-    includeCodexHistory: env.MORPHEUS_G2_INCLUDE_CODEX_HISTORY === "1",
+    includeCodexHistory: env.MORPHEUS_G2_INCLUDE_CODEX_HISTORY !== "0",
     requestLog: env.MORPHEUS_G2_REQUEST_LOG !== "0",
     debug: env.MORPHEUS_G2_DEBUG === "1",
     flowLog: env.MORPHEUS_G2_FLOW_LOG !== "0",
@@ -4568,7 +4693,7 @@ function createBridge(options = {}) {
       }
       res.json({
         ...projectsResponseBody(result, state),
-        history: [],
+        history: projectsOverviewHistory(result.projects, state.lastProject),
         navigation: navigationPayload(state, { action: "navigate_projects" }),
       });
       return;
@@ -4750,7 +4875,7 @@ function createBridge(options = {}) {
           rows: sessions.length,
         });
         res.json({
-          history: [],
+          history: projectSessionsOverviewHistory(state.selectedProject, sessions),
           sessions,
           snapshot,
           mode: "sessions",
@@ -4763,6 +4888,35 @@ function createBridge(options = {}) {
           error: error || undefined,
         });
         return;
+      }
+      // Stock Even clients open a session row by fetching its history; they
+      // never call /api/select-session. Treat the row open as selection so
+      // follow-up prompts, live polling, and the project's active-session row
+      // resume this session instead of spawning a new one.
+      if (!state.selectedSession || !sessionMatches(state.selectedSession, sessionId)) {
+        try {
+          const resolved = await resolveSession(provider, sessionId, config.sessionLimit, {
+            projectId: state.selectedProject?.id || state.selectedProject?.tenant_id || "",
+          });
+          if (resolved.ok) {
+            state.selectedSession = resolved.session;
+            bumpNavigationEpoch(state);
+            if (state.selectedProject) {
+              rememberActiveProjectSession(state, state.selectedProject, resolved.session);
+            }
+            audit("select_session_history_open", { sessionId: resolved.session.id });
+            bridgeFlow(config, "history-open-selected-session", {
+              sessionId,
+              selectedSessionId: resolved.session.id,
+              selectedProjectId: projectKey(state.selectedProject) || "",
+            });
+          }
+        } catch (err) {
+          bridgeDebug(config, "history-open-select-failed", {
+            sessionId,
+            reason: safeJsonError(err),
+          });
+        }
       }
       const history = await sessionHistory(provider, state, sessionId, limit);
       res.json({ history });
@@ -5012,7 +5166,19 @@ function startBridge(options = {}) {
         "MORPHEUS_G2_ALLOW_UNSAFE_BIND=1 only behind trusted ACLs.",
     );
   }
-  const { app } = createBridge(config);
+  const { app, provider } = createBridge(config);
+  if (
+    config.warmCodexAppServer &&
+    provider.agentBackend === AGENT_BACKEND_CODEX_APP_SERVER &&
+    typeof provider.warmup === "function"
+  ) {
+    provider
+      .warmup()
+      .then(() => config.logger.log("[g2-bridge] codex app-server is ready"))
+      .catch((err) =>
+        config.logger.warn(`[g2-bridge] codex app-server warm-up failed: ${safeJsonError(err)}`),
+      );
+  }
   const server = app.listen(config.port, config.host, () => {
     const localUrl = trimTrailingSlash(config.localUrl || `http://${config.host}:${config.port}`);
     const publicUrl = trimTrailingSlash(config.publicUrl || "");
