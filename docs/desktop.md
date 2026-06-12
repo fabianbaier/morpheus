@@ -111,6 +111,15 @@ a permission-mode selector (default / plan / acceptEdits / bypass) let you contr
 what the agent may do. Each turn's cost is logged to the same ledger as the rest
 of Morpheus.
 
+**Fleet-aware by default.** Live Claude turns get Morpheus's MCP server wired in
+automatically (`--mcp-config` is injected unless `~/.claude.json` already
+registers a `morpheus` server; `mcp__morpheus` tools are auto-allowed, and a
+system hint tells the agent it has them). So the same agent that web-searches can
+answer "which sessions are blocked?" directly from the live mission graph — no
+mode switching. For Codex, register the MCP server once in `~/.codex/config.toml`
+and its sessions are fleet-aware everywhere too. Pass `morpheus_tools: false` to
+`POST /api/agent/turn` to opt out.
+
 Only installed CLIs are selectable (the picker greys out the rest). `claude` is
 the most fully supported; the `codex`/`gemini` adapters map their known event
 shapes and degrade any unrecognised line to streamed text.

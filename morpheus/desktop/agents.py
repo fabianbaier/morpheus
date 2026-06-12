@@ -105,11 +105,72 @@ class AgentAdapter:
     def build_command(self, message: str, *, session_ref: str = "",
                       permission_mode: str = "default",
                       allowed_tools: Optional[list[str]] = None,
-                      model: str = "") -> list[str]:
+                      model: str = "",
+                      morpheus_tools: bool = True) -> list[str]:
         raise NotImplementedError
 
     def parse_line(self, raw: str) -> list[dict[str, Any]]:
         raise NotImplementedError
+
+
+# ───────────────────────── morpheus fleet tools ─────────────────────────
+#
+# Morpheus is "available in every session" through its MCP server. The desktop
+# chat therefore doesn't need a separate fleet-Q&A mode for live agents: a
+# spawned claude turn gets the morpheus MCP server wired in, its tools
+# auto-allowed (-p mode would otherwise silently deny them), and a one-line
+# system hint — so the same agent that does web search and tool use can also
+# answer "what's blocked?" from the live mission graph.
+
+CLAUDE_USER_CONFIG = os.path.expanduser("~/.claude.json")
+
+MORPHEUS_TOOLS_HINT = (
+    "This chat runs inside the Morpheus desktop cockpit. You have Morpheus "
+    "mission-control MCP tools (mcp__morpheus__*: list_sessions, get_session, "
+    "list_missions, get_mission, list_goal_runs, get_context, post_note, ...). "
+    "Use them whenever the user asks about their agent fleet — sessions, "
+    "missions, goals, loops, blockers, spend — instead of guessing."
+)
+
+
+def _claude_has_morpheus_mcp() -> bool:
+    """True if the user already registered a 'morpheus' MCP server globally,
+    in which case injecting our own config would create a duplicate."""
+    try:
+        with open(CLAUDE_USER_CONFIG, encoding="utf-8") as fh:
+            cfg = json.load(fh)
+        return "morpheus" in (cfg.get("mcpServers") or {})
+    except (OSError, ValueError):
+        return False
+
+
+def _desktop_mcp_config_path() -> str:
+    """Write (once per content) and return an MCP config that runs morpheus's
+    stdio MCP server on this exact interpreter — robust even when the
+    `morpheus` shim isn't on the spawning process's PATH."""
+    import sys
+
+    from morpheus import db
+
+    payload = json.dumps(
+        {
+            "mcpServers": {
+                "morpheus": {
+                    "command": sys.executable,
+                    "args": ["-m", "morpheus", "mcp", "serve"],
+                }
+            }
+        },
+        indent=2,
+    )
+    path = db.DB_DIR / "desktop-mcp.json"
+    try:
+        if not path.exists() or path.read_text(encoding="utf-8") != payload:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(payload, encoding="utf-8")
+    except OSError:
+        return ""
+    return str(path)
 
 
 class ClaudeAdapter(AgentAdapter):
@@ -118,15 +179,24 @@ class ClaudeAdapter(AgentAdapter):
                          supports_resume=True, structured=True)
 
     def build_command(self, message, *, session_ref="", permission_mode="default",
-                      allowed_tools=None, model=""):
+                      allowed_tools=None, model="", morpheus_tools=True):
         cmd = [self.resolved_executable() or self.executable, "-p", message,
                "--output-format", "stream-json", "--verbose"]
         if session_ref:
             cmd += ["--resume", session_ref]
         if permission_mode:
             cmd += ["--permission-mode", permission_mode]
-        if allowed_tools:
-            cmd += ["--allowedTools", *allowed_tools]
+        tools = list(allowed_tools or [])
+        if morpheus_tools:
+            if not _claude_has_morpheus_mcp():
+                mcp_config = _desktop_mcp_config_path()
+                if mcp_config:
+                    cmd += ["--mcp-config", mcp_config]
+            if "mcp__morpheus" not in tools:
+                tools.append("mcp__morpheus")
+            cmd += ["--append-system-prompt", MORPHEUS_TOOLS_HINT]
+        if tools:
+            cmd += ["--allowedTools", *tools]
         if model:
             cmd += ["--model", model]
         return cmd
@@ -194,7 +264,7 @@ class CodexAdapter(AgentAdapter):
                          supports_resume=True, structured=True)
 
     def build_command(self, message, *, session_ref="", permission_mode="default",
-                      allowed_tools=None, model=""):
+                      allowed_tools=None, model="", morpheus_tools=True):
         cmd = [self.resolved_executable() or self.executable, "exec", "--json"]
         if session_ref:
             cmd += ["resume", session_ref]
@@ -248,7 +318,7 @@ class TextAgentAdapter(AgentAdapter):
         self._buf: list[str] = []
 
     def build_command(self, message, *, session_ref="", permission_mode="default",
-                      allowed_tools=None, model=""):
+                      allowed_tools=None, model="", morpheus_tools=True):
         cmd = [self.resolved_executable() or self.executable, "-p", message]
         if model:
             cmd += ["-m", model]
@@ -314,6 +384,7 @@ def run_turn(
     permission_mode: str = "default",
     allowed_tools: Optional[list[str]] = None,
     model: str = "",
+    morpheus_tools: bool = True,
     timeout: float = DEFAULT_TURN_TIMEOUT,
     argv: Optional[list[str]] = None,
     on_process: Optional[Any] = None,
@@ -335,7 +406,8 @@ def run_turn(
             return
         argv = adapter.build_command(message, session_ref=session_ref,
                                      permission_mode=permission_mode,
-                                     allowed_tools=allowed_tools, model=model)
+                                     allowed_tools=allowed_tools, model=model,
+                                     morpheus_tools=morpheus_tools)
 
     workdir = cwd or os.getcwd()
     if not os.path.isdir(workdir):

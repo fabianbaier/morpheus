@@ -121,6 +121,53 @@ class RegistryTest(unittest.TestCase):
             self.assertFalse(agents.ClaudeAdapter().is_available())
 
 
+class MorpheusToolsInjectionTest(unittest.TestCase):
+    """Live claude turns get morpheus's MCP server wired in, so the agent can
+    answer fleet questions itself (the 'morpheus is in every session' model)."""
+
+    def _cmd(self, **kwargs):
+        with patch.object(agents.shutil, "which", return_value="/bin/claude"):
+            return agents.ClaudeAdapter().build_command("hi", **kwargs)
+
+    def test_injects_mcp_config_and_allows_tools_when_unregistered(self):
+        with _TempDB(), \
+             patch.object(agents, "CLAUDE_USER_CONFIG", "/nonexistent/claude.json"):
+            cmd = self._cmd()
+            self.assertIn("--mcp-config", cmd)
+            cfg_path = Path(cmd[cmd.index("--mcp-config") + 1])
+            cfg = __import__("json").loads(cfg_path.read_text())
+            self.assertIn("morpheus", cfg["mcpServers"])
+            self.assertEqual(cfg["mcpServers"]["morpheus"]["command"], sys.executable)
+            self.assertIn("--allowedTools", cmd)
+            self.assertIn("mcp__morpheus", cmd)
+            self.assertIn("--append-system-prompt", cmd)
+
+    def test_skips_mcp_config_when_user_registered_morpheus(self):
+        with _TempDB(), tempfile.TemporaryDirectory() as tmp:
+            user_cfg = Path(tmp) / "claude.json"
+            user_cfg.write_text('{"mcpServers": {"morpheus": {"command": "morpheus"}}}')
+            with patch.object(agents, "CLAUDE_USER_CONFIG", str(user_cfg)):
+                cmd = self._cmd()
+                self.assertNotIn("--mcp-config", cmd)
+                # tools still auto-allowed + hint still appended
+                self.assertIn("mcp__morpheus", cmd)
+                self.assertIn("--append-system-prompt", cmd)
+
+    def test_morpheus_tools_off_keeps_command_clean(self):
+        with _TempDB():
+            cmd = self._cmd(morpheus_tools=False)
+            self.assertNotIn("--mcp-config", cmd)
+            self.assertNotIn("mcp__morpheus", cmd)
+            self.assertNotIn("--append-system-prompt", cmd)
+
+    def test_merges_with_caller_allowed_tools(self):
+        with _TempDB(), \
+             patch.object(agents, "CLAUDE_USER_CONFIG", "/nonexistent/claude.json"):
+            cmd = self._cmd(allowed_tools=["WebSearch"])
+            idx = cmd.index("--allowedTools")
+            self.assertEqual(cmd[idx + 1:idx + 3], ["WebSearch", "mcp__morpheus"])
+
+
 class RunTurnTest(unittest.TestCase):
     def _fake_agent(self, tmp: Path) -> str:
         script = tmp / "fake_agent.py"

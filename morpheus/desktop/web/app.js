@@ -957,7 +957,8 @@ if (typeof document !== "undefined") {
       $("cwd-chip").textContent = "📁 " + (home || "cwd");
       $("cwd-chip").title = state.cwd;
       const a = state.agents.find((x) => x.kind === state.agent);
-      $("composer-input").placeholder = `Message ${a ? a.label : state.agent}…  (real tool use + web search)`;
+      $("composer-input").placeholder =
+        `Message ${a ? a.label : state.agent}…  (web search, tool use + Morpheus fleet tools)`;
     } else {
       $("composer-input").placeholder = "Message Morpheus…  (try /spawn, /broadcast, or just ask)";
     }

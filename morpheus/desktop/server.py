@@ -399,6 +399,7 @@ def make_handler(cfg: Config) -> type[BaseHTTPRequestHandler]:
                     permission_mode=str(data.get("permission_mode", "default")),
                     allowed_tools=(data.get("allowed_tools") or None),
                     model=str(data.get("model", "")),
+                    morpheus_tools=bool(data.get("morpheus_tools", True)),
                     on_process=lambda p: proc_box.__setitem__("p", p),
                 )
                 for ev in gen:
