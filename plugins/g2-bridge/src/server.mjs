@@ -20,6 +20,8 @@ const DEFAULT_RUNNER_CONCURRENCY = 2;
 const DEFAULT_REQUEST_ID_TTL_MS = 10 * 60 * 1000;
 const DEFAULT_RATE_LIMIT_WINDOW_MS = 60 * 1000;
 const DEFAULT_RATE_LIMIT_MAX = 120;
+const DEFAULT_RATE_LIMIT_READ_MAX = 600;
+const DEFAULT_CLIENT_POLL_OUTPUT_BUDGET_MS = 1500;
 const DEFAULT_PROJECT_LIMIT = 25;
 const DEFAULT_OUTPUT_POLL_INTERVAL_MS = 2000;
 const DEFAULT_OUTPUT_POLL_ATTEMPTS = 45;
@@ -281,16 +283,26 @@ function cleanMessageState(state, sessionId) {
   const key = sessionId || "morpheus";
   let buffer = state.sessions.get(key);
   if (!buffer) {
-    buffer = { messages: [], clients: new Set(), nextId: 1 };
+    buffer = { messages: [], clients: new Set() };
     state.sessions.set(key, buffer);
   }
   return buffer;
 }
 
-function pushMessage(state, sessionId, msg) {
+// Message ids are allocated from one bridge-wide counter so the same logical
+// message keeps the same id in every buffer it lands in. Clients keep a single
+// `after` cursor while hopping between project rows, project-session rows, and
+// real thread ids; per-buffer counters made those cursors skip newer messages.
+function allocateMessageId(state) {
+  if (!state.nextMessageId) state.nextMessageId = 1;
+  const id = state.nextMessageId;
+  state.nextMessageId += 1;
+  return id;
+}
+
+function appendMessageEntry(state, sessionId, msg, id) {
   const key = sessionId || "morpheus";
   const buffer = cleanMessageState(state, sessionId);
-  const id = buffer.nextId++;
   const entry = { id, ...msg };
   buffer.messages.push(entry);
   if (buffer.messages.length > MAX_MESSAGES_PER_SESSION) {
@@ -308,9 +320,18 @@ function pushMessage(state, sessionId, msg) {
   return id;
 }
 
+function pushMessage(state, sessionId, msg) {
+  return appendMessageEntry(state, sessionId, msg, allocateMessageId(state));
+}
+
 function latestMessageId(state, sessionId) {
   const buffer = state.sessions.get(sessionId || "morpheus");
-  return buffer?.messages?.at(-1)?.id || 0;
+  let latest = 0;
+  for (const entry of buffer?.messages || []) {
+    const id = Number(entry?.id || 0);
+    if (id > latest) latest = id;
+  }
+  return latest;
 }
 
 function latestTerminalMessage(state, sessionId, after = 0) {
@@ -465,11 +486,11 @@ function replayMessagesToAlias(state, sessionId, alias) {
   const aliasBuffer = cleanMessageState(state, alias);
   const seen = new Set(aliasBuffer.messages.map((entry) => messageFingerprint(entry)));
   for (const entry of buffer.messages) {
-    const { id: _id, ...msg } = entry;
+    const { id, ...msg } = entry;
     const fingerprint = messageFingerprint(msg);
     if (seen.has(fingerprint)) continue;
     seen.add(fingerprint);
-    pushMessage(state, alias, msg);
+    appendMessageEntry(state, alias, msg, id);
   }
 }
 
@@ -479,14 +500,11 @@ function sessionMessageTargets(state, sessionId) {
 }
 
 function pushMessageForSession(state, sessionId, msg) {
-  let primaryId = null;
+  const id = allocateMessageId(state);
   for (const target of sessionMessageTargets(state, sessionId)) {
-    const id = pushMessage(state, target, msg);
-    if (target === sessionId || primaryId === null) {
-      primaryId = id;
-    }
+    appendMessageEntry(state, target, msg, id);
   }
-  return primaryId;
+  return id;
 }
 
 function markSessionIdle(state, sessionId) {
@@ -667,7 +685,15 @@ function transcriptStreamAllowed(state, sessionId, requestedSessionId = "", msg 
 
   if (state.selectedSession) {
     if (id === "morpheus") return messageBelongsToSession(msg, state.selectedSession);
-    return sessionMatches(state.selectedSession, id) && messageBelongsToSession(msg, state.selectedSession);
+    if (sessionMatches(state.selectedSession, id)) {
+      return messageBelongsToSession(msg, state.selectedSession);
+    }
+  }
+  if (requestedSessionId && id !== "morpheus") {
+    // A client that explicitly addressed a concrete session keeps receiving
+    // that session's own messages even after bridge-side selection moved on;
+    // stock Even clients keep their EventSource open across back navigation.
+    return messageBelongsToSession(msg, { id });
   }
   return false;
 }
@@ -1542,16 +1568,17 @@ function requireRequestId(req, res) {
   return requestId;
 }
 
-function writeRequestId(req, state = null) {
+function writeRequestId(req, _state = null) {
   const explicit = normalizeRequestId(req);
   if (explicit) return explicit;
   if (typeof req.body?.text === "string") {
+    // Only stable request fields go into the auto id. Hashing the bridge's
+    // selected project/session broke in-flight dedupe for stock client
+    // retries, because the first prompt itself mutates that selection.
     const bodySessionId = typeof req.body?.sessionId === "string" ? req.body.sessionId : "";
-    const selectedProjectId = projectKey(state?.selectedProject);
     const key = JSON.stringify({
       path: req.path,
-      sessionId: bodySessionId || state?.selectedSession?.id || "",
-      projectId: selectedProjectId,
+      sessionId: bodySessionId,
       text: req.body.text,
     });
     return `auto-prompt-${sha256(key).slice(0, 32)}`;
@@ -1699,7 +1726,13 @@ function createCorsMiddleware(config) {
 
 function createRateLimitMiddleware(config, state, clock) {
   return (req, res, next) => {
-    const key = req.ip || req.socket?.remoteAddress || "unknown";
+    // Glasses clients poll sessions/messages/status continuously, so read
+    // requests get their own larger budget instead of starving (or being
+    // starved by) the stricter write budget.
+    const isRead = req.method === "GET" || req.method === "HEAD";
+    const max = isRead ? config.rateLimitReadMax || config.rateLimitMax : config.rateLimitMax;
+    const ip = req.ip || req.socket?.remoteAddress || "unknown";
+    const key = `${ip}:${isRead ? "read" : "write"}`;
     const current = clock();
     const bucket = state.rateLimits.get(key) || { windowStart: current, count: 0 };
     if (current - bucket.windowStart > config.rateLimitWindowMs) {
@@ -1708,7 +1741,7 @@ function createRateLimitMiddleware(config, state, clock) {
     }
     bucket.count += 1;
     state.rateLimits.set(key, bucket);
-    if (bucket.count > config.rateLimitMax) {
+    if (bucket.count > max) {
       res.status(429).json({ error: "Rate limit exceeded", code: "rate_limited" });
       return;
     }
@@ -2485,9 +2518,9 @@ async function spawnSessionFromText({ req, res, context, requestId, text, projec
     ) {
       state.selectedSession = finalSession;
     }
-    const activeMessages = getMessages(state, spawned.id, 0).map(sseMessagePayload);
+    const activeMessages = getMessages(state, spawned.id, 0);
     const displayMessages = requestSessionId
-      ? getMessages(state, requestSessionId, 0).map(sseMessagePayload)
+      ? getMessages(state, requestSessionId, 0)
       : activeMessages;
 
     const body = {
@@ -2583,14 +2616,24 @@ async function sendPromptToSession({ req, res, context, requestId, text, session
       [...new Set([outboundSession.id, session.id, rememberedProjectSession?.id, requestSessionId].filter(Boolean))]
         .map((id) => [id, latestMessageId(state, id)]),
     );
-    const baselineOutput = await refreshSessionOutput({
+    const baselineOutput = await refreshSessionOutputWithBudget({
       provider,
       state,
       config,
       sessionId: outboundSession.id,
       publish: false,
+      scheduleOnBudget: false,
     });
-    rememberPromptMirrorBaseline(state, config, outboundSession.id, baselineOutput);
+    if (baselineOutput.budgetExceeded) {
+      // The slow read still captures the pre-prompt screen in the background;
+      // record the baseline whenever it lands so stale-mirror holds keep
+      // working without blocking the prompt on the terminal read.
+      baselineOutput.pending
+        .then((result) => rememberPromptMirrorBaseline(state, config, outboundSession.id, result))
+        .catch(() => {});
+    } else {
+      rememberPromptMirrorBaseline(state, config, outboundSession.id, baselineOutput.result);
+    }
     rememberSessionAliases(state, outboundSession.id, {
       project: promptProject,
       requestSessionId,
@@ -2660,9 +2703,9 @@ async function sendPromptToSession({ req, res, context, requestId, text, session
     ) {
       state.selectedSession = activeSession;
     }
-    const activeMessages = getMessages(state, activeSessionId, 0).map(sseMessagePayload);
+    const activeMessages = getMessages(state, activeSessionId, 0);
     const displayMessages = requestSessionId
-      ? getMessages(state, requestSessionId, 0).map(sseMessagePayload)
+      ? getMessages(state, requestSessionId, 0)
       : activeMessages;
     const body = {
       ok: true,
@@ -2819,6 +2862,44 @@ async function refreshSessionOutput({ provider, state, config, sessionId, publis
   }
 }
 
+const OUTPUT_BUDGET_EXCEEDED = Symbol("output-budget-exceeded");
+
+// Client polls (sessions/messages/events/history) must stay fast even when
+// reading the terminal mirror is slow. The refresh keeps running past the
+// budget and publishes whenever it completes; the background output poller
+// owns retries from then on.
+async function refreshSessionOutputWithBudget({
+  provider,
+  state,
+  config,
+  sessionId,
+  publish = true,
+  scheduleOnBudget = true,
+}) {
+  const pending = refreshSessionOutput({ provider, state, config, sessionId, publish });
+  const budgetMs = Number(config.clientPollOutputBudgetMs || 0);
+  if (!budgetMs) {
+    return { result: await pending, budgetExceeded: false, pending };
+  }
+  let timer;
+  const budget = new Promise((resolve) => {
+    timer = setTimeout(() => resolve(OUTPUT_BUDGET_EXCEEDED), Math.max(1, budgetMs));
+    if (typeof timer.unref === "function") timer.unref();
+  });
+  const raced = await Promise.race([pending, budget]);
+  clearTimeout(timer);
+  if (raced !== OUTPUT_BUDGET_EXCEEDED) {
+    return { result: raced, budgetExceeded: false, pending };
+  }
+  pending.catch(() => {});
+  bridgeDebug(config, "session-output-budget-handoff", { sessionId, budgetMs });
+  bridgeFlow(config, "session-output-budget-handoff", { sessionId, budgetMs });
+  if (scheduleOnBudget) {
+    scheduleOutputRefresh({ config, provider, state }, sessionId);
+  }
+  return { result: null, budgetExceeded: true, pending };
+}
+
 async function refreshSessionHistory({
   provider,
   state,
@@ -2888,17 +2969,24 @@ async function refreshSessionForSessionsPoll({ provider, state, config, sessionI
     : null;
   const firstHistoryText = String(firstHistoryResult?.text || "").trim();
   const shouldUseOutputFallback = !firstHistoryText && (!preferThreadHistory || !outputPollActive);
-  const outputResult = firstHistoryText
-    ? null
-    : shouldUseOutputFallback
-      ? await refreshSessionOutput({ provider, state, config, sessionId })
+  const outputFallback =
+    !firstHistoryText && shouldUseOutputFallback
+      ? await refreshSessionOutputWithBudget({ provider, state, config, sessionId })
       : null;
+  const outputResult = outputFallback?.result || null;
+  const outputBudgetExceeded = Boolean(outputFallback?.budgetExceeded);
   const outputText = String(outputResult?.output?.text || "").trim();
   let historyResult = null;
   if (firstHistoryText) {
     historyResult = firstHistoryResult;
   } else if (!outputText && !preferThreadHistory) {
-    historyResult = await refreshSessionHistory({ provider, state, config, sessionId });
+    historyResult = await refreshSessionHistory({
+      provider,
+      state,
+      config,
+      sessionId,
+      allowOutputFallback: !outputBudgetExceeded,
+    });
   } else if (preferThreadHistory) {
     historyResult = firstHistoryResult;
   }
@@ -3553,6 +3641,16 @@ function buildConfigFromEnv(env = process.env, argv = process.argv.slice(2)) {
       min: 1,
       max: 10_000,
     }),
+    rateLimitReadMax: envInt(env, "MORPHEUS_G2_RATE_LIMIT_READ_MAX", DEFAULT_RATE_LIMIT_READ_MAX, {
+      min: 1,
+      max: 100_000,
+    }),
+    clientPollOutputBudgetMs: envInt(
+      env,
+      "MORPHEUS_G2_CLIENT_POLL_OUTPUT_BUDGET_MS",
+      DEFAULT_CLIENT_POLL_OUTPUT_BUDGET_MS,
+      { min: 100, max: 30_000 },
+    ),
     sessionLimit: envInt(env, "MORPHEUS_G2_SESSION_LIMIT", 12, { min: 1, max: 50 }),
     projectLimit: envInt(env, "MORPHEUS_G2_PROJECT_LIMIT", DEFAULT_PROJECT_LIMIT, { min: 1, max: 50 }),
     spawnCommand: env.MORPHEUS_G2_SPAWN_COMMAND || "codex",
@@ -3593,6 +3691,7 @@ function createBridge(options = {}) {
   config.logger = config.logger || console;
   const state = {
     sessions: new Map(),
+    nextMessageId: 1,
     codexSessions: new Map(),
     idempotency: new Map(),
     rateLimits: new Map(),

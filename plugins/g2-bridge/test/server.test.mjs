@@ -3135,3 +3135,219 @@ test("simulator client can create a Morpheus project session and read the stream
   assert.match(streamed.glassesText, /answer for: local simulator smoke/);
   assert.ok(logs.some((line) => line.includes("EventSource unavailable")));
 });
+
+test("stock polling cursor survives mixed project and session buffer ids", async (t) => {
+  const { baseUrl } = await withBridge(t, {
+    agentBackend: "codex_app_server",
+    createCodexAgentProvider: fakeCodexAgentProvider({ asyncResultMs: 30 }),
+    mirrorCodexTui: false,
+    showProjectsFirst: true,
+    waitForPromptResult: true,
+  });
+
+  await request(baseUrl, "/api/select-project", {
+    body: { projectId: "p_alpha", clientRequestId: "cursor-drift-select-0" },
+  });
+  const firstPrompt = await request(baseUrl, "/api/prompt", {
+    body: {
+      sessionId: "project:p_alpha",
+      text: "cursor drift first turn",
+      clientRequestId: "cursor-drift-prompt-1",
+    },
+  });
+  assert.equal(firstPrompt.status, 202);
+
+  // The stock client keeps one message cursor for the whole conversation while
+  // it watches the project row, so its cursor follows project:p_alpha ids.
+  const projectPoll = await request(baseUrl, "/api/messages?sessionId=project:p_alpha&after=0");
+  const projectPollBody = await projectPoll.json();
+  assert.equal(
+    projectPollBody.messages.find((message) => message.type === "result")?.text,
+    "answer for: cursor drift first turn",
+  );
+
+  // Re-opening the project a few times appends project-row-only events.
+  for (let i = 1; i <= 3; i += 1) {
+    await request(baseUrl, "/api/select-project", {
+      body: { projectId: "p_alpha", clientRequestId: `cursor-drift-select-${i}` },
+    });
+  }
+  const refreshedPoll = await request(baseUrl, "/api/messages?sessionId=project:p_alpha&after=0");
+  const refreshedBody = await refreshedPoll.json();
+  const cursor = refreshedBody.messages.reduce(
+    (max, message) => Math.max(max, Number(message.id || 0)),
+    0,
+  );
+
+  const secondPrompt = await request(baseUrl, "/api/prompt", {
+    body: {
+      sessionId: "project:p_alpha",
+      text: "cursor drift second turn",
+      clientRequestId: "cursor-drift-prompt-2",
+    },
+  });
+  assert.equal(secondPrompt.status, 202);
+
+  const fullSession = await request(baseUrl, "/api/messages?sessionId=project-session:p_alpha&after=0");
+  const fullSessionBody = await fullSession.json();
+  assert.equal(
+    fullSessionBody.messages.find(
+      (message) => message.type === "result" && message.text === "answer for: cursor drift second turn",
+    )?.text,
+    "answer for: cursor drift second turn",
+  );
+
+  // Polling the active session row with the cursor accumulated on the project
+  // row must still deliver the new turn instead of silently skipping it.
+  const cursorPoll = await request(
+    baseUrl,
+    `/api/messages?sessionId=project-session:p_alpha&after=${cursor}`,
+  );
+  const cursorPollBody = await cursorPoll.json();
+  assert.equal(
+    cursorPollBody.messages.find(
+      (message) => message.type === "result" && message.text === "answer for: cursor drift second turn",
+    )?.text,
+    "answer for: cursor drift second turn",
+  );
+});
+
+test("event stream for explicit codex session id stays live after back navigation", async (t) => {
+  const { baseUrl } = await withBridge(t, {
+    agentBackend: "codex_app_server",
+    createCodexAgentProvider: fakeCodexAgentProvider({ asyncResultMs: 300, promptReturnDelayMs: 20 }),
+    mirrorCodexTui: false,
+    showProjectsFirst: true,
+    waitForPromptResult: false,
+  });
+
+  const prompt = await request(baseUrl, "/api/prompt", {
+    body: {
+      sessionId: "project:p_alpha",
+      text: "answer after back",
+      clientRequestId: "stream-after-back-0001",
+    },
+  });
+  assert.equal(prompt.status, 202);
+  const promptBody = await prompt.json();
+  assert.equal(promptBody.activeSessionId, "codex-thread-1");
+
+  const events = await fetch(`${baseUrl}/api/events?sessionId=codex-thread-1&token=${TOKEN}`);
+  assert.equal(events.status, 200);
+  const streamed = readStreamUntil(events.body, "answer for: answer after back", 1500);
+
+  const back = await request(baseUrl, "/api/back", {
+    body: { clientRequestId: "stream-after-back-0002" },
+  });
+  assert.equal(back.status, 200);
+
+  assert.match(await streamed, /"type":"result"/);
+});
+
+test("read polling has a separate rate budget from writes", async (t) => {
+  const { baseUrl } = await withBridge(t, {
+    rateLimitMax: 5,
+    rateLimitWindowMs: 60_000,
+  });
+
+  for (let i = 0; i < 30; i += 1) {
+    const res = await request(baseUrl, "/api/messages?sessionId=morpheus");
+    assert.equal(res.status, 200, `read poll ${i + 1} should not be rate limited`);
+  }
+
+  let lastWriteStatus = 0;
+  for (let i = 0; i < 6; i += 1) {
+    const res = await request(baseUrl, "/api/back", {
+      body: { clientRequestId: `rate-budget-back-${i}` },
+    });
+    lastWriteStatus = res.status;
+  }
+  assert.equal(lastWriteStatus, 429);
+});
+
+test("slow terminal mirror reads hand off to background instead of blocking client polls", async (t) => {
+  const { baseUrl } = await withBridge(t, {
+    agentBackend: "codex_app_server",
+    createCodexAgentProvider: fakeCodexAgentProvider({
+      emitFinalResult: false,
+      promptReturnDelayMs: 20,
+    }),
+    mirrorCodexTui: true,
+    showProjectsFirst: true,
+    waitForPromptResult: false,
+    outputPollIntervalMs: 30000,
+    outputPollAttempts: 0,
+    clientPollOutputBudgetMs: 150,
+    runner: fakeMorpheusRunner({
+      mirrorOutputText: "mirror answer after handoff",
+      outputDelayMs: 700,
+    }),
+  });
+
+  const prompt = await request(baseUrl, "/api/prompt", {
+    body: {
+      sessionId: "project:p_alpha",
+      text: "mirror handoff",
+      clientRequestId: "mirror-handoff-0001",
+    },
+  });
+  assert.equal(prompt.status, 202);
+
+  const started = Date.now();
+  const fast = await request(baseUrl, "/api/messages?sessionId=project-session:p_alpha");
+  const elapsedMs = Date.now() - started;
+  assert.equal(fast.status, 200);
+  assert.ok(elapsedMs < 600, `/api/messages blocked for ${elapsedMs}ms on terminal output`);
+
+  await sleep(900);
+  const after = await request(baseUrl, "/api/messages?sessionId=project-session:p_alpha");
+  const body = await after.json();
+  assert.equal(
+    body.messages.find((message) => message.type === "result")?.text,
+    "mirror answer after handoff",
+  );
+});
+
+test("identical stock prompt retries replay the in-flight response after selection changes", async (t) => {
+  let promptCalls = 0;
+  const baseProvider = fakeCodexAgentProvider({ asyncResultMs: 400, promptReturnDelayMs: 10 });
+  const { baseUrl } = await withBridge(t, {
+    agentBackend: "codex_app_server",
+    createCodexAgentProvider: (emit, client) => {
+      const provider = baseProvider(emit, client);
+      const originalPrompt = provider.prompt.bind(provider);
+      provider.prompt = async (...args) => {
+        promptCalls += 1;
+        return originalPrompt(...args);
+      };
+      return provider;
+    },
+    mirrorCodexTui: false,
+    showProjectsFirst: true,
+    waitForPromptResult: true,
+  });
+
+  const body = { sessionId: "project:p_alpha", text: "same utterance twice" };
+  const first = request(baseUrl, "/api/prompt", { body });
+
+  const selectionDeadline = Date.now() + 2000;
+  let selectionChanged = false;
+  while (Date.now() < selectionDeadline) {
+    const res = await request(baseUrl, "/api/selected-session");
+    const selected = await res.json();
+    if (selected.selectedSession) {
+      selectionChanged = true;
+      break;
+    }
+    await sleep(20);
+  }
+  assert.equal(selectionChanged, true);
+
+  const second = await request(baseUrl, "/api/prompt", { body });
+  const firstRes = await first;
+  assert.equal(firstRes.status, 202);
+  assert.equal(second.status, 202);
+  const secondBody = await second.json();
+  assert.equal(secondBody.duplicate, true);
+  assert.equal(promptCalls, 1);
+});

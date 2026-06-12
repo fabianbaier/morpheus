@@ -188,7 +188,17 @@ app-server path from Even Terminal for G2 conversations:
 - `GET /api/messages` returns structured bridge messages from Codex app-server:
   `text_delta`, tool/status events, final `result`, then `status: idle`. This
   matches Even Terminal's Codex provider and does not depend on terminal output
-  polling.
+  polling. Message ids come from one bridge-wide counter, so a client can keep
+  a single `after` cursor while it moves between `project:<id>`,
+  `project-session:<id>`, and real thread ids without skipping newer messages.
+- Read requests (`GET`) have their own rate budget
+  (`MORPHEUS_G2_RATE_LIMIT_READ_MAX`, default 600/min per client) so steady
+  glasses polling of sessions/messages/status cannot exhaust the stricter
+  write budget (`MORPHEUS_G2_RATE_LIMIT_MAX`, default 120/min).
+- Client polls never block on slow terminal-mirror reads for more than
+  `MORPHEUS_G2_CLIENT_POLL_OUTPUT_BUDGET_MS` (default 1500). Past that budget
+  the read keeps running in the background and publishes the mirrored text as
+  soon as it lands, while the poll returns the buffered state immediately.
 - `GET /api/sessions/:id/history` returns the recent user/assistant text for
   Even Terminal-compatible clients that refresh completed sessions through
   history instead of the live message stream. When the bridge has a buffered
