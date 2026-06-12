@@ -211,6 +211,15 @@ backend. In that mode, prompts are sent to Morpheus-known Codex terminal tabs
 and output completion uses bounded polling (`MORPHEUS_G2_OUTPUT_POLL_INTERVAL_MS`,
 `MORPHEUS_G2_OUTPUT_POLL_ATTEMPTS`).
 
+After a follow-up prompt, the previous answer is still on the terminal until
+the TUI redraws, so the bridge holds mirror text that is byte-identical to the
+pre-prompt screen instead of republishing it as the new answer. Identical text
+is released once it survives `MORPHEUS_G2_STALE_MIRROR_GRACE_MS` (default
+4000ms) with an idle tab, which keeps genuine repeat answers working. The
+bridge also re-arms the Codex app-server thread subscription during client
+polling, so turns typed directly into the laptop TUI keep streaming to the
+glasses even after the upstream provider's idle sweep unsubscribes the thread.
+
 Set `MORPHEUS_G2_INCLUDE_CODEX_HISTORY=1` only when you intentionally want the
 project session list to include older Codex app-server threads.
 

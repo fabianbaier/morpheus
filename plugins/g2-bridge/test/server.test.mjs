@@ -151,6 +151,8 @@ function fakeMorpheusRunner({
 } = {}) {
   let mirroredTabRef = "";
   let outputCalls = 0;
+  const resolveMirrorOutputText =
+    typeof mirrorOutputText === "function" ? mirrorOutputText : () => mirrorOutputText;
   return async (_command, args) => {
     if (args[0] !== "remote") throw new Error(`unexpected command: ${args.join(" ")}`);
 
@@ -216,19 +218,20 @@ function fakeMorpheusRunner({
       if (outputCalls <= outputFailuresBeforeSuccess) {
         throw new Error(outputErrorMessage);
       }
+      const outputText = String(resolveMirrorOutputText() || "");
       return {
         ok: true,
         session: {
           tab_ref: ref,
           mission_ref: "mirror-mission",
-          state: outputState || (mirrorOutputText ? "idle" : "working"),
+          state: outputState || (outputText ? "idle" : "working"),
           goal: "G2: mirrored Codex session",
         },
         output: {
-          text: mirrorOutputText,
-          lines: mirrorOutputText ? [mirrorOutputText] : [],
-          line_count: mirrorOutputText ? 1 : 0,
-          char_count: mirrorOutputText.length,
+          text: outputText,
+          lines: outputText ? [outputText] : [],
+          line_count: outputText ? 1 : 0,
+          char_count: outputText.length,
         },
       };
     }
@@ -2156,6 +2159,7 @@ test("same mirrored answer can stream again after a follow-up prompt", async (t)
     waitForPromptResult: false,
     outputPollIntervalMs: 20,
     outputPollAttempts: 20,
+    staleMirrorGraceMs: 120,
     runner: fakeMorpheusRunner({
       mirrorOutputText: "2",
     }),
@@ -2192,6 +2196,181 @@ test("same mirrored answer can stream again after a follow-up prompt", async (t)
     messagesBody.messages.filter((message) => message.type === "result" && message.text === "2").length,
     2,
   );
+});
+
+test("follow-up prompt does not republish the previous answer while codex is working", async (t) => {
+  const { baseUrl } = await withBridge(t, {
+    agentBackend: "codex_app_server",
+    createCodexAgentProvider: fakeCodexAgentProvider({
+      asyncResultMs: (text) => (text.includes("second") ? 250 : 0),
+      history: {
+        "codex-thread-1": [
+          { role: "user", text: "first question" },
+          { role: "assistant", text: "answer for: first question" },
+        ],
+      },
+    }),
+    mirrorCodexTui: true,
+    showProjectsFirst: true,
+    waitForPromptResult: false,
+    outputPollIntervalMs: 20,
+    outputPollAttempts: 30,
+    runner: fakeMorpheusRunner({
+      mirrorOutputText: "answer for: first question",
+    }),
+  });
+
+  const first = await request(baseUrl, "/api/prompt", {
+    body: {
+      sessionId: "project:p_alpha",
+      text: "first question",
+      clientRequestId: "no-stale-republish-first",
+    },
+  });
+  assert.equal(first.status, 202);
+  await readMessagesUntil(
+    baseUrl,
+    "project-session:p_alpha",
+    (messages) =>
+      messages.some((message) => message.type === "result" && message.text === "answer for: first question"),
+  );
+
+  const second = await request(baseUrl, "/api/prompt", {
+    body: {
+      sessionId: "project:p_alpha",
+      text: "second question",
+      clientRequestId: "no-stale-republish-second",
+    },
+  });
+  assert.equal(second.status, 202);
+
+  const deadline = Date.now() + 150;
+  while (Date.now() < deadline) {
+    const res = await request(baseUrl, "/api/messages?sessionId=project-session:p_alpha");
+    const body = await res.json();
+    const staleResults = body.messages.filter(
+      (message) => message.type === "result" && message.text === "answer for: first question",
+    );
+    assert.equal(
+      staleResults.length,
+      1,
+      "stale terminal/history text must not be republished as the follow-up answer",
+    );
+    assert.equal(body.state, "busy");
+    await sleep(20);
+  }
+
+  const finalBody = await readMessagesUntil(
+    baseUrl,
+    "project-session:p_alpha",
+    (messages) =>
+      messages.some((message) => message.type === "result" && message.text === "answer for: second question"),
+  );
+  assert.equal(
+    finalBody.messages.filter(
+      (message) => message.type === "result" && message.text === "answer for: first question",
+    ).length,
+    1,
+  );
+});
+
+test("terminal mirror updates stream to glasses after a follow-up prompt", async (t) => {
+  let mirrorText = "answer for: first question";
+  const { baseUrl } = await withBridge(t, {
+    agentBackend: "codex_app_server",
+    createCodexAgentProvider: fakeCodexAgentProvider({
+      emitFinalResult: false,
+      history: {
+        "codex-thread-1": [
+          { role: "user", text: "first question" },
+          { role: "assistant", text: "answer for: first question" },
+        ],
+      },
+    }),
+    mirrorCodexTui: true,
+    showProjectsFirst: true,
+    waitForPromptResult: false,
+    outputPollIntervalMs: 20,
+    outputPollAttempts: 60,
+    runner: fakeMorpheusRunner({
+      mirrorOutputText: () => mirrorText,
+    }),
+  });
+
+  const first = await request(baseUrl, "/api/prompt", {
+    body: {
+      sessionId: "project:p_alpha",
+      text: "first question",
+      clientRequestId: "mirror-follow-up-live-first",
+    },
+  });
+  assert.equal(first.status, 202);
+  await readMessagesUntil(
+    baseUrl,
+    "project-session:p_alpha",
+    (messages) =>
+      messages.some((message) => message.type === "result" && message.text === "answer for: first question"),
+  );
+
+  const second = await request(baseUrl, "/api/prompt", {
+    body: {
+      sessionId: "project:p_alpha",
+      text: "what about now",
+      clientRequestId: "mirror-follow-up-live-second",
+    },
+  });
+  assert.equal(second.status, 202);
+  await sleep(60);
+  mirrorText = "fresh terminal output for the follow-up";
+
+  const body = await readMessagesUntil(
+    baseUrl,
+    "project-session:p_alpha",
+    (messages) =>
+      messages.some(
+        (message) => message.type === "result" && message.text === "fresh terminal output for the follow-up",
+      ),
+    2000,
+  );
+  assert.equal(
+    body.messages.filter(
+      (message) => message.type === "result" && message.text === "answer for: first question",
+    ).length,
+    1,
+  );
+});
+
+test("client polling re-arms codex live events when the thread is no longer tracked", async (t) => {
+  const resumedThreads = [];
+  const { baseUrl } = await withBridge(t, {
+    agentBackend: "codex_app_server",
+    createCodexAgentProvider: (emit) => ({
+      ...fakeCodexAgentProvider()(emit),
+      getSubscribedSessions: () => [],
+    }),
+    codexClient: {
+      threadResume: async ({ threadId }) => {
+        resumedThreads.push(threadId);
+        return {};
+      },
+    },
+    mirrorCodexTui: false,
+    showProjectsFirst: true,
+    waitForPromptResult: false,
+  });
+
+  const prompt = await request(baseUrl, "/api/prompt", {
+    body: {
+      sessionId: "project:p_alpha",
+      text: "keep events alive",
+      clientRequestId: "live-events-rearm",
+    },
+  });
+  assert.equal(prompt.status, 202);
+
+  await request(baseUrl, "/api/messages?sessionId=project-session:p_alpha");
+  await request(baseUrl, "/api/messages?sessionId=project-session:p_alpha");
+  assert.deepEqual(resumedThreads, ["codex-thread-1"]);
 });
 
 test("codex app-server streams results before slow terminal mirror finishes", async (t) => {

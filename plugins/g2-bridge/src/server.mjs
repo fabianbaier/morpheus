@@ -25,6 +25,8 @@ const DEFAULT_OUTPUT_POLL_INTERVAL_MS = 2000;
 const DEFAULT_OUTPUT_POLL_ATTEMPTS = 45;
 const DEFAULT_CODEX_APP_SERVER_PORT = 8765;
 const DEFAULT_PROMPT_WAIT_FOR_RESULT_MS = 90_000;
+const DEFAULT_STALE_MIRROR_GRACE_MS = 4000;
+const CODEX_LIVE_EVENTS_CHECK_MS = 60_000;
 const MAX_MESSAGES_PER_SESSION = 500;
 const AGENT_BACKEND_MORPHEUS = "morpheus";
 const AGENT_BACKEND_CODEX_APP_SERVER = "codex_app_server";
@@ -338,6 +340,47 @@ function latestUserPromptText(state, sessionId) {
     if (msg.type === "result" || msg.type === "error") return "";
   }
   return "";
+}
+
+function sessionAwaitingResultSinceLatestPrompt(state, sessionId) {
+  const messages = getMessages(state, sessionId, 0);
+  for (let idx = messages.length - 1; idx >= 0; idx -= 1) {
+    const msg = messages[idx];
+    if (msg.type === "result" || msg.type === "error") return null;
+    if (msg.type === "prompt_submitted" || msg.type === "user_prompt") return msg;
+  }
+  return null;
+}
+
+function historyAnswerForPrompt(history, promptMsg) {
+  const entries = Array.isArray(history) ? history : [];
+  const promptHash = String(promptMsg?.textHash || "");
+  const promptText = String(promptMsg?.text || "");
+  if (!promptHash && !promptText) return "";
+  for (let idx = entries.length - 1; idx >= 0; idx -= 1) {
+    const entry = entries[idx];
+    if (entry?.role !== "user" || !entry.text) continue;
+    const entryText = String(entry.text);
+    const matches =
+      (promptText && entryText === promptText) ||
+      (promptHash && sha256(entryText) === promptHash);
+    if (!matches) continue;
+    for (let after = entries.length - 1; after > idx; after -= 1) {
+      const candidate = entries[after];
+      if (candidate?.role === "assistant" && candidate.text) return String(candidate.text);
+    }
+    return "";
+  }
+  return "";
+}
+
+function rememberPromptMirrorBaseline(state, config, sessionId, outputResult) {
+  if (!sessionId) return;
+  const text = String(outputResult?.output?.text || "").trim();
+  state.promptMirrorBaselines.set(sessionId, {
+    textHash: sha256(text),
+    at: config.clock(),
+  });
 }
 
 function resolveResultWaiters(state, sessionId, msg) {
@@ -2282,6 +2325,39 @@ function createCodexAppServerBridgeProvider(options = {}) {
       };
     },
 
+    // The upstream codex provider unsubscribes idle threads after a few
+    // minutes (its SSE-client check never sees the bridge's own clients), so
+    // turns typed into the laptop TUI stop reaching the bridge. Re-arm the
+    // app-server subscription for threads the provider no longer tracks; its
+    // auto-discovery rebuilds the session once notifications flow again.
+    async ensureLiveEvents(sessionId) {
+      const threadId = String(sessionId || "").trim();
+      if (!threadId || threadId === "morpheus" || threadId.includes(":")) return false;
+      if (typeof codex.getSubscribedSessions !== "function") return false;
+      if (isKnownMorpheusSession(threadId)) return false;
+      try {
+        const tracked = codex.getSubscribedSessions() || [];
+        if (tracked.some((entry) => entry?.threadId === threadId)) return true;
+      } catch {
+        return false;
+      }
+      const now = config.clock();
+      const lastCheck = state.codexLiveEventsCheckedAt.get(threadId) || 0;
+      if (now - lastCheck < CODEX_LIVE_EVENTS_CHECK_MS) return false;
+      state.codexLiveEventsCheckedAt.set(threadId, now);
+      try {
+        await client.threadResume({ threadId });
+        bridgeFlow(config, "codex-live-events-resubscribed", { sessionId: threadId });
+        return true;
+      } catch (err) {
+        bridgeDebug(config, "codex-live-events-resubscribe-failed", {
+          sessionId: threadId,
+          reason: safeJsonError(err),
+        });
+        return false;
+      }
+    },
+
     interrupt(sessionId) {
       codex.interrupt?.(sessionId);
     },
@@ -2507,13 +2583,14 @@ async function sendPromptToSession({ req, res, context, requestId, text, session
       [...new Set([outboundSession.id, session.id, rememberedProjectSession?.id, requestSessionId].filter(Boolean))]
         .map((id) => [id, latestMessageId(state, id)]),
     );
-    await refreshSessionOutput({
+    const baselineOutput = await refreshSessionOutput({
       provider,
       state,
       config,
       sessionId: outboundSession.id,
       publish: false,
     });
+    rememberPromptMirrorBaseline(state, config, outboundSession.id, baselineOutput);
     rememberSessionAliases(state, outboundSession.id, {
       project: promptProject,
       requestSessionId,
@@ -2549,6 +2626,10 @@ async function sendPromptToSession({ req, res, context, requestId, text, session
       timestamp: nowIso(config.clock),
     };
     if (session.id !== activeSessionId) addSessionAlias(state, activeSessionId, session.id);
+    if (activeSessionId !== outboundSession.id) {
+      const baseline = state.promptMirrorBaselines.get(outboundSession.id);
+      if (baseline) state.promptMirrorBaselines.set(activeSessionId, baseline);
+    }
     rememberSessionAliases(state, activeSessionId, {
       project: promptProject,
       requestSessionId,
@@ -2701,6 +2782,27 @@ async function refreshSessionOutput({ provider, state, config, sessionId, publis
       state.outputHashes.set(sessionId, fingerprint);
       return normalizedResult;
     }
+    // A follow-up prompt leaves the previous answer on the terminal until the
+    // TUI redraws for the new turn. Publishing that unchanged screen would
+    // resolve the new prompt with the old answer, so hold identical mirror text
+    // until it changes, or until the grace window passes with a settled tab.
+    const outstandingPrompt = sessionAwaitingResultSinceLatestPrompt(state, sessionId);
+    if (outstandingPrompt) {
+      const baseline = state.promptMirrorBaselines.get(sessionId);
+      if (baseline && baseline.textHash === sha256(text)) {
+        const ageMs = config.clock() - baseline.at;
+        const settled = outputStatus === "idle";
+        if (ageMs < config.staleMirrorGraceMs || !settled) {
+          bridgeDebug(config, "session-output-stale-mirror-held", {
+            sessionId,
+            ageMs,
+            outputStatus,
+            graceMs: config.staleMirrorGraceMs,
+          });
+          return normalizedResult;
+        }
+      }
+    }
     // Morpheus marks an open interactive Codex tab as "working" even after the
     // answer is visible and the TUI is waiting for the next prompt. The terminal
     // text itself is the stronger live signal for G2, so publish it instead of
@@ -2727,8 +2829,24 @@ async function refreshSessionHistory({
   if (!sessionId || !provider.getHistory) return null;
   try {
     const history = await provider.getHistory(sessionId, 10, { allowOutputFallback });
-    const text = latestHistoryText(history, "assistant");
-    if (!text) return { history, text: "", published: false };
+    // While a prompt is outstanding, the latest assistant entry in history is
+    // usually the answer to the PREVIOUS turn. Publishing it would feed the old
+    // answer back as the new result, so only accept history text that follows
+    // the outstanding prompt itself; otherwise report stale so callers can use
+    // the live terminal mirror instead.
+    const outstandingPrompt = sessionAwaitingResultSinceLatestPrompt(state, sessionId);
+    const text = outstandingPrompt
+      ? historyAnswerForPrompt(history, outstandingPrompt)
+      : latestHistoryText(history, "assistant");
+    if (!text) {
+      if (outstandingPrompt && hasAssistantHistory(history)) {
+        bridgeDebug(config, "session-history-stale-while-awaiting", {
+          sessionId,
+          entries: history.length,
+        });
+      }
+      return { history, text: "", published: false };
+    }
     const published = publishAssistantResultIfNew(state, config, sessionId, text, provider.name || "codex");
     return { history, text, published };
   } catch (err) {
@@ -2757,6 +2875,7 @@ async function refreshSessionForSessionsPoll({ provider, state, config, sessionI
   const beforeLatestId = latestMessageId(state, sessionId);
   const beforeHash = state.outputHashes.get(sessionId) || "";
   const preferThreadHistory = shouldPreferThreadHistoryForClientPoll(provider, state, sessionId);
+  if (preferThreadHistory) void provider.ensureLiveEvents?.(sessionId);
   const outputPollActive = outputPollIsActive(state, sessionId);
   const firstHistoryResult = preferThreadHistory
     ? await refreshSessionHistory({
@@ -3410,6 +3529,12 @@ function buildConfigFromEnv(env = process.env, argv = process.argv.slice(2)) {
       DEFAULT_OUTPUT_POLL_ATTEMPTS,
       { min: 1, max: 300 },
     ),
+    staleMirrorGraceMs: envInt(
+      env,
+      "MORPHEUS_G2_STALE_MIRROR_GRACE_MS",
+      DEFAULT_STALE_MIRROR_GRACE_MS,
+      { min: 1, max: 5 * 60_000 },
+    ),
     codexAppServerPort: envInt(
       env,
       "CODEX_APP_SERVER_PORT",
@@ -3474,6 +3599,8 @@ function createBridge(options = {}) {
     outputHashes: new Map(),
     outputPollers: new Map(),
     outputPollStats: new Map(),
+    promptMirrorBaselines: new Map(),
+    codexLiveEventsCheckedAt: new Map(),
     mirroredCodexSessions: new Set(),
     sessionAliases: new Map(),
     resultWaiters: new Map(),
