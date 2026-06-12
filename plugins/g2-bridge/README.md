@@ -146,10 +146,12 @@ app-server path from Even Terminal for G2 conversations:
 - `GET /api/projects` lists Morpheus project tenants.
 - `GET /api/sessions` returns projects as Even-compatible session rows before a
   project is selected. Once a project is selected, it returns a `Back to
-  projects` row plus the active G2 conversation as `project-session:<projectId>`.
-  The original `project:<projectId>` row is navigation-only after the project is
-  open. Old Codex app-server history is hidden by default so deleted/archived
-  laptop sessions do not reappear on the glasses.
+  projects` row, the active G2 conversation as `project-session:<projectId>`,
+  and the project's recent sessions: Morpheus-known terminal tabs plus recent
+  Codex app-server threads in the project directory, so glasses can resume or
+  join them. Set `MORPHEUS_G2_INCLUDE_CODEX_HISTORY=0` to hide old Codex
+  threads again. The original `project:<projectId>` row is navigation-only
+  after the project is open.
 - `POST /api/select-project` pins the bridge to one project.
 - `POST /api/select-session` pins the G2 bridge to one Codex session.
 - `GET /api/navigation` returns the current bridge view: `projects`, `sessions`,
@@ -172,7 +174,10 @@ app-server path from Even Terminal for G2 conversations:
   query-token auth is disabled for ordinary API calls.
 - `POST /api/prompt` submits bounded text to the selected session. If no session
   is selected, or the prompt targets a project row, it starts a Codex app-server
-  thread in that project. Follow-up prompts target the selected Codex thread.
+  thread in that project. Prompts that target the `Back to projects` menu row
+  are routed the same way as sessionless prompts (the selected or last project
+  decides between spawn and follow-up) instead of failing with `409
+  selected_session_stale`. Follow-up prompts target the selected Codex thread.
   By default the bridge waits for the final Codex `result` event before
   returning, so G2 runtimes that miss Server-Sent Events still receive the
   answer in the prompt response body. The answer is included redundantly as
@@ -217,6 +222,12 @@ app-server path from Even Terminal for G2 conversations:
   assistant answer, that buffered answer wins over stale/user-only Codex
   persisted history. `project:<projectId>/history` opens the project session
   list; `project-session:<projectId>/history` opens the active G2 conversation.
+  Stock Even clients open every row as a conversation view, so project and
+  `Back to projects` rows return a compact overview as history (the project's
+  sessions, or the project list) instead of a blank screen; the overview is
+  response-only and never enters the message buffers. Opening a concrete
+  session row by history also selects that session on the bridge, so follow-up
+  prompts resume it instead of spawning a new thread.
 - `POST /api/transcript/finalize` accepts final voice transcripts through the
   same safe prompt path.
 - `POST /api/permission-response` and `/api/question-response` are intentionally
@@ -242,8 +253,16 @@ bridge also re-arms the Codex app-server thread subscription during client
 polling, so turns typed directly into the laptop TUI keep streaming to the
 glasses even after the upstream provider's idle sweep unsubscribes the thread.
 
-Set `MORPHEUS_G2_INCLUDE_CODEX_HISTORY=1` only when you intentionally want the
-project session list to include older Codex app-server threads.
+The bridge starts (and connects to) the Codex app-server in the background at
+startup, matching Even Terminal's own boot behavior, so the first glasses
+prompt does not race a cold app-server start. Prompt submission additionally
+retries while the app-server is still starting, for up to
+`MORPHEUS_G2_CODEX_STARTUP_WAIT_MS` (default 30000). Set
+`MORPHEUS_G2_WARM_CODEX_APP_SERVER=0` to skip the startup warm-up.
+
+Set `MORPHEUS_G2_INCLUDE_CODEX_HISTORY=0` if you do not want the project
+session list to include older Codex app-server threads (for example when
+deleted/archived laptop sessions keep reappearing on the glasses).
 
 The bridge prints `[g2-api]` request lines by default so hardware runs can show
 whether the phone is reading `/api/messages`, `/api/events`, or
@@ -288,8 +307,11 @@ store it somewhere private while pairing your phone-side client.
    `/api/transcript/finalize`. The active conversation then appears as
    `project-session:<id>`.
 
-With the stock Even app, the first stream shows projects as session rows. Select
-a project row and send a prompt to create a Codex app-server session in that
+With the stock Even app, the first stream shows projects as session rows.
+Opening a project row renders a session overview (the project's recent
+sessions plus a resume/new-session hint), and the session list behind it shows
+those sessions as rows. Open a session row to resume that session, or send a
+prompt from the project view to create a Codex app-server session in that
 project. The active conversation appears as `project-session:<projectId>` while
 `project:<projectId>` remains the project/session-list row. Going back to
 projects and re-opening the same project reuses the remembered active

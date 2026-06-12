@@ -62,9 +62,13 @@ function fakeCodexAgentProvider({
   throwOnProjectHistory = false,
   throwHistoryFor = [],
   deltaTexts = [],
+  promptFailuresBeforeSuccess = 0,
+  promptFailureMessage = "codex app-server failed to start (see [codex] logs above)",
+  promptCalls = { count: 0 },
 } = {}) {
   const sessions = [...seedSessions];
   let nextId = 1;
+  let promptFailures = 0;
 
   return (emit) => ({
     async getInfo() {
@@ -96,6 +100,11 @@ function fakeCodexAgentProvider({
     },
 
     async prompt(sessionId, text, cwd) {
+      promptCalls.count += 1;
+      if (promptFailures < promptFailuresBeforeSuccess) {
+        promptFailures += 1;
+        throw new Error(promptFailureMessage);
+      }
       const id = sessionId || `codex-thread-${nextId++}`;
       let session = sessions.find((item) => item.id === id);
       if (!session) {
@@ -440,7 +449,7 @@ test("selects a project and then lists project sessions", async (t) => {
   assert.equal(body.selectedProject.id, "p_alpha");
 });
 
-test("opening a project row history returns project session rows without menu transcript", async (t) => {
+test("opening a project row history returns project session rows and a session overview", async (t) => {
   const { baseUrl } = await withBridge(t, { showProjectsFirst: true });
 
   const projectHistory = await request(baseUrl, "/api/sessions/project:p_alpha/history");
@@ -453,7 +462,44 @@ test("opening a project row history returns project session rows without menu tr
   assert.equal(body.selectedSession, null);
   assert.equal(body.sessions[0].id, "project:__projects__");
   assert.equal(body.sessions[1].id, "abc123");
-  assert.deepEqual(body.history, []);
+  // Stock Even clients render this history as the opened view, so the glasses
+  // show the project's sessions instead of a blank "Waiting input" screen.
+  assert.equal(body.history.length, 1);
+  assert.equal(body.history[0].role, "assistant");
+  assert.match(body.history[0].text, /Project alpha — 1 session/);
+  assert.match(body.history[0].text, /1\. G2: Test Morpheus session \[idle\]/);
+  assert.match(body.history[0].text, /resume|start a new session/i);
+  assert.doesNotMatch(body.history[0].text, /Back to projects/);
+});
+
+test("opening an empty project row history invites starting a new session", async (t) => {
+  const { baseUrl } = await withBridge(t, { showProjectsFirst: true });
+
+  const projectHistory = await request(baseUrl, "/api/sessions/project:p_beta/history");
+  assert.equal(projectHistory.status, 200);
+  const body = await projectHistory.json();
+  assert.equal(body.mode, "sessions");
+  assert.equal(body.history.length, 1);
+  assert.match(body.history[0].text, /Project beta has no sessions yet/);
+  assert.match(body.history[0].text, /start a new session/i);
+});
+
+test("projects menu history lists the project overview", async (t) => {
+  const { baseUrl } = await withBridge(t, { showProjectsFirst: true });
+  await request(baseUrl, "/api/select-project", {
+    body: { projectId: "p_alpha", clientRequestId: "projects-overview-select" },
+  });
+
+  const menuHistory = await request(baseUrl, "/api/sessions/project:__projects__/history");
+  assert.equal(menuHistory.status, 200);
+  const body = await menuHistory.json();
+  assert.equal(body.navigation.view, "projects");
+  assert.equal(body.history.length, 1);
+  assert.equal(body.history[0].role, "assistant");
+  assert.match(body.history[0].text, /Morpheus projects — 2/);
+  assert.match(body.history[0].text, /1\. alpha \[1 live\]/);
+  assert.match(body.history[0].text, /2\. beta/);
+  assert.match(body.history[0].text, /Speaking here starts a new session in alpha/);
 });
 
 test("codex app-server project menu includes Morpheus snapshot sessions after bridge restart", async (t) => {
@@ -472,7 +518,7 @@ test("codex app-server project menu includes Morpheus snapshot sessions after br
   assert.equal(historyBody.sessions[0].id, "project:__projects__");
   assert.equal(historyBody.sessions[1].id, "abc123");
   assert.equal(historyBody.selectedSession, null);
-  assert.deepEqual(historyBody.history, []);
+  assert.match(historyBody.history[0].text, /Project alpha — 1 session/);
 
   const sessions = await request(baseUrl, `/api/sessions?token=${TOKEN}`, { token: null });
   assert.equal(sessions.status, 200);
@@ -688,6 +734,30 @@ test("spawns in remembered project when Add session prompt omits sessionId", asy
   assert.equal(body.selectedProject.id, "p_beta");
   assert.equal(body.result.session.project.root_path, "/tmp/morpheus-beta");
   assert.equal(body.result.session.prompt, "start a fresh remembered project session");
+});
+
+test("prompting the projects menu row spawns in the remembered project", async (t) => {
+  const { baseUrl } = await withBridge(t, { showProjectsFirst: true });
+  await request(baseUrl, "/api/select-project", {
+    body: { projectId: "p_beta", clientRequestId: "menu-prompt-select" },
+  });
+  // Stock Even clients can open the "Back to projects" row (which resets the
+  // bridge to the projects view) and speak into that view.
+  await request(baseUrl, "/api/sessions/project:__projects__/history");
+
+  const res = await request(baseUrl, "/api/prompt", {
+    body: {
+      sessionId: "project:__projects__",
+      text: "what is 3 minus 4",
+      clientRequestId: "menu-prompt-0001",
+    },
+  });
+  assert.equal(res.status, 202);
+  const body = await res.json();
+  assert.equal(body.action, "spawn_session");
+  assert.equal(body.sessionId, "g2spawn");
+  assert.equal(body.selectedProject.id, "p_beta");
+  assert.equal(body.result.session.prompt, "what is 3 minus 4");
 });
 
 test("continues selected session when app posts the project row again", async (t) => {
@@ -920,7 +990,7 @@ test("project menu history request returns to projects for stock Even row opens"
   const historyBody = await history.json();
   assert.equal(historyBody.mode, "projects");
   assert.equal(historyBody.navigation.view, "projects");
-  assert.deepEqual(historyBody.history, []);
+  assert.match(historyBody.history[0].text, /Morpheus projects — 2/);
   assert.equal(historyBody.sessions[0].id, "project:p_alpha");
   assert.equal(historyBody.sessions[0].title, "alpha");
 
@@ -940,7 +1010,7 @@ test("legacy nav project history still returns projects", async (t) => {
   assert.equal(history.status, 200);
   const historyBody = await history.json();
   assert.equal(historyBody.mode, "projects");
-  assert.deepEqual(historyBody.history, []);
+  assert.match(historyBody.history[0].text, /Morpheus projects — 2/);
   assert.equal(historyBody.sessions[0].id, "project:p_alpha");
 });
 
@@ -975,7 +1045,7 @@ test("project menu history uses cached project rows if live project listing fail
   const historyBody = await history.json();
   assert.equal(historyBody.mode, "projects");
   assert.equal(historyBody.stale, true);
-  assert.deepEqual(historyBody.history, []);
+  assert.match(historyBody.history[0].text, /Morpheus projects — 1/);
   assert.equal(historyBody.sessions[0].id, "project:p_alpha");
 });
 
@@ -1090,6 +1160,60 @@ test("codex app-server backend emits final results without terminal polling", as
     role: "assistant",
     text: "answer for: list the directory",
   });
+});
+
+test("codex prompt retries while the app-server is still cold-starting", async (t) => {
+  const promptCalls = { count: 0 };
+  const { baseUrl } = await withBridge(t, {
+    agentBackend: "codex_app_server",
+    createCodexAgentProvider: fakeCodexAgentProvider({
+      promptFailuresBeforeSuccess: 1,
+      promptCalls,
+    }),
+    mirrorCodexTui: false,
+    showProjectsFirst: true,
+    codexAppServerStartupWaitMs: 10_000,
+  });
+  await request(baseUrl, "/api/select-project", {
+    body: { projectId: "p_alpha", clientRequestId: "codex-coldstart-select" },
+  });
+
+  const res = await request(baseUrl, "/api/prompt", {
+    body: { text: "first prompt during cold start", clientRequestId: "codex-coldstart-prompt" },
+  });
+  assert.equal(res.status, 202);
+  const body = await res.json();
+  assert.equal(body.action, "spawn_session");
+  assert.equal(body.sessionId, "codex-thread-1");
+  assert.match(body.text, /answer for: first prompt during cold start/);
+  assert.equal(promptCalls.count, 2);
+});
+
+test("codex prompt does not retry non-startup failures", async (t) => {
+  const promptCalls = { count: 0 };
+  const { baseUrl } = await withBridge(t, {
+    agentBackend: "codex_app_server",
+    createCodexAgentProvider: fakeCodexAgentProvider({
+      promptFailuresBeforeSuccess: 1,
+      promptFailureMessage: "model refused the request",
+      promptCalls,
+    }),
+    mirrorCodexTui: false,
+    showProjectsFirst: true,
+    codexAppServerStartupWaitMs: 10_000,
+  });
+  await request(baseUrl, "/api/select-project", {
+    body: { projectId: "p_alpha", clientRequestId: "codex-norate-select" },
+  });
+
+  const res = await request(baseUrl, "/api/prompt", {
+    body: { text: "fail fast please", clientRequestId: "codex-norate-prompt" },
+  });
+  assert.equal(res.status, 500);
+  const body = await res.json();
+  assert.equal(body.code, "spawn_failed");
+  assert.match(body.error, /model refused the request/);
+  assert.equal(promptCalls.count, 1);
 });
 
 test("codex app-server prompt response waits for delayed final result", async (t) => {
@@ -1630,7 +1754,8 @@ test("project row history returns the session menu after leaving a busy active s
   assert.equal(projectHistoryBody.sessions[0].id, "project:__projects__");
   assert.equal(projectHistoryBody.sessions[1].id, "project-session:p_alpha");
   assert.equal(projectHistoryBody.sessions[1].status, "busy");
-  assert.deepEqual(projectHistoryBody.history, []);
+  assert.match(projectHistoryBody.history[0].text, /Project alpha — 2 sessions/);
+  assert.match(projectHistoryBody.history[0].text, /busy project should not auto-open \[busy\]/);
 });
 
 test("project row event stream receives codex final result via query-token auth", async (t) => {
@@ -2687,7 +2812,66 @@ test("selecting a project row after an active session enters project sessions wi
   assert.equal(sessionsBody.sessions[1].latestOutput, "answer for: first project navigation turn");
 });
 
-test("codex app-server backend hides old codex history from project session list", async (t) => {
+test("codex app-server backend lists old codex threads for resume by default", async (t) => {
+  const { baseUrl } = await withBridge(t, {
+    agentBackend: "codex_app_server",
+    createCodexAgentProvider: fakeCodexAgentProvider({
+      seedSessions: [
+        {
+          id: "old-cached-thread",
+          title: "Old cached Codex thread",
+          timestamp: new Date(1_779_999_000_000).toISOString(),
+          cwd: "/tmp/morpheus-alpha",
+          status: "idle",
+        },
+      ],
+      history: {
+        "old-cached-thread": [
+          { role: "user", text: "earlier question" },
+          { role: "assistant", text: "earlier answer" },
+        ],
+      },
+    }),
+    mirrorCodexTui: false,
+    showProjectsFirst: true,
+  });
+  await request(baseUrl, "/api/select-project", {
+    body: { projectId: "p_alpha", clientRequestId: "codex-resume-select-project" },
+  });
+
+  const sessions = await request(baseUrl, `/api/sessions?token=${TOKEN}`, { token: null });
+  const sessionsBody = await sessions.json();
+  assert.equal(
+    sessionsBody.sessions.some((session) => session.id === "old-cached-thread"),
+    true,
+  );
+
+  const projectHistory = await request(baseUrl, "/api/sessions/project:p_alpha/history");
+  const projectHistoryBody = await projectHistory.json();
+  assert.match(projectHistoryBody.history[0].text, /Old cached Codex thread/);
+
+  // Stock Even clients open a row by fetching its history: that must select
+  // the thread so a follow-up prompt resumes it instead of spawning anew.
+  const threadHistory = await request(baseUrl, "/api/sessions/old-cached-thread/history");
+  assert.equal(threadHistory.status, 200);
+  const threadHistoryBody = await threadHistory.json();
+  assert.equal(threadHistoryBody.history.at(-1).text, "earlier answer");
+
+  const navigation = await request(baseUrl, "/api/navigation");
+  const navigationBody = await navigation.json();
+  assert.equal(navigationBody.view, "session");
+  assert.equal(navigationBody.selectedSession.id, "old-cached-thread");
+
+  const prompt = await request(baseUrl, "/api/prompt", {
+    body: { text: "continue this thread", clientRequestId: "codex-resume-followup" },
+  });
+  assert.equal(prompt.status, 202);
+  const promptBody = await prompt.json();
+  assert.equal(promptBody.action, "send_prompt");
+  assert.equal(promptBody.sessionId, "old-cached-thread");
+});
+
+test("codex app-server backend hides old codex history when explicitly disabled", async (t) => {
   const { baseUrl } = await withBridge(t, {
     agentBackend: "codex_app_server",
     createCodexAgentProvider: fakeCodexAgentProvider({
@@ -2703,6 +2887,7 @@ test("codex app-server backend hides old codex history from project session list
     }),
     mirrorCodexTui: false,
     showProjectsFirst: true,
+    includeCodexHistory: false,
   });
   await request(baseUrl, "/api/select-project", {
     body: { projectId: "p_alpha", clientRequestId: "codex-history-select-project" },
