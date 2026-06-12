@@ -5,6 +5,16 @@
 
 // ───────────────────────── pure helpers ─────────────────────────
 
+// Coerce any value (including objects from the API) to a display string —
+// never "[object Object]". Pure → unit-tested in Node.
+export function asText(v) {
+  if (v == null) return "";
+  if (typeof v === "object") {
+    try { return JSON.stringify(v); } catch { return String(v); }
+  }
+  return String(v);
+}
+
 export function escapeHtml(s) {
   return String(s == null ? "" : s)
     .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
@@ -181,7 +191,7 @@ if (typeof document !== "undefined") {
   function renderTicker(items) {
     const feed = $("ticker-feed");
     feed.innerHTML = items.slice(0, 12).map(it =>
-      `<span class="ticker-item"><span class="tk-kind">${escapeHtml(it.kind)}</span>${escapeHtml(it.text)}</span>`
+      `<span class="ticker-item"><span class="tk-kind">${escapeHtml(asText(it.kind))}</span>${escapeHtml(asText(it.text))}</span>`
     ).join("") || `<span class="ticker-item">fleet quiet</span>`;
   }
 
@@ -473,7 +483,12 @@ if (typeof document !== "undefined") {
       if (!v) return; inp.value = ""; inp.style.height = "auto"; sendChat(v);
     });
     $("composer-input").addEventListener("keydown", (e) => {
-      if ((e.metaKey || e.ctrlKey) && e.key === "Enter") { e.preventDefault(); $("composer").requestSubmit(); }
+      // Enter sends; Shift+Enter inserts a newline (the Claude Code / Codex
+      // convention). Cmd/Ctrl+Enter also sends. Respect IME composition.
+      if (e.key === "Enter" && !e.shiftKey && !e.isComposing) {
+        e.preventDefault();
+        $("composer").requestSubmit();
+      }
     });
     $("composer-input").addEventListener("input", (e) => {
       e.target.style.height = "auto"; e.target.style.height = e.target.scrollHeight + "px";

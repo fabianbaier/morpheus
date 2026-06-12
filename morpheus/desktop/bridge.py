@@ -295,6 +295,26 @@ def notes(limit: int = 30, tenant_id: Optional[str] = None) -> list[dict[str, An
     ]
 
 
+def _action_text(action: str, details: Any) -> str:
+    """Flatten a ledger action's details (a dict) into one readable line.
+
+    ledger.recent_actions() json-decodes the details column into a dict; sending
+    that raw to the browser renders as "[object Object]". Pick the most
+    informative fields, fall back to compact JSON, else just the action name.
+    """
+    if isinstance(details, str):
+        return details or action
+    if isinstance(details, dict) and details:
+        for key in ("summary", "goal", "title", "command", "prompt", "reason", "text", "name"):
+            val = details.get(key)
+            if val:
+                return f"{action}: {val}" if action else str(val)
+        flat = ", ".join(f"{k}={v}" for k, v in details.items()
+                         if isinstance(v, (str, int, float)) and str(v))
+        return f"{action}: {flat}"[:200] if flat else action
+    return action
+
+
 def activity_feed(limit: int = 40) -> list[dict[str, Any]]:
     """The 🐇 ticker: recent notes + recent autonomous actions, newest first."""
     items: list[dict[str, Any]] = []
@@ -313,7 +333,7 @@ def activity_feed(limit: int = 40) -> list[dict[str, Any]]:
             {
                 "ts": a.ts,
                 "kind": a.action,
-                "text": a.details or a.action,
+                "text": _action_text(a.action, a.details),
                 "source": "action",
                 "tab_id": a.tab_id,
             }

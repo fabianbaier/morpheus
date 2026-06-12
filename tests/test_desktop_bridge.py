@@ -92,6 +92,27 @@ class BridgeReadTest(unittest.TestCase):
             feed = bridge.activity_feed()
             self.assertTrue(any("src/auth" in it["text"] for it in feed))
 
+    def test_activity_feed_flattens_action_details_dicts(self):
+        with _TempDB():
+            # ledger.recent_actions json-decodes details into a dict; the feed
+            # must surface a readable string, never the raw dict.
+            ledger.log_action("remote_spawn_session",
+                              details={"goal": "review PR #224", "command": "codex"})
+            ledger.log_action("prune", details={})
+            feed = bridge.activity_feed()
+            spawn = next(it for it in feed if it["kind"] == "remote_spawn_session")
+            self.assertIsInstance(spawn["text"], str)
+            self.assertIn("review PR #224", spawn["text"])
+            prune = next(it for it in feed if it["kind"] == "prune")
+            self.assertEqual(prune["text"], "prune")
+
+    def test_action_text_helper(self):
+        self.assertEqual(bridge._action_text("spawn", {"goal": "x"}), "spawn: x")
+        self.assertEqual(bridge._action_text("kill", {}), "kill")
+        self.assertEqual(bridge._action_text("note", "already a string"), "already a string")
+        self.assertEqual(bridge._action_text("snapshot", {"count": 3}), "snapshot: count=3")
+        self.assertNotIn("object", bridge._action_text("x", {"a": {"nested": 1}}))
+
     def test_spend(self):
         with _TempDB():
             _seed()
