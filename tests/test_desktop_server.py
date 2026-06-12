@@ -209,6 +209,26 @@ class DispatchRouteTest(unittest.TestCase):
         self.assertEqual(_get("/api/stream?token=secret-token")[0], 200)
 
 
+class ParentWatchdogTest(unittest.TestCase):
+    def test_fires_when_parent_changes(self):
+        import threading
+        fired = threading.Event()
+        ppids = iter([42, 42, 1])  # parent died → reparented to init
+        t = server.start_parent_watchdog(
+            poll_secs=0.01, getppid=lambda: next(ppids, 1),
+            on_orphaned=fired.set)
+        self.assertTrue(fired.wait(timeout=2))
+        t.join(timeout=2)
+
+    def test_quiet_while_parent_alive(self):
+        import threading
+        fired = threading.Event()
+        server.start_parent_watchdog(
+            poll_secs=0.01, getppid=lambda: 42, initial_ppid=42,
+            on_orphaned=fired.set)
+        self.assertFalse(fired.wait(timeout=0.2))
+
+
 class FleetSignatureTest(unittest.TestCase):
     def test_signature_changes_with_state(self):
         a = {"counts": {"working": 1}, "sessions": [{"tab_id": "t", "state": "working", "buffer_changed_at": 1}], "notes": []}

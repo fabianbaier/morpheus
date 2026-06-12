@@ -2965,6 +2965,10 @@ def desktop_serve(
         False, "--handshake",
         help="Print a single JSON line {host,port,token,url} on ready (for the Electron shell), then serve.",
     ),
+    parent_watchdog: bool = typer.Option(
+        False, "--parent-watchdog",
+        help="Exit automatically when the launching parent process dies (prevents orphaned servers if the shell is force-quit).",
+    ),
 ):
     """Run the desktop bridge server (REST + SSE) without opening a browser.
 
@@ -2979,7 +2983,8 @@ def desktop_serve(
         else:
             console.print(f"[green]bridge[/green] at [bold]{srv.url.split('?')[0]}[/bold]  token: [dim]{srv.cfg.token}[/dim]")
 
-    desktop_server.serve(host=host, port=port, on_ready=_on_ready, block=True)
+    desktop_server.serve(host=host, port=port, on_ready=_on_ready, block=True,
+                         parent_watchdog=parent_watchdog)
 
 
 @app.command("daemon-status")

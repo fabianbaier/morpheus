@@ -48,6 +48,26 @@ Python interpreter with `morpheus` installed to be reachable; for a fully
 self-contained app, bundle the venv (e.g. with `pyinstaller` or `briefcase`) and
 set `MORPHEUS_BIN` accordingly in `main.js`.
 
+## Process lifecycle
+
+`main.js` reaps the Python bridge on quit, window-close, and SIGTERM/SIGINT/
+SIGHUP. For the paths where no handler can run (force-quit, SIGKILL, a crash),
+the bridge is started with `--parent-watchdog`: it polls its parent pid and
+exits on its own when the shell dies, so no orphaned server ever squats on the
+port.
+
+## Headless smoke test (Linux CI)
+
+The shell runs under Xvfb for CI smoke tests; containers lack Chromium's setuid
+sandbox, so pass `--no-sandbox` there (never needed on macOS):
+
+```bash
+xvfb-run -a ./node_modules/.bin/electron --no-sandbox --disable-gpu .
+```
+
+Verified: handshake → window renders the cockpit → SIGTERM reaps the bridge →
+SIGKILL triggers the bridge's parent watchdog.
+
 ## Security
 
 The bridge binds `127.0.0.1` only, requires a per-launch bearer token on every

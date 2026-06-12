@@ -17,7 +17,9 @@ const readline = require("node:readline");
 
 // Allow overriding how the bridge is launched (e.g. a venv path) via env.
 const MORPHEUS_BIN = process.env.MORPHEUS_BIN || "morpheus";
-const MORPHEUS_ARGS = ["desktop", "serve", "--handshake"];
+// --parent-watchdog makes the bridge exit on its own if this process dies
+// without running cleanup (force-quit, SIGKILL, crash) — no orphaned server.
+const MORPHEUS_ARGS = ["desktop", "serve", "--handshake", "--parent-watchdog"];
 
 let child = null;
 let mainWindow = null;
@@ -125,3 +127,8 @@ app.on("window-all-closed", () => {
 app.on("before-quit", stopBridge);
 app.on("will-quit", stopBridge);
 process.on("exit", stopBridge);
+// Signals bypass app lifecycle events entirely — without these handlers a
+// `kill`/Ctrl-C would terminate Electron without reaping the bridge child.
+for (const sig of ["SIGTERM", "SIGINT", "SIGHUP"]) {
+  process.on(sig, () => { stopBridge(); app.quit(); process.exit(0); });
+}

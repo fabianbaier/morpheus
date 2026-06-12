@@ -520,6 +520,35 @@ class DesktopServer:
             self._thread.join()
 
 
+def start_parent_watchdog(
+    *,
+    initial_ppid: Optional[int] = None,
+    poll_secs: float = 2.0,
+    getppid: Callable[[], int] = os.getppid,
+    on_orphaned: Callable[[], None] = lambda: os._exit(0),
+) -> threading.Thread:
+    """Exit when the launching parent (e.g. the Electron shell) dies.
+
+    Cleanup handlers can't run on the parent's SIGKILL or crash, so the child
+    watches its own ppid: when the parent disappears, the process is reparented
+    (to init/reaper) and we shut down instead of squatting on the port as an
+    orphan. Injectable ``getppid``/``on_orphaned`` keep it unit-testable.
+    """
+    first = initial_ppid if initial_ppid is not None else getppid()
+
+    def _watch():
+        while True:
+            time.sleep(poll_secs)
+            current = getppid()
+            if current != first or current == 1:
+                on_orphaned()
+                return
+
+    t = threading.Thread(target=_watch, daemon=True, name="parent-watchdog")
+    t.start()
+    return t
+
+
 def serve(
     host: str = "127.0.0.1",
     port: int = 0,
@@ -527,9 +556,12 @@ def serve(
     *,
     on_ready: Optional[Callable[[DesktopServer], None]] = None,
     block: bool = True,
+    parent_watchdog: bool = False,
 ) -> DesktopServer:
     """Start the desktop bridge server. Prints the handshake JSON line on ready."""
     server = DesktopServer(Config(host=host, port=port, token=token)).start()
+    if parent_watchdog:
+        start_parent_watchdog()
     if on_ready is not None:
         on_ready(server)
     if block:
