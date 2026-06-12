@@ -191,6 +191,12 @@ app-server path from Even Terminal for G2 conversations:
   polling. Message ids come from one bridge-wide counter, so a client can keep
   a single `after` cursor while it moves between `project:<id>`,
   `project-session:<id>`, and real thread ids without skipping newer messages.
+  Stream and poll messages are presented under the session id the client
+  subscribed with (stock Even clients drop messages tagged with a foreign
+  session id); the real codex thread id rides along as `activeSessionId`.
+  While a turn is actively streaming `text_delta` events, history and
+  terminal-mirror fallbacks hold so partial answers are never published as
+  final results.
 - Read requests (`GET`) have their own rate budget
   (`MORPHEUS_G2_RATE_LIMIT_READ_MAX`, default 600/min per client) so steady
   glasses polling of sessions/messages/status cannot exhaust the stricter

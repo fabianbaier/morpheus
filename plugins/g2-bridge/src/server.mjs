@@ -29,6 +29,7 @@ const DEFAULT_CODEX_APP_SERVER_PORT = 8765;
 const DEFAULT_PROMPT_WAIT_FOR_RESULT_MS = 90_000;
 const DEFAULT_STALE_MIRROR_GRACE_MS = 4000;
 const CODEX_LIVE_EVENTS_CHECK_MS = 60_000;
+const LIVE_DELTA_HOLD_MS = 10_000;
 const MAX_MESSAGES_PER_SESSION = 500;
 const AGENT_BACKEND_MORPHEUS = "morpheus";
 const AGENT_BACKEND_CODEX_APP_SERVER = "codex_app_server";
@@ -300,6 +301,16 @@ function allocateMessageId(state) {
   return id;
 }
 
+// Stock Even clients drop stream/poll messages whose sessionId does not match
+// the row they are watching, so alias-delivered messages are presented under
+// the session id the client asked for; the real thread id stays alongside.
+function presentMessageForSession(msg, sessionId) {
+  const target = String(sessionId || "");
+  const original = String(msg?.sessionId || "");
+  if (!target || !original || original === target) return msg;
+  return { ...msg, sessionId: target, activeSessionId: original };
+}
+
 function appendMessageEntry(state, sessionId, msg, id) {
   const key = sessionId || "morpheus";
   const buffer = cleanMessageState(state, sessionId);
@@ -308,7 +319,7 @@ function appendMessageEntry(state, sessionId, msg, id) {
   if (buffer.messages.length > MAX_MESSAGES_PER_SESSION) {
     buffer.messages.shift();
   }
-  const payload = JSON.stringify(msg);
+  const payload = JSON.stringify(presentMessageForSession(msg, key));
   for (const client of buffer.clients) {
     const res = client?.res || client;
     if (typeof client?.filter === "function" && !client.filter(msg)) continue;
@@ -371,6 +382,26 @@ function sessionAwaitingResultSinceLatestPrompt(state, sessionId) {
     if (msg.type === "prompt_submitted" || msg.type === "user_prompt") return msg;
   }
   return null;
+}
+
+// True while the current turn is visibly streaming: a text_delta arrived after
+// the latest prompt, recently enough that the live event stream is clearly
+// alive. History/mirror fallbacks stay quiet then, so partial answers are not
+// published as final results; if the stream dies mid-turn the hold ages out
+// and the fallbacks take over.
+function liveDeltaStreamActive(state, config, sessionId) {
+  const messages = getMessages(state, sessionId, 0);
+  for (let idx = messages.length - 1; idx >= 0; idx -= 1) {
+    const msg = messages[idx];
+    if (msg.type === "result" || msg.type === "error") return false;
+    if (msg.type === "prompt_submitted" || msg.type === "user_prompt") return false;
+    if (msg.type === "text_delta") {
+      const at = Date.parse(msg.at || "");
+      if (!Number.isFinite(at)) return true;
+      return config.clock() - at < LIVE_DELTA_HOLD_MS;
+    }
+  }
+  return false;
 }
 
 function historyAnswerForPrompt(history, promptMsg) {
@@ -1263,7 +1294,9 @@ function selectedSessionResponse(state) {
     activeSessionId && activeSessionId !== displaySessionId
       ? getMessages(state, activeSessionId, 0)
       : [];
-  const messages = mergeBufferedMessages(displayMessages, activeMessages);
+  const messages = mergeBufferedMessages(displayMessages, activeMessages).map((entry) =>
+    presentMessageForSession(entry, displaySessionId),
+  );
   const history = selected.history || bufferedHistoryForRow(state, displaySessionId, 10, {
     preferredSessionIds: [activeSessionId],
   });
@@ -2536,7 +2569,9 @@ async function spawnSessionFromText({ req, res, context, requestId, text, projec
     }
     const activeMessages = getMessages(state, spawned.id, 0);
     const displayMessages = requestSessionId
-      ? getMessages(state, requestSessionId, 0)
+      ? getMessages(state, requestSessionId, 0).map((entry) =>
+          presentMessageForSession(entry, requestSessionId),
+        )
       : activeMessages;
 
     const body = {
@@ -2721,7 +2756,9 @@ async function sendPromptToSession({ req, res, context, requestId, text, session
     }
     const activeMessages = getMessages(state, activeSessionId, 0);
     const displayMessages = requestSessionId
-      ? getMessages(state, requestSessionId, 0)
+      ? getMessages(state, requestSessionId, 0).map((entry) =>
+          presentMessageForSession(entry, requestSessionId),
+        )
       : activeMessages;
     const body = {
       ok: true,
@@ -2863,6 +2900,13 @@ async function refreshSessionOutputUncached({ provider, state, config, sessionId
       state.outputHashes.set(sessionId, fingerprint);
       return normalizedResult;
     }
+    // While text_deltas are actively streaming, the codex result event owns
+    // turn completion; the mirror shows a half-rendered answer that must not
+    // be published as final.
+    if (liveDeltaStreamActive(state, config, sessionId)) {
+      bridgeDebug(config, "session-output-held-for-live-deltas", { sessionId });
+      return normalizedResult;
+    }
     // A follow-up prompt leaves the previous answer on the terminal until the
     // TUI redraws for the new turn. Publishing that unchanged screen would
     // resolve the new prompt with the old answer, so hold identical mirror text
@@ -2947,6 +2991,14 @@ async function refreshSessionHistory({
 }) {
   if (!sessionId || !provider.getHistory) return null;
   try {
+    // Codex streams the answer as text_delta events while persisting partial
+    // assistant text into thread history. Publishing that mid-turn history
+    // would resolve the prompt wait with a truncated answer, so while deltas
+    // are actively arriving the real `result` event owns turn completion.
+    if (liveDeltaStreamActive(state, config, sessionId)) {
+      bridgeDebug(config, "session-history-held-for-live-deltas", { sessionId });
+      return { history: [], text: "", published: false };
+    }
     const history = await provider.getHistory(sessionId, 10, { allowOutputFallback });
     // While a prompt is outstanding, the latest assistant entry in history is
     // usually the answer to the PREVIOUS turn. Publishing it would feed the old
@@ -4821,7 +4873,9 @@ function createBridge(options = {}) {
       selectedSessionId: state.selectedSession?.id || "",
     });
     res.json({
-      messages: getMessages(state, sessionId, Number.isFinite(after) ? after : 0),
+      messages: getMessages(state, sessionId, Number.isFinite(after) ? after : 0).map((entry) =>
+        presentMessageForSession(entry, sessionId),
+      ),
       state: responseStatus,
       sessionId,
       activeSessionId: activeSession?.id || projectActiveSession?.id || undefined,
@@ -4894,7 +4948,9 @@ function createBridge(options = {}) {
         dropped += 1;
         continue;
       }
-      res.write(`id: ${entry.id}\ndata: ${JSON.stringify(sseMessagePayload(entry))}\n\n`);
+      res.write(
+        `id: ${entry.id}\ndata: ${JSON.stringify(presentMessageForSession(sseMessagePayload(entry), sessionId))}\n\n`,
+      );
       replayed += 1;
     }
     res.write(":ok\n\n");

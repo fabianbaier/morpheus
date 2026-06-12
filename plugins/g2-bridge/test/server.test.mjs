@@ -61,6 +61,7 @@ function fakeCodexAgentProvider({
   promptReturnDelayMs = 0,
   throwOnProjectHistory = false,
   throwHistoryFor = [],
+  deltaTexts = [],
 } = {}) {
   const sessions = [...seedSessions];
   let nextId = 1;
@@ -109,6 +110,9 @@ function fakeCodexAgentProvider({
       }
       session.status = "busy";
       emit(id, { type: "status", state: "busy", provider: "codex", sessionId: id });
+      for (const delta of deltaTexts) {
+        emit(id, { type: "text_delta", text: delta, provider: "codex", sessionId: id });
+      }
       const finish = () => {
         if (!emitFinalResult) return;
         emit(id, {
@@ -3461,4 +3465,105 @@ test("concurrent client polls share one terminal output read", async (t) => {
     body.messages.find((message) => message.type === "result")?.text,
     "single flight mirror answer",
   );
+});
+
+test("mid-turn history does not publish a truncated answer while deltas stream", async (t) => {
+  const fullAnswer = "Doing fine. Ready to work in /tmp/morpheus-alpha whenever you are.";
+  const { baseUrl } = await withBridge(t, {
+    agentBackend: "codex_app_server",
+    createCodexAgentProvider: fakeCodexAgentProvider({
+      asyncResultMs: 250,
+      promptReturnDelayMs: 10,
+      deltaTexts: ["Doing fine. ", "Ready to work in /tmp/morpheus-alpha whenever you are."],
+      history: {
+        // Codex persists partial assistant text while the turn still streams.
+        "codex-thread-1": [
+          { role: "user", text: "Hey, how are you doing?" },
+          { role: "assistant", text: "Doing fine." },
+        ],
+      },
+    }),
+    mirrorCodexTui: false,
+    showProjectsFirst: true,
+    waitForPromptResult: false,
+    outputPollIntervalMs: 20,
+    outputPollAttempts: 30,
+  });
+
+  // The fake provider always answers "answer for: <text>", so assert on that.
+  const prompt = await request(baseUrl, "/api/prompt", {
+    body: {
+      sessionId: "project:p_alpha",
+      text: "Hey, how are you doing?",
+      clientRequestId: "delta-hold-prompt-1",
+    },
+  });
+  assert.equal(prompt.status, 202);
+
+  // Poll while the turn is still streaming: the partial persisted history
+  // must not surface as a result.
+  const during = await request(baseUrl, "/api/messages?sessionId=project-session:p_alpha");
+  const duringBody = await during.json();
+  assert.equal(
+    duringBody.messages.some(
+      (message) => message.type === "result" && message.text === "Doing fine.",
+    ),
+    false,
+    "partial mid-turn history must not be published as a result",
+  );
+
+  await sleep(400);
+  const after = await request(baseUrl, "/api/messages?sessionId=project-session:p_alpha");
+  const afterBody = await after.json();
+  const results = afterBody.messages.filter((message) => message.type === "result");
+  assert.equal(results.length, 1);
+  assert.equal(results[0].text, "answer for: Hey, how are you doing?");
+  assert.equal(fullAnswer.length > 0, true);
+});
+
+test("stream and poll messages carry the session id the client asked for", async (t) => {
+  const { baseUrl } = await withBridge(t, {
+    agentBackend: "codex_app_server",
+    createCodexAgentProvider: fakeCodexAgentProvider({ asyncResultMs: 120, promptReturnDelayMs: 10 }),
+    mirrorCodexTui: false,
+    showProjectsFirst: true,
+    waitForPromptResult: false,
+  });
+
+  const events = await fetch(`${baseUrl}/api/events?sessionId=project:p_alpha&token=${TOKEN}`);
+  assert.equal(events.status, 200);
+  const streamed = readStreamUntil(events.body, '"type":"result"', 1500);
+
+  const prompt = await request(baseUrl, "/api/prompt", {
+    body: {
+      sessionId: "project:p_alpha",
+      text: "present ids",
+      clientRequestId: "present-ids-prompt-1",
+    },
+  });
+  assert.equal(prompt.status, 202);
+
+  const streamText = await streamed;
+  const streamPayloads = streamText
+    .split("\n")
+    .filter((line) => line.startsWith("data: "))
+    .map((line) => JSON.parse(line.slice(6)));
+  assert.ok(streamPayloads.length > 0);
+  for (const payload of streamPayloads) {
+    if (!payload.sessionId) continue;
+    assert.equal(
+      payload.sessionId,
+      "project:p_alpha",
+      `stream message ${payload.type} must carry the subscribed session id`,
+    );
+  }
+  const streamResult = streamPayloads.find((payload) => payload.type === "result");
+  assert.equal(streamResult.activeSessionId, "codex-thread-1");
+
+  await sleep(250);
+  const polled = await request(baseUrl, "/api/messages?sessionId=project-session:p_alpha");
+  const polledBody = await polled.json();
+  const polledResult = polledBody.messages.find((message) => message.type === "result");
+  assert.equal(polledResult.sessionId, "project-session:p_alpha");
+  assert.equal(polledResult.activeSessionId, "codex-thread-1");
 });
