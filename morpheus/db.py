@@ -799,6 +799,12 @@ def _codex_resume_command(command: str, resume_ref: str) -> str:
     return shlex.join(kept + ["resume", resume_ref or "--last"])
 
 
+def codex_resume_ref_from_command(command: str) -> str:
+    """Return the exact codex thread id from a `codex ... resume <id>` command."""
+    ref, confidence = _resume_ref_from_command(command, "codex")
+    return ref if confidence == "exact" else ""
+
+
 def _claude_resume_command(command: str, resume_ref: str) -> str:
     parts = _agent_command_parts(command, "claude") or ["claude"]
     kept = _leading_agent_options(parts, CLAUDE_VALUE_OPTIONS) or ["claude"]

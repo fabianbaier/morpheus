@@ -21,7 +21,7 @@ const DEFAULT_REQUEST_ID_TTL_MS = 10 * 60 * 1000;
 const DEFAULT_RATE_LIMIT_WINDOW_MS = 60 * 1000;
 const DEFAULT_RATE_LIMIT_MAX = 120;
 const DEFAULT_RATE_LIMIT_READ_MAX = 600;
-const DEFAULT_CLIENT_POLL_OUTPUT_BUDGET_MS = 1500;
+const DEFAULT_CLIENT_POLL_OUTPUT_BUDGET_MS = 800;
 const DEFAULT_PROJECT_LIMIT = 25;
 const DEFAULT_OUTPUT_POLL_INTERVAL_MS = 2000;
 const DEFAULT_OUTPUT_POLL_ATTEMPTS = 45;
@@ -2002,6 +2002,22 @@ function createCodexAppServerBridgeProvider(options = {}) {
       const sessions = Array.isArray(result) ? result : result.sessions || [];
       for (const session of sessions) {
         if (session?.id) morpheusSnapshotSessions.set(session.id, session);
+        // Mirror tabs outlive bridge restarts, but the thread->tab map is in
+        // memory only. Snapshot rows expose the exact codex thread id of
+        // `codex ... resume <id>` tabs, so re-attach them here: terminal
+        // output fallback keeps working for old threads and re-prompts do
+        // not spawn duplicate mirror tabs.
+        const resumeRef = String(session?.morpheus?.resume_ref || "").trim();
+        if (resumeRef) {
+          state.mirroredCodexSessions.add(resumeRef);
+          if (!codexMirrorSessions.has(resumeRef)) {
+            codexMirrorSessions.set(resumeRef, session);
+            bridgeDebug(config, "codex-mirror-remapped", {
+              sessionId: resumeRef,
+              tabRef: session?.id || "",
+            });
+          }
+        }
       }
       bridgeDebug(config, "morpheus-snapshot-sessions", {
         projectId,
@@ -2775,8 +2791,30 @@ async function sendPromptToSession({ req, res, context, requestId, text, session
   }
 }
 
-async function refreshSessionOutput({ provider, state, config, sessionId, publish = true }) {
-  if (!sessionId || !provider.sessionOutput) return null;
+function refreshSessionOutput({ provider, state, config, sessionId, publish = true }) {
+  if (!sessionId || !provider.sessionOutput) return Promise.resolve(null);
+  // Reading the terminal mirror shells out to the morpheus CLI, so concurrent
+  // client polls and the background poller share one in-flight read per
+  // session instead of queueing duplicate runs behind the runner semaphore.
+  if (publish) {
+    const inflight = state.outputRefreshInflight?.get(sessionId);
+    if (inflight) return inflight;
+  }
+  const run = refreshSessionOutputUncached({ provider, state, config, sessionId, publish });
+  if (publish && state.outputRefreshInflight) {
+    state.outputRefreshInflight.set(sessionId, run);
+    run
+      .catch(() => {})
+      .finally(() => {
+        if (state.outputRefreshInflight.get(sessionId) === run) {
+          state.outputRefreshInflight.delete(sessionId);
+        }
+      });
+  }
+  return run;
+}
+
+async function refreshSessionOutputUncached({ provider, state, config, sessionId, publish }) {
   try {
     const result = await provider.sessionOutput({
       sessionId,
@@ -2951,7 +2989,14 @@ function shouldPreferThreadHistoryForClientPoll(provider, state, sessionId) {
   return true;
 }
 
-async function refreshSessionForSessionsPoll({ provider, state, config, sessionId, reason = "sessions_poll" }) {
+async function refreshSessionForSessionsPoll({
+  provider,
+  state,
+  config,
+  sessionId,
+  reason = "sessions_poll",
+  outputFallback = true,
+}) {
   if (!sessionId) return { refreshed: false, published: false };
   const beforeLatestId = latestMessageId(state, sessionId);
   const beforeHash = state.outputHashes.get(sessionId) || "";
@@ -2968,13 +3013,13 @@ async function refreshSessionForSessionsPoll({ provider, state, config, sessionI
       })
     : null;
   const firstHistoryText = String(firstHistoryResult?.text || "").trim();
-  const shouldUseOutputFallback = !firstHistoryText && (!preferThreadHistory || !outputPollActive);
-  const outputFallback =
-    !firstHistoryText && shouldUseOutputFallback
-      ? await refreshSessionOutputWithBudget({ provider, state, config, sessionId })
-      : null;
-  const outputResult = outputFallback?.result || null;
-  const outputBudgetExceeded = Boolean(outputFallback?.budgetExceeded);
+  const shouldUseOutputFallback =
+    outputFallback && !firstHistoryText && (!preferThreadHistory || !outputPollActive);
+  const budgetedOutput = shouldUseOutputFallback
+    ? await refreshSessionOutputWithBudget({ provider, state, config, sessionId })
+    : null;
+  const outputResult = budgetedOutput?.result || null;
+  const outputBudgetExceeded = Boolean(budgetedOutput?.budgetExceeded);
   const outputText = String(outputResult?.output?.text || "").trim();
   let historyResult = null;
   if (firstHistoryText) {
@@ -2985,7 +3030,7 @@ async function refreshSessionForSessionsPoll({ provider, state, config, sessionI
       state,
       config,
       sessionId,
-      allowOutputFallback: !outputBudgetExceeded,
+      allowOutputFallback: outputFallback && !outputBudgetExceeded,
     });
   } else if (preferThreadHistory) {
     historyResult = firstHistoryResult;
@@ -3041,7 +3086,13 @@ async function refreshSessionForSessionsPoll({ provider, state, config, sessionI
   };
 }
 
-async function refreshSelectedSessionForSessionsPoll({ provider, state, config, reason }) {
+async function refreshSelectedSessionForSessionsPoll({
+  provider,
+  state,
+  config,
+  reason,
+  outputFallback = true,
+}) {
   const ids = [];
   const activeProjectSession = state.selectedProject
     ? activeSessionForProject(state, state.selectedProject)
@@ -3050,6 +3101,9 @@ async function refreshSelectedSessionForSessionsPoll({ provider, state, config, 
   if (state.selectedSession?.id) ids.push(state.selectedSession.id);
 
   let published = false;
+  // Only the first session may fall back to the (budgeted) terminal read, so
+  // one client poll never stacks multiple output budgets.
+  let allowOutput = outputFallback;
   for (const sessionId of [...new Set(ids)]) {
     const result = await refreshSessionForSessionsPoll({
       provider,
@@ -3057,7 +3111,9 @@ async function refreshSelectedSessionForSessionsPoll({ provider, state, config, 
       config,
       sessionId,
       reason,
+      outputFallback: allowOutput,
     });
+    allowOutput = false;
     published = published || Boolean(result.published);
   }
   return { published };
@@ -3698,6 +3754,7 @@ function createBridge(options = {}) {
     outputHashes: new Map(),
     outputPollers: new Map(),
     outputPollStats: new Map(),
+    outputRefreshInflight: new Map(),
     promptMirrorBaselines: new Map(),
     codexLiveEventsCheckedAt: new Map(),
     mirroredCodexSessions: new Set(),
@@ -3864,11 +3921,14 @@ function createBridge(options = {}) {
         state.selectedProject,
         limit,
       );
+      // The before-rows refresh already owned this poll's output budget;
+      // the post-rows pass is history-only so one poll stays bounded.
       const postRefresh = await refreshSelectedSessionForSessionsPoll({
         provider,
         state,
         config,
         reason: "sessions_poll_after_rows",
+        outputFallback: false,
       });
       if (postRefresh.published) {
         ({ sessions, snapshot, stale, error } = await projectSessionMenuRows(

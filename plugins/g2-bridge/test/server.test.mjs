@@ -141,6 +141,7 @@ function fakeMorpheusRunner({
   mirrorOutputText = "",
   outputState = "",
   snapshotDelayMs = 0,
+  snapshotSessions = [],
   outputDelayMs = 0,
   outputFailuresBeforeSuccess = 0,
   outputErrorMessage = "morpheus timed out after 10000ms",
@@ -181,7 +182,7 @@ function fakeMorpheusRunner({
         generated_at: 1_779_999_999,
         summary: "slow Morpheus snapshot",
         counts: {},
-        sessions: [],
+        sessions: snapshotSessions,
       };
     }
 
@@ -211,7 +212,9 @@ function fakeMorpheusRunner({
 
     if (args[1] === "output") {
       const ref = args[args.length - 1];
-      if (ref !== mirroredTabRef) throw new Error(`unexpected output target: ${ref}`);
+      const known =
+        ref === mirroredTabRef || snapshotSessions.some((row) => row.tab_ref === ref);
+      if (!known) throw new Error(`unexpected output target: ${ref}`);
       onOutputStart(ref);
       if (outputDelayMs > 0) await sleep(outputDelayMs);
       outputCalls += 1;
@@ -3350,4 +3353,112 @@ test("identical stock prompt retries replay the in-flight response after selecti
   const secondBody = await second.json();
   assert.equal(secondBody.duplicate, true);
   assert.equal(promptCalls, 1);
+});
+
+test("bridge restart remaps existing mirror tabs from morpheus snapshot rows", async (t) => {
+  let mirrorSpawns = 0;
+  const { baseUrl } = await withBridge(t, {
+    agentBackend: "codex_app_server",
+    createCodexAgentProvider: fakeCodexAgentProvider({
+      emitFinalResult: false,
+      promptReturnDelayMs: 10,
+    }),
+    mirrorCodexTui: true,
+    showProjectsFirst: true,
+    waitForPromptResult: false,
+    outputPollIntervalMs: 20,
+    outputPollAttempts: 20,
+    runner: fakeMorpheusRunner({
+      mirrorOutputText: "mirror answer after restart",
+      onMirrorStart: () => {
+        mirrorSpawns += 1;
+      },
+      snapshotSessions: [
+        {
+          tab_ref: "old-mirror-tab",
+          mission_ref: "old-mirror-mission",
+          tenant_id: "p_alpha",
+          project_root: "/tmp/morpheus-alpha",
+          state: "working",
+          goal: "G2: hello again",
+          age_secs: 30,
+          resume_ref: "codex-thread-1",
+        },
+      ],
+    }),
+  });
+
+  // Listing project sessions ingests snapshot rows and re-attaches the mirror.
+  await request(baseUrl, "/api/select-project", {
+    body: { projectId: "p_alpha", clientRequestId: "remap-select-1" },
+  });
+  await request(baseUrl, `/api/sessions?token=${TOKEN}`, { token: null });
+
+  const prompt = await request(baseUrl, "/api/prompt", {
+    body: {
+      sessionId: "project:p_alpha",
+      text: "hello again",
+      clientRequestId: "remap-prompt-1",
+    },
+  });
+  assert.equal(prompt.status, 202);
+  assert.equal(mirrorSpawns, 0, "re-prompt must not spawn a duplicate mirror tab");
+
+  const deadline = Date.now() + 1500;
+  let resultText = "";
+  while (Date.now() < deadline && !resultText) {
+    const res = await request(baseUrl, "/api/messages?sessionId=project-session:p_alpha");
+    const body = await res.json();
+    resultText = body.messages.find((message) => message.type === "result")?.text || "";
+    if (!resultText) await sleep(40);
+  }
+  assert.equal(resultText, "mirror answer after restart");
+});
+
+test("concurrent client polls share one terminal output read", async (t) => {
+  let outputStarts = 0;
+  const { baseUrl } = await withBridge(t, {
+    agentBackend: "codex_app_server",
+    createCodexAgentProvider: fakeCodexAgentProvider({
+      emitFinalResult: false,
+      promptReturnDelayMs: 10,
+    }),
+    mirrorCodexTui: true,
+    showProjectsFirst: true,
+    waitForPromptResult: false,
+    outputPollIntervalMs: 30000,
+    outputPollAttempts: 0,
+    clientPollOutputBudgetMs: 120,
+    runner: fakeMorpheusRunner({
+      mirrorOutputText: "single flight mirror answer",
+      outputDelayMs: 400,
+      onOutputStart: () => {
+        outputStarts += 1;
+      },
+    }),
+  });
+
+  const prompt = await request(baseUrl, "/api/prompt", {
+    body: {
+      sessionId: "project:p_alpha",
+      text: "single flight",
+      clientRequestId: "single-flight-1",
+    },
+  });
+  assert.equal(prompt.status, 202);
+
+  await Promise.all([
+    request(baseUrl, "/api/messages?sessionId=project-session:p_alpha"),
+    request(baseUrl, "/api/messages?sessionId=project-session:p_alpha"),
+    request(baseUrl, "/api/messages?sessionId=project-session:p_alpha"),
+  ]);
+  assert.equal(outputStarts, 1, "concurrent polls must share one in-flight terminal read");
+
+  await sleep(600);
+  const res = await request(baseUrl, "/api/messages?sessionId=project-session:p_alpha");
+  const body = await res.json();
+  assert.equal(
+    body.messages.find((message) => message.type === "result")?.text,
+    "single flight mirror answer",
+  );
 });

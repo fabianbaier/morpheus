@@ -196,9 +196,15 @@ app-server path from Even Terminal for G2 conversations:
   glasses polling of sessions/messages/status cannot exhaust the stricter
   write budget (`MORPHEUS_G2_RATE_LIMIT_MAX`, default 120/min).
 - Client polls never block on slow terminal-mirror reads for more than
-  `MORPHEUS_G2_CLIENT_POLL_OUTPUT_BUDGET_MS` (default 1500). Past that budget
+  `MORPHEUS_G2_CLIENT_POLL_OUTPUT_BUDGET_MS` (default 800). Past that budget
   the read keeps running in the background and publishes the mirrored text as
   soon as it lands, while the poll returns the buffered state immediately.
+  Concurrent polls share one in-flight terminal read per session, and at most
+  one budgeted read runs per poll request.
+- Mirror tabs are re-attached after a bridge restart: Morpheus snapshot rows
+  expose the exact `codex ... resume <id>` thread id, so existing mirror tabs
+  keep feeding terminal output fallback and re-prompts do not spawn duplicate
+  mirror tabs.
 - `GET /api/sessions/:id/history` returns the recent user/assistant text for
   Even Terminal-compatible clients that refresh completed sessions through
   history instead of the live message stream. When the bridge has a buffered

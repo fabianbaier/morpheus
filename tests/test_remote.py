@@ -146,6 +146,52 @@ class RemoteSurfaceTest(unittest.TestCase):
         assignment = html.split("window.openai.toolOutput =", 1)[1].split(";", 1)[0]
         self.assertNotIn("&quot;", assignment)
 
+    def test_codex_resume_ref_from_command_parses_quoted_resume_ids(self) -> None:
+        thread = "019ebd79-adb0-7982-ad1a-ddd9d877a89e"
+        mirror_cmd = (
+            "cd '/Users/fab/github/morpheus' && codex --remote 'ws://127.0.0.1:8765' "
+            f"-C '/Users/fab/github/morpheus' resume '{thread}'"
+        )
+
+        self.assertEqual(db.codex_resume_ref_from_command(mirror_cmd), thread)
+        self.assertEqual(db.codex_resume_ref_from_command("codex resume --last"), "")
+        self.assertEqual(db.codex_resume_ref_from_command("codex"), "")
+        self.assertEqual(db.codex_resume_ref_from_command(""), "")
+
+    def test_snapshot_sessions_expose_codex_resume_ref_for_mirror_tabs(self) -> None:
+        thread = "019ebd79-adb0-7982-ad1a-ddd9d877a89e"
+        with isolated_remote_runtime():
+            now = time.time()
+            db.upsert(
+                db.Mission(
+                    tab_id="mirror1-tab",
+                    mission_id="m_mirror",
+                    goal="G2: hello",
+                    state="working",
+                    cmd=(
+                        "cd '/tmp/proj' && codex --remote 'ws://127.0.0.1:8765' "
+                        f"-C '/tmp/proj' resume '{thread}'"
+                    ),
+                    buffer_changed_at=now,
+                )
+            )
+            db.upsert(
+                db.Mission(
+                    tab_id="plain1-tab",
+                    mission_id="m_plain",
+                    goal="write docs",
+                    state="working",
+                    cmd="codex",
+                    buffer_changed_at=now,
+                )
+            )
+
+            snapshot = remote.fleet_snapshot(limit=4)
+
+        by_ref = {row["tab_ref"]: row for row in snapshot["sessions"]}
+        self.assertEqual(by_ref["mirror1"]["resume_ref"], thread)
+        self.assertEqual(by_ref["plain1"]["resume_ref"], "")
+
 
 if __name__ == "__main__":
     unittest.main()

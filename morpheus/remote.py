@@ -318,6 +318,9 @@ def _session_rows(missions: list[db.Mission], memories: dict[str, db.MissionMemo
                 "last_event": _shorten(mission.last_event, 96),
                 "age_secs": max(0, int(now - (mission.buffer_changed_at or mission.updated_at or now))),
                 "linked_pr": mission.linked_pr,
+                # Exact codex thread id for `codex ... resume <id>` tabs so the
+                # G2 bridge can re-attach mirror tabs after a bridge restart.
+                "resume_ref": db.codex_resume_ref_from_command(mission.cmd),
             }
         )
     return rows
