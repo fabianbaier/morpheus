@@ -61,6 +61,8 @@ function fakeCodexAgentProvider({
   promptReturnDelayMs = 0,
   throwOnProjectHistory = false,
   throwHistoryFor = [],
+  deltas = null,
+  deltaIntervalMs = 25,
 } = {}) {
   const sessions = [...seedSessions];
   let nextId = 1;
@@ -122,7 +124,19 @@ function fakeCodexAgentProvider({
         emit(id, { type: "status", state: "idle", provider: "codex", sessionId: id });
       };
       const resultDelayMs = typeof asyncResultMs === "function" ? asyncResultMs(text, id) : asyncResultMs;
-      if (resultDelayMs > 0) {
+      const deltaList = typeof deltas === "function" ? deltas(text, id) : deltas;
+      if (Array.isArray(deltaList) && deltaList.length) {
+        // Stream like the real Even Terminal codex provider: deltas carry no
+        // sessionId of their own and arrive after prompt() resolves.
+        (async () => {
+          for (const delta of deltaList) {
+            await sleep(deltaIntervalMs);
+            emit(id, { type: "text_delta", text: String(delta) });
+          }
+          await sleep(Math.max(0, resultDelayMs));
+          finish();
+        })();
+      } else if (resultDelayMs > 0) {
         const timer = setTimeout(finish, resultDelayMs);
         if (typeof timer.unref === "function") timer.unref();
       } else {
@@ -2141,6 +2155,176 @@ test("codex history polling streams final answer when live notification is misse
   assert.equal(
     messagesBody.messages.find((message) => message.type === "result")?.text,
     "answer from persisted codex history",
+  );
+});
+
+test("new session live delta stream is not interrupted by premature poll results", async (t) => {
+  const { baseUrl } = await withBridge(t, {
+    agentBackend: "codex_app_server",
+    createCodexAgentProvider: fakeCodexAgentProvider({
+      deltas: ["Hello ", "from ", "codex ", "live."],
+      deltaIntervalMs: 60,
+      asyncResultMs: 150,
+    }),
+    mirrorCodexTui: false,
+    showProjectsFirst: true,
+    outputPollIntervalMs: 20,
+    outputPollAttempts: 50,
+  });
+
+  const events = await fetch(`${baseUrl}/api/events?sessionId=project:p_alpha&token=${TOKEN}`);
+  assert.equal(events.status, 200);
+  const streamed = readStreamUntil(events.body, "answer for: start new task stream", 3000);
+
+  let polling = true;
+  const pollLoop = (async () => {
+    // The glasses keep polling while the turn streams; each poll used to
+    // publish the partial delta text as a premature result + idle status.
+    while (polling) {
+      await request(baseUrl, "/api/messages?sessionId=project-session:p_alpha");
+      await sleep(25);
+    }
+  })();
+
+  const prompt = await request(baseUrl, "/api/prompt", {
+    body: {
+      sessionId: "project:p_alpha",
+      text: "start new task stream",
+      clientRequestId: "codex-live-delta-stream",
+    },
+  });
+  polling = false;
+  await pollLoop;
+  assert.equal(prompt.status, 202);
+  const promptBody = await prompt.json();
+  assert.equal(promptBody.text, "answer for: start new task stream");
+  assert.equal(promptBody.state, "idle");
+
+  const streamText = await streamed;
+  const deltaOrder = ["Hello ", "from ", "codex ", "live."].map((delta) =>
+    streamText.indexOf(`"type":"text_delta","text":${JSON.stringify(delta)}`),
+  );
+  for (const idx of deltaOrder) assert.notEqual(idx, -1, `missing delta in ${streamText}`);
+  const resultIdx = streamText.indexOf('"type":"result"');
+  assert.notEqual(resultIdx, -1);
+  assert.ok(
+    deltaOrder.every((idx) => idx < resultIdx),
+    `expected all deltas before the result: ${streamText}`,
+  );
+  assert.equal(
+    streamText.indexOf('"type":"result"', resultIdx + 1),
+    -1,
+    `expected exactly one result frame: ${streamText}`,
+  );
+  const idleIdx = streamText.indexOf('"state":"idle"');
+  assert.ok(idleIdx > resultIdx, `expected idle only after the real result: ${streamText}`);
+
+  const messages = await request(baseUrl, "/api/messages?sessionId=project-session:p_alpha");
+  const messagesBody = await messages.json();
+  const results = messagesBody.messages.filter((message) => message.type === "result");
+  assert.equal(results.length, 1);
+  assert.equal(results[0].text, "answer for: start new task stream");
+});
+
+test("follow-up prompt does not republish the previous answer while the new turn runs", async (t) => {
+  const { baseUrl } = await withBridge(t, {
+    agentBackend: "codex_app_server",
+    createCodexAgentProvider: fakeCodexAgentProvider({
+      asyncResultMs: (text) => (text.includes("again") ? 350 : 0),
+    }),
+    mirrorCodexTui: false,
+    showProjectsFirst: true,
+    waitForPromptResult: false,
+    outputPollIntervalMs: 20,
+    outputPollAttempts: 50,
+  });
+
+  const first = await request(baseUrl, "/api/prompt", {
+    body: {
+      sessionId: "project:p_alpha",
+      text: "first question",
+      clientRequestId: "codex-followup-first",
+    },
+  });
+  assert.equal(first.status, 202);
+  await readMessagesUntil(
+    baseUrl,
+    "project-session:p_alpha",
+    (messages) => messages.some((message) => message.type === "result" && message.text === "answer for: first question"),
+  );
+
+  const second = await request(baseUrl, "/api/prompt", {
+    body: {
+      sessionId: "project:p_alpha",
+      text: "ask again",
+      clientRequestId: "codex-followup-second",
+    },
+  });
+  assert.equal(second.status, 202);
+
+  // While the second turn is still running, polls must not republish the
+  // first answer as if it completed the new prompt.
+  const midTurn = Date.now() + 200;
+  while (Date.now() < midTurn) {
+    const poll = await request(baseUrl, "/api/messages?sessionId=project-session:p_alpha");
+    const pollBody = await poll.json();
+    const firstAnswerResults = pollBody.messages.filter(
+      (message) => message.type === "result" && message.text === "answer for: first question",
+    );
+    assert.equal(firstAnswerResults.length, 1, JSON.stringify(pollBody.messages));
+    await sleep(25);
+  }
+
+  const finalBody = await readMessagesUntil(
+    baseUrl,
+    "project-session:p_alpha",
+    (messages) => messages.some((message) => message.type === "result" && message.text === "answer for: ask again"),
+    2000,
+  );
+  assert.equal(
+    finalBody.messages.filter(
+      (message) => message.type === "result" && message.text === "answer for: first question",
+    ).length,
+    1,
+  );
+});
+
+test("history recovery still publishes after the live delta stream goes quiet", async (t) => {
+  const { baseUrl } = await withBridge(t, {
+    agentBackend: "codex_app_server",
+    createCodexAgentProvider: fakeCodexAgentProvider({
+      deltas: ["partial ", "answer ", "text"],
+      deltaIntervalMs: 20,
+      emitFinalResult: false,
+    }),
+    mirrorCodexTui: false,
+    showProjectsFirst: true,
+    waitForPromptResult: false,
+    liveStreamQuietMs: 250,
+    outputPollIntervalMs: 20,
+    outputPollAttempts: 100,
+  });
+
+  const prompt = await request(baseUrl, "/api/prompt", {
+    body: {
+      sessionId: "project:p_alpha",
+      text: "stream dies before the result",
+      clientRequestId: "codex-quiet-recovery",
+    },
+  });
+  assert.equal(prompt.status, 202);
+
+  // The codex result event never arrives; once the stream has been quiet for
+  // liveStreamQuietMs, polling recovery publishes the streamed text.
+  const recovered = await readMessagesUntil(
+    baseUrl,
+    "project-session:p_alpha",
+    (messages) => messages.some((message) => message.type === "result" && message.text === "partial answer text"),
+    2000,
+  );
+  assert.equal(
+    recovered.messages.filter((message) => message.type === "result").length,
+    1,
   );
 });
 

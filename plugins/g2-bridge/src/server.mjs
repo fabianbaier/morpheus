@@ -25,6 +25,7 @@ const DEFAULT_OUTPUT_POLL_INTERVAL_MS = 2000;
 const DEFAULT_OUTPUT_POLL_ATTEMPTS = 45;
 const DEFAULT_CODEX_APP_SERVER_PORT = 8765;
 const DEFAULT_PROMPT_WAIT_FOR_RESULT_MS = 90_000;
+const DEFAULT_LIVE_STREAM_QUIET_MS = 30_000;
 const MAX_MESSAGES_PER_SESSION = 500;
 const AGENT_BACKEND_MORPHEUS = "morpheus";
 const AGENT_BACKEND_CODEX_APP_SERVER = "codex_app_server";
@@ -338,6 +339,92 @@ function latestUserPromptText(state, sessionId) {
     if (msg.type === "result" || msg.type === "error") return "";
   }
   return "";
+}
+
+const LIVE_STREAM_ACTIVITY_TYPES = new Set([
+  "text_delta",
+  "tool_start",
+  "tool_end",
+  "running_stats",
+  "user_prompt",
+  "permission_request",
+  "permission_result",
+  "user_question",
+  "question_answer",
+]);
+
+function isLiveStreamActivityMessage(msg) {
+  if (!msg) return false;
+  if (LIVE_STREAM_ACTIVITY_TYPES.has(msg.type)) return true;
+  if (msg.type === "status") {
+    const state = String(msg.state || "");
+    return state.endsWith("_start") || state.endsWith("_end");
+  }
+  return false;
+}
+
+function messageAtMs(msg) {
+  const parsed = Date.parse(msg?.at || "");
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+// Live-turn view of one session buffer: whether a turn is open (prompt or
+// trailing deltas with no result yet), when that open turn last saw
+// provider-emitted live activity, and where the latest buffered assistant
+// text (result or delta) came from. Bridge-synthetic busy/idle statuses and
+// prompt_submitted/session_started markers do not count as live activity.
+function liveTurnState(state, sessionId) {
+  const messages = getMessages(state, sessionId, 0);
+  let boundaryId = 0;
+  let openByBoundary = false;
+  let trailingDelta = false;
+  let lastLiveAtMs = 0;
+  let latestAssistantSourceId = 0;
+  for (const msg of messages) {
+    if (
+      msg.type === "prompt_submitted" ||
+      msg.type === "user_prompt" ||
+      msg.type === "session_started"
+    ) {
+      const liveAt = msg.type === "user_prompt" ? messageAtMs(msg) : 0;
+      lastLiveAtMs = openByBoundary || trailingDelta ? Math.max(lastLiveAtMs, liveAt) : liveAt;
+      boundaryId = msg.id;
+      openByBoundary = true;
+      continue;
+    }
+    if (msg.type === "result" || msg.type === "error") {
+      openByBoundary = false;
+      trailingDelta = false;
+      lastLiveAtMs = 0;
+      if (msg.type === "result" && msg.text) latestAssistantSourceId = msg.id;
+      continue;
+    }
+    if (msg.type === "text_delta" && msg.text) {
+      trailingDelta = true;
+      latestAssistantSourceId = msg.id;
+    }
+    if ((openByBoundary || trailingDelta) && isLiveStreamActivityMessage(msg)) {
+      lastLiveAtMs = Math.max(lastLiveAtMs, messageAtMs(msg));
+    }
+  }
+  return {
+    open: openByBoundary || trailingDelta,
+    boundaryId,
+    lastLiveAtMs,
+    latestAssistantSourceId,
+  };
+}
+
+// True while live provider events are actively streaming the session's open
+// turn. Poll-driven recovery (history/terminal mirror) must not publish a
+// result then: it would flip the session idle mid-stream with partial or
+// stale text. Recovery resumes once the stream has been quiet for
+// config.liveStreamQuietMs.
+function liveStreamOwnsOpenTurn(state, config, sessionId, turn = null) {
+  const current = turn || liveTurnState(state, sessionId);
+  if (!current.open || !current.lastLiveAtMs) return false;
+  const quietMs = Number(config.liveStreamQuietMs || DEFAULT_LIVE_STREAM_QUIET_MS);
+  return config.clock() - current.lastLiveAtMs < quietMs;
 }
 
 function resolveResultWaiters(state, sessionId, msg) {
@@ -2701,6 +2788,12 @@ async function refreshSessionOutput({ provider, state, config, sessionId, publis
       state.outputHashes.set(sessionId, fingerprint);
       return normalizedResult;
     }
+    if (liveStreamOwnsOpenTurn(state, config, sessionId)) {
+      // Leave the output hash untouched so recovery can still publish this
+      // text once the live stream goes quiet.
+      bridgeDebug(config, "output-publish-deferred-live-turn", { sessionId });
+      return normalizedResult;
+    }
     // Morpheus marks an open interactive Codex tab as "working" even after the
     // answer is visible and the TUI is waiting for the next prompt. The terminal
     // text itself is the stronger live signal for G2, so publish it instead of
@@ -2729,6 +2822,34 @@ async function refreshSessionHistory({
     const history = await provider.getHistory(sessionId, 10, { allowOutputFallback });
     const text = latestHistoryText(history, "assistant");
     if (!text) return { history, text: "", published: false };
+    const turn = liveTurnState(state, sessionId);
+    if (turn.open) {
+      if (liveStreamOwnsOpenTurn(state, config, sessionId, turn)) {
+        bridgeDebug(config, "history-publish-deferred-live-turn", {
+          sessionId,
+          boundaryId: turn.boundaryId,
+          lastLiveAtMs: turn.lastLiveAtMs,
+        });
+        return { history, text, published: false, deferred: "live_turn_streaming" };
+      }
+      // The newest buffered assistant text predates the open turn, so it is
+      // the previous turn's answer, not this turn's. Return empty text so the
+      // caller can still fall back to terminal mirror output for recovery.
+      const buffered = historyFromBufferedMessages(getMessages(state, sessionId, 0), 10);
+      if (
+        hasAssistantHistory(buffered) &&
+        latestHistoryText(buffered, "assistant") === text &&
+        turn.latestAssistantSourceId &&
+        turn.latestAssistantSourceId <= turn.boundaryId
+      ) {
+        bridgeDebug(config, "history-publish-skipped-previous-turn", {
+          sessionId,
+          boundaryId: turn.boundaryId,
+          latestAssistantSourceId: turn.latestAssistantSourceId,
+        });
+        return { history, text: "", published: false, skipped: "previous_turn_history" };
+      }
+    }
     const published = publishAssistantResultIfNew(state, config, sessionId, text, provider.name || "codex");
     return { history, text, published };
   } catch (err) {
@@ -3409,6 +3530,12 @@ function buildConfigFromEnv(env = process.env, argv = process.argv.slice(2)) {
       "MORPHEUS_G2_OUTPUT_POLL_ATTEMPTS",
       DEFAULT_OUTPUT_POLL_ATTEMPTS,
       { min: 1, max: 300 },
+    ),
+    liveStreamQuietMs: envInt(
+      env,
+      "MORPHEUS_G2_LIVE_STREAM_QUIET_MS",
+      DEFAULT_LIVE_STREAM_QUIET_MS,
+      { min: 250, max: 10 * 60_000 },
     ),
     codexAppServerPort: envInt(
       env,

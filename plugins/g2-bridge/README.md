@@ -189,6 +189,14 @@ app-server path from Even Terminal for G2 conversations:
   `text_delta`, tool/status events, final `result`, then `status: idle`. This
   matches Even Terminal's Codex provider and does not depend on terminal output
   polling.
+- While a turn is actively streaming live events (`text_delta`, tool events,
+  running stats), poll-driven recovery from Codex history or terminal mirror
+  output stays quiet so it cannot publish a partial or stale answer as a
+  premature `result` + `status: idle` mid-stream. Recovery publishing resumes
+  once the live stream has been silent for
+  `MORPHEUS_G2_LIVE_STREAM_QUIET_MS` (default 30000), so sessions whose
+  notifications die mid-turn still get their answer from history/mirror
+  polling.
 - `GET /api/sessions/:id/history` returns the recent user/assistant text for
   Even Terminal-compatible clients that refresh completed sessions through
   history instead of the live message stream. When the bridge has a buffered
