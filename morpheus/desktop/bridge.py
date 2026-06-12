@@ -256,6 +256,16 @@ def goals(include_finished: bool = True, tenant_id: Optional[str] = None) -> lis
     return out
 
 
+def _due_in(next_run_at: float, now: float) -> str:
+    """Human countdown to the next run — '' when unset, 'due' when past."""
+    if not next_run_at:
+        return ""
+    delta = next_run_at - now
+    if delta <= 0:
+        return "due"
+    return naming.format_age(delta)
+
+
 def loops(include_paused: bool = True, tenant_id: str = "") -> list[dict[str, Any]]:
     now = time.time()
     out = []
@@ -269,8 +279,9 @@ def loops(include_paused: bool = True, tenant_id: str = "") -> list[dict[str, An
                 "interval_seconds": lp.interval_seconds,
                 "status": lp.status,
                 "next_run_at": lp.next_run_at,
-                "next_due": _age(lp.next_run_at, now) if lp.next_run_at else "",
+                "next_due": _due_in(lp.next_run_at, now),
                 "due_now": bool(lp.next_run_at and lp.next_run_at <= now and lp.status == "active"),
+                "running": lp.last_run_status == "running",
                 "last_run_at": lp.last_run_at,
                 "last_run_status": lp.last_run_status,
                 "last_summary": lp.last_summary,
@@ -551,8 +562,9 @@ def _loop_dict(lp: db.PromptLoop, now: Optional[float] = None) -> dict[str, Any]
         "interval": loops_mod.format_interval(lp.interval_seconds),
         "status": lp.status,
         "next_run_at": lp.next_run_at,
-        "next_due": _age(lp.next_run_at, now) if lp.next_run_at else "",
+        "next_due": _due_in(lp.next_run_at, now),
         "due_now": bool(lp.next_run_at and lp.next_run_at <= now and lp.status == "active"),
+        "running": lp.last_run_status == "running",
         "last_run_at": lp.last_run_at,
         "last_run_status": lp.last_run_status,
         "last_summary": lp.last_summary,
@@ -618,8 +630,15 @@ def loop_create(name: str, prompt: str, every: str = "30m",
     return result
 
 
-def loop_action(loop_id: int, action: str, *, timeout: int = 120) -> dict[str, Any]:
-    """pause | resume | delete | run_now — the TUI's loop verbs."""
+def loop_action(loop_id: int, action: str, *, timeout: int = 0,
+                wait: bool = False) -> dict[str, Any]:
+    """pause | resume | delete | run_now — the TUI's loop verbs.
+
+    ``run_now`` starts the run in a background thread and returns immediately
+    (agent runs can take many minutes; blocking the HTTP request was both bad UX
+    and a thread hog). The UI watches the loop's ``running`` flag / run history
+    for completion. ``wait=True`` keeps the old synchronous behaviour for tests.
+    """
     from morpheus import loops as loops_mod
 
     lp = db.get_loop(loop_id)
@@ -635,14 +654,44 @@ def loop_action(loop_id: int, action: str, *, timeout: int = 120) -> dict[str, A
         db.delete_loop(loop_id)
         return {"ok": True, "deleted": True}
     if action == "run_now":
-        try:
-            # run_loop publishes the result itself (notes + feed routing).
-            run = loops_mod.run_loop(lp, timeout=timeout)
-            return {"ok": run.status in ("ok", "success"), "status": run.status,
-                    "summary": run.summary, "exit_code": run.exit_code}
-        except Exception as e:
-            return {"ok": False, "error": str(e)}
+        if lp.last_run_status == "running":
+            return {"ok": False, "error": "a run is already in progress"}
+        run_timeout = timeout or loops_mod.DEFAULT_TIMEOUT_SECONDS
+        if wait:
+            try:
+                # run_loop publishes the result itself (notes + feed routing).
+                run = loops_mod.run_loop(lp, timeout=run_timeout)
+                return {"ok": run.status in ("ok", "success"), "status": run.status,
+                        "summary": run.summary, "exit_code": run.exit_code}
+            except Exception as e:
+                return {"ok": False, "error": str(e)}
+        import threading
+
+        def _bg():
+            try:
+                loops_mod.run_loop(lp, timeout=run_timeout)
+            except Exception:
+                pass
+
+        threading.Thread(target=_bg, daemon=True,
+                         name=f"loop-run-{loop_id}").start()
+        return {"ok": True, "started": True, "status": "running"}
     return {"ok": False, "error": f"unknown action '{action}'"}
+
+
+def loop_run_output(loop_id: int, run_id: int, *, tail_chars: int = 20000) -> dict[str, Any]:
+    """The captured output of one loop run — how you 'look inside' a headless run."""
+    from morpheus import loops as loops_mod
+    from pathlib import Path
+
+    run = db.get_loop_run(run_id)
+    if run is None or run.loop_id != loop_id:
+        return {"ok": False, "error": "run not found"}
+    text = loops_mod._read_output(Path(run.output_path)) if run.output_path else ""
+    if len(text) > tail_chars:
+        text = "…(truncated)…\n" + text[-tail_chars:]
+    return {"ok": True, "run_id": run_id, "status": run.status,
+            "output": text or "(no output captured)"}
 
 
 def loop_set_feed_rule(loop_id: int, policy: str, pattern: str = "") -> dict[str, Any]:

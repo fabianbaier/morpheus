@@ -341,3 +341,19 @@ body {
 }
 .form-hint { font-size: 11px; color: var(--muted); }
 .form-actions { display: flex; justify-content: flex-end; gap: 10px; margin-top: 16px; }
+
+/* ── Loop running state + run output ── */
+.running-badge {
+  font-size: 12px; color: var(--accent); font-family: var(--font-mono);
+  margin-left: 10px; animation: pulse 1.4s infinite;
+}
+.running-glyph { color: var(--accent); animation: pulse 1.4s infinite; }
+@keyframes pulse { 0%,100%{opacity:.45} 50%{opacity:1} }
+.run-click { cursor: pointer; border-radius: 6px; }
+.run-click:hover { background: var(--surface-2); }
+.run-output {
+  background: #0d120f; border: 1px solid var(--border); border-radius: 8px;
+  padding: 10px 12px; margin: 2px 0 8px 16px; font-family: var(--font-mono);
+  font-size: 11.5px; color: var(--text-2); white-space: pre-wrap;
+  max-height: 320px; overflow: auto;
+}

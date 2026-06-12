@@ -181,10 +181,10 @@ if (typeof document !== "undefined") {
     if (!lp.length) loops.appendChild(el("div", "empty-line", "No loops."));
     for (const l of lp) {
       const item = el("button", "nav-item");
-      const mark = l.status === "active" ? "↻" : "‖";
-      item.innerHTML = `<span class="nav-emoji">${mark}</span>
+      const mark = l.running ? "●" : l.status === "active" ? "↻" : "‖";
+      item.innerHTML = `<span class="nav-emoji ${l.running ? "running-glyph" : ""}">${mark}</span>
         <span class="nav-goal">${escapeHtml(l.name)}</span>
-        <span class="nav-age">${escapeHtml(l.next_due || "")}</span>`;
+        <span class="nav-age">${l.running ? "running" : escapeHtml(l.next_due || "")}</span>`;
       item.onclick = () => selectLoop(l.id);
       loops.appendChild(item);
     }
@@ -387,6 +387,7 @@ if (typeof document !== "undefined") {
   // ── views ──
   const VIEWS = ["chat", "session", "cockpit", "feed", "loop", "goal"];
   function showView(v) {
+    if (v !== "loop" && typeof stopLoopPoll === "function") stopLoopPoll();
     state.view = v;
     for (const name of VIEWS) {
       const elv = $("view-" + name);
@@ -513,29 +514,37 @@ if (typeof document !== "undefined") {
   }
 
   // ── loop detail view ──
-  async function selectLoop(loopId) {
+  let loopPollTimer = null;
+  function stopLoopPoll() { if (loopPollTimer) { clearTimeout(loopPollTimer); loopPollTimer = null; } }
+
+  async function selectLoop(loopId, { quiet = false } = {}) {
+    stopLoopPoll();
     showView("loop");
     const v = $("view-loop");
-    v.innerHTML = `<div class="detail-head"><h2>loading…</h2></div>`;
+    if (!quiet) v.innerHTML = `<div class="detail-head"><h2>loading…</h2></div>`;
     let d;
     try { d = await api("/api/loops/" + loopId); }
     catch (e) { v.innerHTML = `<div class="detail-head"><h2>loop not found</h2></div>`; return; }
-    const mark = d.status === "active" ? "↻" : "‖";
+    const mark = d.running ? "●" : d.status === "active" ? "↻" : "‖";
+    const runDot = (s) => s === "success" ? "dot-working" : s === "running" ? "dot-idle" : "dot-blocked";
     const runs = (d.runs || []).map((r) =>
-      `<div class="run-row"><span class="run-dot ${r.status === "success" ? "dot-working" : "dot-blocked"}"></span>
-       <span class="run-summary">${escapeHtml(r.summary || "(no summary)")}</span>
+      `<div class="run-row run-click" data-run-id="${r.id}" title="Click to view output">
+       <span class="run-dot ${runDot(r.status)}"></span>
+       <span class="run-summary">${r.status === "running" ? "● running… " : ""}${escapeHtml(r.summary || "(no summary)")}</span>
        <span class="run-age">${escapeHtml(r.age || "")}</span></div>`).join("")
       || `<div class="empty-line">No runs yet.</div>`;
     const rulePolicy = d.feed_rule ? d.feed_rule.policy : "";
     v.innerHTML = `
       <div class="detail-head">
-        <h2>${mark} ${escapeHtml(d.name)}</h2>
+        <h2>${mark} ${escapeHtml(d.name)}
+          ${d.running ? `<span class="running-badge">● running…</span>` : ""}</h2>
         <div class="meta">${escapeHtml(d.status)} · every ${escapeHtml(d.interval)} ·
           next ${escapeHtml(d.next_due || "now")}</div>
         <div class="detail-actions">
           <button class="btn-ghost" data-act="${d.status === "active" ? "pause" : "resume"}">
             ${d.status === "active" ? "‖ Pause" : "↻ Resume"}</button>
-          <button class="btn-ghost" data-act="run_now">▶ Run now</button>
+          <button class="btn-ghost" data-act="run_now" ${d.running ? "disabled" : ""}>
+            ${d.running ? "● running…" : "▶ Run now"}</button>
           <button class="btn-ghost btn-danger" data-act="delete">✕ Delete</button>
         </div>
       </div>
@@ -554,7 +563,7 @@ if (typeof document !== "undefined") {
             value="${escapeHtml(d.feed_rule?.pattern || "")}" />
           <button class="btn-ghost" id="loop-feed-save">Save</button>
         </div>
-        <div class="mc-section-head">Run history</div>
+        <div class="mc-section-head">Run history <span class="form-hint">(click a run to see its output)</span></div>
         <div class="run-list">${runs}</div>
       </div>`;
     for (const btn of v.querySelectorAll("[data-act]")) {
@@ -562,12 +571,28 @@ if (typeof document !== "undefined") {
         const act = btn.dataset.act;
         if (act === "delete" && !confirm(`Delete loop "${d.name}"?`)) return;
         btn.disabled = true;
+        if (act === "run_now") btn.textContent = "▶ starting…";
         const r = await api(`/api/loops/${loopId}/action`, {
           method: "POST", body: JSON.stringify({ action: act }) });
         if (!r.ok && r.error) toast(r.error, "blocked");
-        else toast(act === "run_now" ? `Run: ${r.summary || r.status}` : `Loop ${r.status || "deleted"}`);
+        else if (act === "run_now") toast(`▶ Run started — watching for the result…`);
+        else toast(`Loop ${r.status || "deleted"}`);
         await refresh();
-        if (act === "delete") showView("chat"); else selectLoop(loopId);
+        if (act === "delete") showView("chat"); else selectLoop(loopId, { quiet: true });
+      };
+    }
+    // expandable run output
+    for (const row of v.querySelectorAll(".run-click")) {
+      row.onclick = async () => {
+        const existing = row.nextElementSibling;
+        if (existing && existing.classList.contains("run-output")) { existing.remove(); return; }
+        const rid = row.dataset.runId;
+        const out = el("pre", "run-output", "loading…");
+        row.after(out);
+        try {
+          const r = await api(`/api/loops/${loopId}/runs/${rid}/output`);
+          out.textContent = r.output || "(no output)";
+        } catch { out.textContent = "(output unavailable)"; }
       };
     }
     v.querySelector("#loop-feed-save").onclick = async () => {
@@ -578,6 +603,10 @@ if (typeof document !== "undefined") {
       toast(r.ok ? (policy ? `Pushing to feed: ${policy}` : "Feed push disabled")
                  : (r.error || "failed"), r.ok ? "" : "blocked");
     };
+    // While a run is in flight, keep the view fresh so completion shows up.
+    if (d.running && state.view === "loop") {
+      loopPollTimer = setTimeout(() => selectLoop(loopId, { quiet: true }), 4000);
+    }
   }
 
   // ── goal detail view ──
@@ -641,9 +670,9 @@ if (typeof document !== "undefined") {
        <span class="run-age mono">${g.turns_used}/${g.max_turns}</span></div>`).join("")
       || `<div class="empty-line">No goals.</div>`;
     const loops = (f.loops || []).map((l) =>
-      `<div class="run-row"><span>${l.status === "active" ? "↻" : "‖"}</span>
-       <span class="run-summary">${escapeHtml(l.name)} — ${escapeHtml(l.last_summary || "no runs yet")}</span>
-       <span class="run-age">${escapeHtml(l.next_due || "")}</span></div>`).join("")
+      `<div class="run-row"><span>${l.running ? "●" : l.status === "active" ? "↻" : "‖"}</span>
+       <span class="run-summary">${escapeHtml(l.name)} — ${l.running ? "running now…" : escapeHtml(l.last_summary || "no runs yet")}</span>
+       <span class="run-age">${l.running ? "" : escapeHtml(l.next_due || "")}</span></div>`).join("")
       || `<div class="empty-line">No loops.</div>`;
     const feed = (state.feedItems || []).slice(0, 8).map((it) =>
       `<div class="run-row"><span>${it.priority > 0 ? "❗" : "·"}</span>

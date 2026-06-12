@@ -173,18 +173,72 @@ class BridgeLoopsTest(unittest.TestCase):
         with _TempDB():
             # command is `echo`, so the run executes anywhere and succeeds
             lid = bridge.loop_create("echoer", "hello-from-loop", command="echo")["loop"]["id"]
-            r = bridge.loop_action(lid, "run_now")
+            r = bridge.loop_action(lid, "run_now", wait=True)
             self.assertTrue(r["ok"], r)
             detail = bridge.loop_detail(lid)
             self.assertEqual(len(detail["runs"]), 1)
             self.assertEqual(detail["runs"][0]["status"], "success")
+
+    def test_loop_run_now_async_returns_started(self):
+        import time as _time
+        with _TempDB():
+            lid = bridge.loop_create("echoer", "bg hello", command="echo")["loop"]["id"]
+            r = bridge.loop_action(lid, "run_now")
+            self.assertTrue(r["ok"], r)
+            self.assertTrue(r["started"])
+            # the background run finishes quickly (echo); wait for it
+            for _ in range(50):
+                detail = bridge.loop_detail(lid)
+                if detail["runs"] and detail["runs"][0]["status"] != "running":
+                    break
+                _time.sleep(0.1)
+            self.assertEqual(detail["runs"][0]["status"], "success")
+            self.assertFalse(detail["running"])
+
+    def test_loop_run_now_rejected_while_running(self):
+        with _TempDB():
+            lid = bridge.loop_create("x", "p", command="echo")["loop"]["id"]
+            from morpheus import db as _db
+            _db.mark_loop_running(lid, started_at=1.0, next_run_at=2.0)
+            r = bridge.loop_action(lid, "run_now")
+            self.assertFalse(r["ok"])
+            self.assertIn("already", r["error"])
+            detail = bridge.loop_detail(lid)
+            self.assertTrue(detail["running"])
+
+    def test_loop_run_output(self):
+        with _TempDB():
+            lid = bridge.loop_create("echoer", "peek-at-me", command="echo")["loop"]["id"]
+            bridge.loop_action(lid, "run_now", wait=True)
+            run_id = bridge.loop_detail(lid)["runs"][0]["id"]
+            r = bridge.loop_run_output(lid, run_id)
+            self.assertTrue(r["ok"], r)
+            self.assertIn("peek-at-me", r["output"])
+            self.assertFalse(bridge.loop_run_output(lid, 9999)["ok"])
+            self.assertFalse(bridge.loop_run_output(lid + 1, run_id)["ok"])
+
+    def test_loop_next_due_counts_down_not_negative(self):
+        import time as _time
+        with _TempDB():
+            lid = bridge.loop_create("x", "p", every="30m")["loop"]["id"]
+            db.update_loop_after_run(lid, last_run_at=_time.time(),
+                                     next_run_at=_time.time() + 1751,
+                                     last_run_status="success", last_summary="ok")
+            detail = bridge.loop_detail(lid)
+            self.assertNotIn("-", detail["next_due"])
+            self.assertEqual(detail["next_due"], "29m")
+            # past-due shows 'due', never a negative age
+            db.update_loop_after_run(lid, last_run_at=_time.time(),
+                                     next_run_at=_time.time() - 60,
+                                     last_run_status="success", last_summary="ok")
+            self.assertEqual(bridge.loop_detail(lid)["next_due"], "due")
 
     def test_loop_run_now_routes_to_feed_exactly_once(self):
         from morpheus import feeds
         with _TempDB():
             lid = bridge.loop_create("echoer", "BREAKING hello", command="echo",
                                      feed_policy="always")["loop"]["id"]
-            bridge.loop_action(lid, "run_now")
+            bridge.loop_action(lid, "run_now", wait=True)
             # run_loop publishes internally; the bridge must not double-publish
             self.assertEqual(len(feeds.recent()), 1)
 

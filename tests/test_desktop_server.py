@@ -191,6 +191,18 @@ class DispatchRouteTest(unittest.TestCase):
             self.assertEqual(_get("/api/loops/999", AUTH)[0], 404)
             self.assertEqual(_post("/api/loops/xyz/action", {"action": "pause"}, AUTH)[0], 400)
 
+    def test_loop_run_output_route(self):
+        from morpheus.desktop import bridge
+        with _TempDB():
+            lid = bridge.loop_create("echoer", "served-output", command="echo")["loop"]["id"]
+            bridge.loop_action(lid, "run_now", wait=True)
+            rid = bridge.loop_detail(lid)["runs"][0]["id"]
+            status, _, body = _get(f"/api/loops/{lid}/runs/{rid}/output", AUTH)
+            self.assertEqual(status, 200)
+            self.assertIn("served-output", json.loads(body)["output"])
+            self.assertEqual(_get(f"/api/loops/{lid}/runs/9999/output", AUTH)[0], 404)
+            self.assertEqual(_get(f"/api/loops/{lid}/runs/abc/output", AUTH)[0], 400)
+
     def test_stream_requires_auth(self):
         # dispatch returns 200 placeholder for an authorized stream request
         self.assertEqual(_get("/api/stream")[0], 401)

@@ -194,8 +194,20 @@ def _route_api_get(path: str, query: dict[str, list[str]]) -> tuple[int, dict[st
     if path == "/api/agents":
         return _json(200, {"agents": agents.available_agents(), "cwd": os.getcwd()})
     if path.startswith("/api/loops/"):
+        rest = path[len("/api/loops/"):]
+        # /api/loops/{id}/runs/{run_id}/output → captured run output (text)
+        parts = rest.split("/")
+        if len(parts) == 4 and parts[1] == "runs" and parts[3] == "output":
+            try:
+                loop_id, run_id = int(parts[0]), int(parts[2])
+            except ValueError:
+                return _err(400, "bad loop/run id")
+            result = bridge.loop_run_output(loop_id, run_id)
+            if not result.get("ok"):
+                return _err(404, result.get("error", "not found"))
+            return _json(200, result)
         try:
-            loop_id = int(path[len("/api/loops/"):])
+            loop_id = int(rest)
         except ValueError:
             return _err(400, "bad loop id")
         detail = bridge.loop_detail(loop_id)
