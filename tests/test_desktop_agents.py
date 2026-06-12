@@ -95,9 +95,30 @@ class RegistryTest(unittest.TestCase):
     def test_available_agents_lists_known_clis(self):
         kinds = {a["kind"] for a in agents.available_agents()}
         self.assertEqual(kinds, {"claude", "codex", "gemini"})
+        for a in agents.available_agents():
+            self.assertIn("executable", a)
 
     def test_get_adapter_unknown(self):
         self.assertIsNone(agents.get_adapter("nope"))
+
+    def test_resolve_executable_falls_back_to_common_dirs(self):
+        # Simulate a launchd-style minimal PATH: which() misses the CLI, but it
+        # lives in a known install dir → still resolved.
+        with tempfile.TemporaryDirectory() as tmp:
+            fake = Path(tmp) / "claude"
+            fake.write_text("#!/bin/sh\n")
+            fake.chmod(0o755)
+            with patch.object(agents.shutil, "which", return_value=None), \
+                 patch.object(agents, "_COMMON_BIN_DIRS", (tmp,)):
+                self.assertEqual(agents._resolve_executable("claude"), str(fake))
+                self.assertTrue(agents.ClaudeAdapter().is_available())
+                self.assertEqual(agents.ClaudeAdapter().build_command("hi")[0], str(fake))
+
+    def test_resolve_executable_missing_everywhere(self):
+        with patch.object(agents.shutil, "which", return_value=None), \
+             patch.object(agents, "_COMMON_BIN_DIRS", ()):
+            self.assertEqual(agents._resolve_executable("claude"), "")
+            self.assertFalse(agents.ClaudeAdapter().is_available())
 
 
 class RunTurnTest(unittest.TestCase):

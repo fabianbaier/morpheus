@@ -261,7 +261,19 @@ if (typeof document !== "undefined") {
         thinking.querySelector(".msg-body").innerHTML = `Note posted.`;
       } else {
         const r = await api("/api/chat", { method: "POST", body: JSON.stringify({ message }) });
-        thinking.querySelector(".msg-body").innerHTML = renderMarkdown(r.answer || "");
+        const bodyEl = thinking.querySelector(".msg-body");
+        bodyEl.innerHTML = renderMarkdown(r.answer || "");
+        // Ask Morpheus answers from the fleet snapshot only. If a live agent
+        // CLI is installed, offer a one-click re-run with real tools/web.
+        const live = bestLiveAgent();
+        if (live) {
+          const actions = el("div", "msg-actions");
+          const chip = el("button", "chip",
+            `🔎 Re-run with ${escapeHtml(live.label)} (tools + web search)`);
+          chip.onclick = () => switchAgentAndResend(live.kind, message);
+          actions.appendChild(chip);
+          bodyEl.appendChild(actions);
+        }
       }
     } catch (e) {
       thinking.querySelector(".msg-body").innerHTML = `<span style="color:var(--blocked)">Error: ${escapeHtml(e.message)}</span>`;
@@ -876,15 +888,35 @@ if (typeof document !== "undefined") {
     } catch { state.agents = []; }
     const sel = $("agent-select");
     sel.innerHTML = "";
-    const ask = el("option", null, "✦ Ask Morpheus");
+    const ask = el("option", null, "✦ Ask Morpheus (fleet only)");
     ask.value = "ask"; sel.appendChild(ask);
     for (const a of state.agents) {
       const o = el("option", null, (a.available ? "" : "○ ") + a.label + (a.available ? "" : " (not installed)"));
       o.value = a.kind; o.disabled = !a.available;
       sel.appendChild(o);
     }
+    // Default to the best live agent when one is installed: the chat should
+    // feel like Claude Code out of the box — real tool use + web search.
+    // "Ask Morpheus" stays one click away for instant, free fleet answers.
+    if (state.agent === "ask") {
+      const live = state.agents.find((a) => a.available && a.structured)
+        || state.agents.find((a) => a.available);
+      if (live) state.agent = live.kind;
+    }
     sel.value = state.agent;
     onAgentChanged();
+  }
+
+  function bestLiveAgent() {
+    return state.agents.find((a) => a.available && a.structured)
+      || state.agents.find((a) => a.available) || null;
+  }
+
+  function switchAgentAndResend(kind, message) {
+    state.agent = kind;
+    $("agent-select").value = kind;
+    onAgentChanged();
+    sendChat(message);
   }
 
   function onAgentChanged() {

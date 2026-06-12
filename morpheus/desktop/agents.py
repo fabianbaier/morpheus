@@ -59,6 +59,30 @@ def _summarize_tool_input(name: str, inp: dict[str, Any]) -> str:
     return ", ".join(f"{k}={v}" for k, v in list(inp.items())[:2])[:120]
 
 
+# When the bridge is launched outside a login shell (launchd daemon, the
+# Electron shell, an IDE), PATH is often minimal and misses where agent CLIs
+# actually live. Fall back to the usual install locations so the picker doesn't
+# grey out a CLI the user definitely has.
+_COMMON_BIN_DIRS = (
+    "/opt/homebrew/bin",
+    "/usr/local/bin",
+    os.path.expanduser("~/.local/bin"),
+    os.path.expanduser("~/.npm-global/bin"),
+    os.path.expanduser("~/bin"),
+)
+
+
+def _resolve_executable(name: str) -> str:
+    found = shutil.which(name)
+    if found:
+        return found
+    for d in _COMMON_BIN_DIRS:
+        cand = os.path.join(d, name)
+        if os.path.isfile(cand) and os.access(cand, os.X_OK):
+            return cand
+    return ""
+
+
 # ───────────────────────── adapters ─────────────────────────
 
 
@@ -72,8 +96,11 @@ class AgentAdapter:
     supports_resume: bool = False
     structured: bool = True  # emits parseable tool events vs. plain text
 
+    def resolved_executable(self) -> str:
+        return _resolve_executable(self.executable)
+
     def is_available(self) -> bool:
-        return shutil.which(self.executable) is not None
+        return bool(self.resolved_executable())
 
     def build_command(self, message: str, *, session_ref: str = "",
                       permission_mode: str = "default",
@@ -92,7 +119,7 @@ class ClaudeAdapter(AgentAdapter):
 
     def build_command(self, message, *, session_ref="", permission_mode="default",
                       allowed_tools=None, model=""):
-        cmd = [self.executable, "-p", message,
+        cmd = [self.resolved_executable() or self.executable, "-p", message,
                "--output-format", "stream-json", "--verbose"]
         if session_ref:
             cmd += ["--resume", session_ref]
@@ -168,7 +195,7 @@ class CodexAdapter(AgentAdapter):
 
     def build_command(self, message, *, session_ref="", permission_mode="default",
                       allowed_tools=None, model=""):
-        cmd = [self.executable, "exec", "--json"]
+        cmd = [self.resolved_executable() or self.executable, "exec", "--json"]
         if session_ref:
             cmd += ["resume", session_ref]
         if model:
@@ -222,7 +249,7 @@ class TextAgentAdapter(AgentAdapter):
 
     def build_command(self, message, *, session_ref="", permission_mode="default",
                       allowed_tools=None, model=""):
-        cmd = [self.executable, "-p", message]
+        cmd = [self.resolved_executable() or self.executable, "-p", message]
         if model:
             cmd += ["-m", model]
         return cmd
@@ -271,7 +298,9 @@ def available_agents() -> list[dict[str, Any]]:
     out = []
     for kind, factory in _ADAPTERS.items():
         a = factory()
-        out.append({"kind": kind, "label": a.label, "available": a.is_available(),
+        resolved = a.resolved_executable()
+        out.append({"kind": kind, "label": a.label, "available": bool(resolved),
+                    "executable": resolved,
                     "supports_resume": a.supports_resume, "structured": a.structured})
     return out
 
