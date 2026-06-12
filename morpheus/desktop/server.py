@@ -193,6 +193,33 @@ def _route_api_get(path: str, query: dict[str, list[str]]) -> tuple[int, dict[st
         return _json(200, {"projects": bridge.projects()})
     if path == "/api/agents":
         return _json(200, {"agents": agents.available_agents(), "cwd": os.getcwd()})
+    if path.startswith("/api/loops/"):
+        try:
+            loop_id = int(path[len("/api/loops/"):])
+        except ValueError:
+            return _err(400, "bad loop id")
+        detail = bridge.loop_detail(loop_id)
+        if detail is None:
+            return _err(404, "loop not found")
+        return _json(200, detail)
+    if path == "/api/feed":
+        try:
+            limit = int(q("limit", "50"))
+            since = int(q("since_id", "0"))
+        except ValueError:
+            return _err(400, "bad limit/since_id")
+        return _json(200, {"items": bridge.feed_items(limit=limit, since_id=since)})
+    if path == "/api/feed/text":
+        # Ultra-condensed plain text — the endpoint a minimal client (AR glasses,
+        # a watch, curl) polls. One line per item, newest first.
+        try:
+            limit = int(q("limit", "20"))
+        except ValueError:
+            return _err(400, "bad limit")
+        text = bridge.feed_text(limit=limit)
+        return 200, {"Content-Type": "text/plain; charset=utf-8"}, text.encode("utf-8")
+    if path == "/api/feed/rules":
+        return _json(200, {"rules": bridge.feed_rules_list()})
     return _err(404, "not found")
 
 
@@ -224,6 +251,47 @@ def _route_api_post(path: str, data: dict[str, Any]) -> tuple[int, dict[str, str
             str(data.get("tab_id", "")),
             str(data.get("text", "")),
             submit=bool(data.get("submit", True)),
+        ))
+    if path == "/api/loops":
+        return _json(200, bridge.loop_create(
+            str(data.get("name", "")),
+            str(data.get("prompt", "")),
+            every=str(data.get("every", "30m")),
+            command=str(data.get("command", "")),
+            feed_policy=str(data.get("feed_policy", "")),
+            feed_pattern=str(data.get("feed_pattern", "")),
+        ))
+    if path.startswith("/api/loops/") and path.endswith("/action"):
+        try:
+            loop_id = int(path[len("/api/loops/"):-len("/action")])
+        except ValueError:
+            return _err(400, "bad loop id")
+        return _json(200, bridge.loop_action(loop_id, str(data.get("action", ""))))
+    if path.startswith("/api/loops/") and path.endswith("/feed-rule"):
+        try:
+            loop_id = int(path[len("/api/loops/"):-len("/feed-rule")])
+        except ValueError:
+            return _err(400, "bad loop id")
+        return _json(200, bridge.loop_set_feed_rule(
+            loop_id, str(data.get("policy", "")), str(data.get("pattern", ""))))
+    if path == "/api/goals":
+        return _json(200, bridge.goal_create(
+            str(data.get("objective", "")),
+            done_definition=str(data.get("done_definition", "")),
+            source=str(data.get("source", "")),
+            autonomy_level=str(data.get("autonomy_level", "ask_to_spawn")),
+            max_turns=int(data.get("max_turns", 20) or 20),
+            max_workers=int(data.get("max_workers", 3) or 3),
+        ))
+    if path.startswith("/api/goals/") and path.endswith("/action"):
+        goal_ref = path[len("/api/goals/"):-len("/action")]
+        return _json(200, bridge.goal_action(
+            goal_ref, str(data.get("action", "")), reason=str(data.get("reason", ""))))
+    if path == "/api/feed":
+        return _json(200, bridge.feed_post(
+            str(data.get("title", "")),
+            str(data.get("body", "")),
+            priority=int(data.get("priority", 0) or 0),
         ))
     return _err(404, "not found")
 
@@ -362,8 +430,11 @@ def make_handler(cfg: Config) -> type[BaseHTTPRequestHandler]:
                     sse_clients["count"] -= 1
 
         def _stream_loop(self):
+            from morpheus import feeds
+
             last_sig = None
             last_beat = 0.0
+            last_feed_id = feeds.latest_id()
             while True:
                 snapshot = bridge.fleet()
                 sig = fleet_signature(snapshot)
@@ -374,7 +445,16 @@ def make_handler(cfg: Config) -> type[BaseHTTPRequestHandler]:
                     self.wfile.write(chunk.encode("utf-8"))
                     self.wfile.flush()
                     last_beat = now
-                elif now - last_beat >= _SSE_HEARTBEAT_SECS:
+                # Push newly arrived feed items as their own event so a feed
+                # subscriber (desktop, glasses relay) gets them immediately.
+                new_items = bridge.feed_items(limit=20, since_id=last_feed_id)
+                if new_items:
+                    last_feed_id = max(it["id"] for it in new_items)
+                    chunk = f"event: feed\ndata: {json.dumps({'items': new_items})}\n\n"
+                    self.wfile.write(chunk.encode("utf-8"))
+                    self.wfile.flush()
+                    last_beat = now
+                if now - last_beat >= _SSE_HEARTBEAT_SECS:
                     self.wfile.write(b": heartbeat\n\n")
                     self.wfile.flush()
                     last_beat = now

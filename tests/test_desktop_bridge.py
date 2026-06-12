@@ -141,6 +141,114 @@ class BridgeWriteTest(unittest.TestCase):
             self.assertIn("No LLM", r["answer"])
 
 
+class BridgeLoopsTest(unittest.TestCase):
+    def test_loop_create_and_detail(self):
+        with _TempDB():
+            r = bridge.loop_create("news", "scan hn", every="15m", command="echo",
+                                   feed_policy="on_match", feed_pattern="breaking")
+            self.assertTrue(r["ok"])
+            lid = r["loop"]["id"]
+            self.assertEqual(r["loop"]["interval"], "15m")
+            self.assertEqual(r["feed_rule"]["policy"], "on_match")
+            detail = bridge.loop_detail(lid)
+            self.assertEqual(detail["name"], "news")
+            self.assertEqual(detail["feed_rule"]["policy"], "on_match")
+            self.assertEqual(detail["runs"], [])
+
+    def test_loop_create_validates(self):
+        with _TempDB():
+            self.assertFalse(bridge.loop_create("", "p")["ok"])
+            self.assertFalse(bridge.loop_create("n", "p", every="banana")["ok"])
+
+    def test_loop_pause_resume_delete(self):
+        with _TempDB():
+            lid = bridge.loop_create("x", "p")["loop"]["id"]
+            self.assertEqual(bridge.loop_action(lid, "pause")["status"], "paused")
+            self.assertEqual(bridge.loop_action(lid, "resume")["status"], "active")
+            self.assertTrue(bridge.loop_action(lid, "delete")["deleted"])
+            self.assertIsNone(bridge.loop_detail(lid))
+            self.assertFalse(bridge.loop_action(lid, "pause")["ok"])
+
+    def test_loop_run_now_executes_command(self):
+        with _TempDB():
+            # command is `echo`, so the run executes anywhere and succeeds
+            lid = bridge.loop_create("echoer", "hello-from-loop", command="echo")["loop"]["id"]
+            r = bridge.loop_action(lid, "run_now")
+            self.assertTrue(r["ok"], r)
+            detail = bridge.loop_detail(lid)
+            self.assertEqual(len(detail["runs"]), 1)
+            self.assertEqual(detail["runs"][0]["status"], "success")
+
+    def test_loop_run_now_routes_to_feed_exactly_once(self):
+        from morpheus import feeds
+        with _TempDB():
+            lid = bridge.loop_create("echoer", "BREAKING hello", command="echo",
+                                     feed_policy="always")["loop"]["id"]
+            bridge.loop_action(lid, "run_now")
+            # run_loop publishes internally; the bridge must not double-publish
+            self.assertEqual(len(feeds.recent()), 1)
+
+    def test_loop_feed_rule_set_and_clear(self):
+        with _TempDB():
+            lid = bridge.loop_create("x", "p")["loop"]["id"]
+            r = bridge.loop_set_feed_rule(lid, "on_change")
+            self.assertEqual(r["feed_rule"]["policy"], "on_change")
+            r = bridge.loop_set_feed_rule(lid, "")
+            self.assertIsNone(r["feed_rule"])
+            self.assertFalse(bridge.loop_set_feed_rule(lid, "bogus")["ok"])
+
+
+class BridgeGoalsTest(unittest.TestCase):
+    def test_goal_create_without_source_makes_mission(self):
+        with _TempDB():
+            r = bridge.goal_create("ship the desktop app",
+                                   done_definition="all tests green",
+                                   max_turns=5, max_workers=2)
+            self.assertTrue(r["ok"], r)
+            self.assertEqual(r["status"], "active")
+            goals = bridge.goals()
+            self.assertEqual(goals[0]["objective"], "ship the desktop app")
+            self.assertEqual(goals[0]["max_turns"], 5)
+
+    def test_goal_create_validates(self):
+        with _TempDB():
+            self.assertFalse(bridge.goal_create("")["ok"])
+            self.assertFalse(bridge.goal_create("x", autonomy_level="yolo")["ok"])
+
+    def test_goal_lifecycle_actions(self):
+        with _TempDB():
+            gid = bridge.goal_create("test goal")["goal_id"]
+            self.assertEqual(bridge.goal_action(gid, "pause")["status"], "paused")
+            self.assertEqual(bridge.goal_action(gid, "resume")["status"], "active")
+            self.assertEqual(bridge.goal_action(gid, "done")["status"], "done")
+            self.assertFalse(bridge.goal_action(gid, "explode")["ok"])
+            self.assertFalse(bridge.goal_action("g_nope", "pause")["ok"])
+
+
+class BridgeFeedTest(unittest.TestCase):
+    def test_feed_post_and_items(self):
+        with _TempDB():
+            r = bridge.feed_post("manual headline", "body", priority=1)
+            self.assertTrue(r["ok"])
+            items = bridge.feed_items()
+            self.assertEqual(items[0]["title"], "manual headline")
+            self.assertEqual(items[0]["priority"], 1)
+            self.assertFalse(bridge.feed_post("")["ok"])
+
+    def test_feed_rules_list_names_loops(self):
+        with _TempDB():
+            lid = bridge.loop_create("hn-watch", "p", feed_policy="always")["loop"]["id"]
+            rules = bridge.feed_rules_list()
+            self.assertEqual(rules[0]["source_ref"], str(lid))
+            self.assertEqual(rules[0]["source_name"], "hn-watch")
+
+    def test_feed_text_plain(self):
+        with _TempDB():
+            bridge.feed_post("line one")
+            text = bridge.feed_text()
+            self.assertIn("[manual] line one", text)
+
+
 class BridgeControlDegradeTest(unittest.TestCase):
     def test_iterm_unavailable(self):
         with _TempDB():

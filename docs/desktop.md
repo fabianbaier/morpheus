@@ -120,6 +120,44 @@ shapes and degrade any unrecognised line to streamed text.
 | `GET /api/agents` | which agent CLIs are installed + the current working dir |
 | `POST /api/agent/turn` | `{agent, message, cwd?, session_ref?, permission_mode?}` → an SSE stream of `session`/`thinking`/`text`/`tool_use`/`tool_result`/`web_search`/`result` events |
 
+## Feeds — the condensed aggregator
+
+A **feed** is one terminal stream of high-level updates you (or any device — AR
+glasses, a watch, a phone widget) can subscribe to, instead of watching every
+session. Sources push condensed items into it; **rules with thresholds** decide
+what gets through:
+
+| Policy | Pushes when |
+| --- | --- |
+| `always` | every result |
+| `on_change` | the summary differs from the last pushed item |
+| `on_match` | the result matches a regex (e.g. `breaking\|error\|>\s*100`) |
+| `on_failure` | the source run failed (failures always push, with priority) |
+
+Today the source is **loops**: create a loop ("scan HN every 30m"), set its feed
+subscription in the loop detail view (or at creation), and matching results land
+in the feed — in the desktop Feed view, the Mission Cockpit card, and any
+external subscriber. The schema is source-generic (`source_kind`/`source_ref`),
+so later sources — email, sensors, agent awareness — plug in without migration.
+
+**Subscribing from minimal clients** (the glasses path):
+
+```bash
+# one line per item, newest first — no JSON parsing needed
+curl "http://127.0.0.1:$PORT/api/feed/text?token=$TOKEN"
+# 18:08 ! [loop] BREAKING: agents everywhere
+# or live: the /api/stream SSE emits `feed` events as items arrive
+```
+
+## TUI parity in the desktop
+
+Loops and goals are fully manageable from the UI: click a loop for its detail
+view (prompt, command, run history, feed subscription) with pause / resume /
+run-now / delete; click a goal for budgets + tasks with pause / resume / done /
+clear; the `+` buttons (and ⌘K "New loop… / New goal…") open creation forms. The
+**Mission Cockpit** view is the everything-overview: fleet health, sessions,
+goals, loops, the feed tail, and recent notes in one grid.
+
 ## HTTP API
 
 All `/api/*` routes require `Authorization: Bearer <token>` (or `?token=` for the
@@ -132,6 +170,16 @@ SSE stream). `/healthz` is unauthenticated.
 | GET | `/api/sessions` | live sessions |
 | GET | `/api/sessions/{ref}` | full mission card (memory + events + artifacts + edges) |
 | GET | `/api/goals` `/api/loops` `/api/notes` `/api/activity` `/api/spend` `/api/projects` | cockpit data |
+| GET | `/api/loops/{id}` | loop detail: config, run history, feed rule |
+| POST | `/api/loops` | create loop `{name, prompt, every, command?, feed_policy?, feed_pattern?}` |
+| POST | `/api/loops/{id}/action` | `{action: pause\|resume\|delete\|run_now}` |
+| POST | `/api/loops/{id}/feed-rule` | `{policy, pattern?}` ('' clears) |
+| POST | `/api/goals` | create goal `{objective, done_definition?, source?, autonomy_level?, max_turns?, max_workers?}` |
+| POST | `/api/goals/{ref}/action` | `{action: pause\|resume\|done\|clear}` |
+| GET | `/api/feed` | feed items `?limit=&since_id=` |
+| GET | `/api/feed/text` | plain-text condensed feed (glasses/watch-friendly) |
+| GET | `/api/feed/rules` | all push rules |
+| POST | `/api/feed` | manual post `{title, body?, priority?}` |
 | GET | `/api/stream?token=` | Server-Sent-Events; pushes a `fleet` event on change |
 | POST | `/api/chat` | `{message, use_llm?, include_gh?}` → answer |
 | POST | `/api/notes` | `{text, kind?, tab_id?}` |
