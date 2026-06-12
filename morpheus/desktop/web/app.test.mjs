@@ -2,7 +2,14 @@
 // (also invoked from tests/test_desktop_web.py so it runs under `make test`).
 import assert from "node:assert";
 import { renderMarkdown, parseCommand, escapeHtml, stateDotClass, SUGGESTIONS,
-         parseSseBuffer, toolIcon } from "./app.js";
+         parseSseBuffer, toolIcon, asText } from "./app.js";
+
+// asText never yields "[object Object]"
+assert.equal(asText("hi"), "hi");
+assert.equal(asText(null), "");
+assert.equal(asText(42), "42");
+assert.equal(asText({ goal: "x" }), '{"goal":"x"}');
+assert.ok(!asText({ a: 1 }).includes("[object"));
 
 // escapeHtml escapes the dangerous five
 assert.equal(escapeHtml('<b>&"x\''), "&lt;b&gt;&amp;&quot;x&#39;");

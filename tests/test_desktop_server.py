@@ -149,6 +149,48 @@ class DispatchRouteTest(unittest.TestCase):
             self.assertEqual(status, 200)
             self.assertFalse(json.loads(body)["ok"])
 
+    def test_loop_and_goal_and_feed_routes(self):
+        with _TempDB():
+            # create loop with a feed rule
+            status, _, body = _post("/api/loops", {
+                "name": "news", "prompt": "scan", "every": "10m",
+                "feed_policy": "always"}, AUTH)
+            self.assertEqual(status, 200)
+            created = json.loads(body)
+            self.assertTrue(created["ok"], created)
+            lid = created["loop"]["id"]
+            # loop detail
+            status, _, body = _get(f"/api/loops/{lid}", AUTH)
+            self.assertEqual(status, 200)
+            self.assertEqual(json.loads(body)["name"], "news")
+            # pause via action
+            status, _, body = _post(f"/api/loops/{lid}/action", {"action": "pause"}, AUTH)
+            self.assertEqual(json.loads(body)["status"], "paused")
+            # feed rule update
+            status, _, body = _post(f"/api/loops/{lid}/feed-rule",
+                                    {"policy": "on_change"}, AUTH)
+            self.assertEqual(json.loads(body)["feed_rule"]["policy"], "on_change")
+            # goal create + action
+            status, _, body = _post("/api/goals", {"objective": "test obj"}, AUTH)
+            gid = json.loads(body)["goal_id"]
+            status, _, body = _post(f"/api/goals/{gid}/action", {"action": "pause"}, AUTH)
+            self.assertEqual(json.loads(body)["status"], "paused")
+            # feed post + read + rules + text
+            _post("/api/feed", {"title": "hello feed"}, AUTH)
+            status, _, body = _get("/api/feed", AUTH)
+            self.assertEqual(json.loads(body)["items"][0]["title"], "hello feed")
+            status, hdrs, body = _get("/api/feed/text", AUTH)
+            self.assertIn("text/plain", hdrs["Content-Type"])
+            self.assertIn("hello feed", body.decode())
+            status, _, body = _get("/api/feed/rules", AUTH)
+            self.assertEqual(len(json.loads(body)["rules"]), 1)
+
+    def test_loop_routes_validate_ids(self):
+        with _TempDB():
+            self.assertEqual(_get("/api/loops/abc", AUTH)[0], 400)
+            self.assertEqual(_get("/api/loops/999", AUTH)[0], 404)
+            self.assertEqual(_post("/api/loops/xyz/action", {"action": "pause"}, AUTH)[0], 400)
+
     def test_stream_requires_auth(self):
         # dispatch returns 200 placeholder for an authorized stream request
         self.assertEqual(_get("/api/stream")[0], 401)

@@ -29,10 +29,17 @@
     <aside class="sidebar" id="sidebar">
       <div class="side-section">
         <div class="side-head">
-          <span>Conversation</span>
+          <span>Views</span>
         </div>
         <button class="nav-item nav-chat active" data-view="chat">
           <span class="nav-emoji">✦</span> Chat with Morpheus
+        </button>
+        <button class="nav-item nav-cockpit" id="nav-cockpit">
+          <span class="nav-emoji">▶</span> Mission Cockpit
+        </button>
+        <button class="nav-item nav-feed" id="nav-feed">
+          <span class="nav-emoji">📡</span> Feed
+          <span class="nav-age" id="feed-badge"></span>
         </button>
       </div>
 
@@ -45,12 +52,16 @@
       </div>
 
       <div class="side-section">
-        <div class="side-head"><span>Goals</span><span class="side-count" id="goals-count">0</span></div>
+        <div class="side-head"><span>Goals</span>
+          <span class="side-actions"><button class="side-add" id="goal-add" title="New goal">+</button>
+          <span class="side-count" id="goals-count">0</span></span></div>
         <div id="goals-list" class="nav-list compact"></div>
       </div>
 
       <div class="side-section">
-        <div class="side-head"><span>Loops</span><span class="side-count" id="loops-count">0</span></div>
+        <div class="side-head"><span>Loops</span>
+          <span class="side-actions"><button class="side-add" id="loop-add" title="New loop">+</button>
+          <span class="side-count" id="loops-count">0</span></span></div>
         <div id="loops-list" class="nav-list compact"></div>
       </div>
     </aside>
@@ -90,6 +101,35 @@
         </div>
       </section>
 
+      <!-- Mission cockpit: the everything-overview -->
+      <section class="view view-cockpit hidden" id="view-cockpit">
+        <div class="cockpit-grid" id="cockpit-grid"></div>
+      </section>
+
+      <!-- Feed: the condensed aggregator stream -->
+      <section class="view view-feed hidden" id="view-feed">
+        <div class="detail-head">
+          <h2>📡 Feed</h2>
+          <div class="meta">condensed updates from loops & sources · subscribe via
+            <code>/api/feed/text</code> (plain text, glasses-friendly)</div>
+        </div>
+        <div class="feed-list" id="feed-list"></div>
+        <div class="feed-rules-box">
+          <div class="mc-section-head">Push rules</div>
+          <div id="feed-rules"></div>
+        </div>
+        <form class="composer" id="feed-composer">
+          <input id="feed-input" placeholder="Post to the feed manually…" />
+          <button type="submit" class="send-btn" title="Post">↑</button>
+        </form>
+      </section>
+
+      <!-- Loop detail / management -->
+      <section class="view view-loop hidden" id="view-loop"></section>
+
+      <!-- Goal detail / management -->
+      <section class="view view-goal hidden" id="view-goal"></section>
+
       <!-- Session transcript view -->
       <section class="view view-session hidden" id="view-session">
         <div class="session-head" id="session-head"></div>
@@ -122,6 +162,14 @@
     <div class="cmdk">
       <input id="cmdk-input" placeholder="Jump to a session, goal, loop — or run a command…" />
       <div class="cmdk-results" id="cmdk-results"></div>
+    </div>
+  </div>
+
+  <!-- Create-form modal (new loop / new goal) -->
+  <div class="modal-overlay hidden" id="modal-overlay">
+    <div class="modal" id="modal">
+      <h3 id="modal-title"></h3>
+      <form id="modal-form"></form>
     </div>
   </div>
 

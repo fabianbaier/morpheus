@@ -296,6 +296,13 @@ def publish_run(loop: db.PromptLoop, run: db.PromptLoopRun) -> None:
         tab_id=loop.target_tab_id,
         kind="loop",
     )
+    # Route into subscribed feeds (per-loop rules with thresholds). Best-effort:
+    # a feed problem must never break the loop runner itself.
+    try:
+        from morpheus import feeds
+        feeds.route_loop_run(loop, run)
+    except Exception:
+        pass
     if not loop.target_mission_id:
         return
     db.add_event(

@@ -5,6 +5,16 @@
 
 // ───────────────────────── pure helpers ─────────────────────────
 
+// Coerce any value (including objects from the API) to a display string —
+// never "[object Object]". Pure → unit-tested in Node.
+export function asText(v) {
+  if (v == null) return "";
+  if (typeof v === "object") {
+    try { return JSON.stringify(v); } catch { return String(v); }
+  }
+  return String(v);
+}
+
 export function escapeHtml(s) {
   return String(s == null ? "" : s)
     .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
@@ -159,9 +169,10 @@ if (typeof document !== "undefined") {
     const goals = $("goals-list"); goals.innerHTML = "";
     if (!f.goals.length) goals.appendChild(el("div", "empty-line", "No goals."));
     for (const g of f.goals) {
-      const item = el("div", "nav-item");
+      const item = el("button", "nav-item");
       item.innerHTML = `<span class="nav-goal">${escapeHtml(g.objective || g.goal_id)}</span>
-        <span class="nav-age">${g.turns_used}/${g.max_turns}</span>`;
+        <span class="nav-age">${escapeHtml(g.status === "active" ? `${g.turns_used}/${g.max_turns}` : g.status)}</span>`;
+      item.onclick = () => selectGoal(g.goal_id);
       goals.appendChild(item);
     }
 
@@ -169,11 +180,12 @@ if (typeof document !== "undefined") {
     const lp = f.loops || [];
     if (!lp.length) loops.appendChild(el("div", "empty-line", "No loops."));
     for (const l of lp) {
-      const item = el("div", "nav-item");
+      const item = el("button", "nav-item");
       const mark = l.status === "active" ? "↻" : "‖";
       item.innerHTML = `<span class="nav-emoji">${mark}</span>
         <span class="nav-goal">${escapeHtml(l.name)}</span>
         <span class="nav-age">${escapeHtml(l.next_due || "")}</span>`;
+      item.onclick = () => selectLoop(l.id);
       loops.appendChild(item);
     }
   }
@@ -181,7 +193,7 @@ if (typeof document !== "undefined") {
   function renderTicker(items) {
     const feed = $("ticker-feed");
     feed.innerHTML = items.slice(0, 12).map(it =>
-      `<span class="ticker-item"><span class="tk-kind">${escapeHtml(it.kind)}</span>${escapeHtml(it.text)}</span>`
+      `<span class="ticker-item"><span class="tk-kind">${escapeHtml(asText(it.kind))}</span>${escapeHtml(asText(it.text))}</span>`
     ).join("") || `<span class="ticker-item">fleet quiet</span>`;
   }
 
@@ -361,10 +373,16 @@ if (typeof document !== "undefined") {
   }
 
   // ── views ──
+  const VIEWS = ["chat", "session", "cockpit", "feed", "loop", "goal"];
   function showView(v) {
     state.view = v;
-    $("view-chat").classList.toggle("hidden", v !== "chat");
-    $("view-session").classList.toggle("hidden", v !== "session");
+    for (const name of VIEWS) {
+      const elv = $("view-" + name);
+      if (elv) elv.classList.toggle("hidden", v !== name);
+    }
+    document.querySelector(".nav-chat")?.classList.toggle("active", v === "chat");
+    $("nav-cockpit")?.classList.toggle("active", v === "cockpit");
+    $("nav-feed")?.classList.toggle("active", v === "feed");
   }
 
   async function selectSession(s) {
@@ -383,13 +401,315 @@ if (typeof document !== "undefined") {
     renderSidebar(state.fleet);
   }
 
+  // ── modal forms ──
+  function openModal(title, fields, onSubmit) {
+    $("modal-title").textContent = title;
+    const form = $("modal-form");
+    form.innerHTML = "";
+    for (const f of fields) {
+      const row = el("div", "form-row");
+      row.appendChild(el("label", null, escapeHtml(f.label)));
+      let input;
+      if (f.type === "select") {
+        input = el("select", "ctl-select");
+        for (const [val, lab] of f.options) {
+          const o = el("option", null, escapeHtml(lab)); o.value = val;
+          input.appendChild(o);
+        }
+        if (f.value) input.value = f.value;
+      } else if (f.type === "textarea") {
+        input = el("textarea"); input.rows = 3; input.value = f.value || "";
+      } else {
+        input = el("input"); input.value = f.value || "";
+        if (f.placeholder) input.placeholder = f.placeholder;
+      }
+      input.name = f.name;
+      row.appendChild(input);
+      if (f.hint) row.appendChild(el("div", "form-hint", escapeHtml(f.hint)));
+      form.appendChild(row);
+    }
+    const actions = el("div", "form-actions");
+    const cancel = el("button", "btn-ghost", "Cancel"); cancel.type = "button";
+    cancel.onclick = closeModal;
+    const submit = el("button", "btn-primary", "Create"); submit.type = "submit";
+    actions.appendChild(cancel); actions.appendChild(submit);
+    form.appendChild(actions);
+    form.onsubmit = async (e) => {
+      e.preventDefault();
+      const data = {};
+      for (const f of fields) data[f.name] = form.elements[f.name].value;
+      submit.disabled = true;
+      try { await onSubmit(data); closeModal(); }
+      catch (err) { toast(err.message, "blocked"); }
+      submit.disabled = false;
+    };
+    $("modal-overlay").classList.remove("hidden");
+    form.querySelector("input, textarea, select")?.focus();
+  }
+  function closeModal() { $("modal-overlay").classList.add("hidden"); }
+
+  const FEED_POLICY_OPTIONS = [
+    ["", "don't push to feed"],
+    ["always", "always push"],
+    ["on_change", "push when result changes"],
+    ["on_match", "push when matching pattern"],
+    ["on_failure", "push on failure only"],
+  ];
+
+  function newLoopModal() {
+    openModal("New loop", [
+      { name: "name", label: "Name", placeholder: "hn-watch" },
+      { name: "prompt", label: "Prompt", type: "textarea",
+        placeholder: "Scan Hacker News for AI agent tooling news; one-line summary." },
+      { name: "every", label: "Every", value: "30m", hint: "e.g. 15m, 2h, 1d" },
+      { name: "command", label: "Command", placeholder: "(default: codex exec)",
+        hint: "agent CLI the prompt is piped to" },
+      { name: "feed_policy", label: "Feed", type: "select", options: FEED_POLICY_OPTIONS },
+      { name: "feed_pattern", label: "Feed pattern", placeholder: "breaking|error|>\\s*100",
+        hint: "regex threshold — used with 'push when matching pattern'" },
+    ], async (d) => {
+      const r = await api("/api/loops", { method: "POST", body: JSON.stringify(d) });
+      if (!r.ok) throw new Error(r.error || "create failed");
+      toast(`Loop "${d.name}" created`);
+      await refresh();
+      selectLoop(r.loop.id);
+    });
+  }
+
+  function newGoalModal() {
+    openModal("New goal", [
+      { name: "objective", label: "Objective", type: "textarea",
+        placeholder: "Ship the desktop feeds MVP" },
+      { name: "done_definition", label: "Done when", type: "textarea",
+        placeholder: "All tests green and pushed" },
+      { name: "source", label: "Source (optional)", placeholder: "PRD path or mission ref",
+        hint: "leave empty to start from the objective alone" },
+      { name: "autonomy_level", label: "Autonomy", type: "select", value: "ask_to_spawn",
+        options: [["observe_only", "observe only"], ["ask_to_spawn", "ask to spawn"],
+                  ["bounded_fanout", "bounded fanout"]] },
+      { name: "max_turns", label: "Max turns", value: "20" },
+      { name: "max_workers", label: "Max workers", value: "3" },
+    ], async (d) => {
+      d.max_turns = parseInt(d.max_turns, 10) || 20;
+      d.max_workers = parseInt(d.max_workers, 10) || 3;
+      const r = await api("/api/goals", { method: "POST", body: JSON.stringify(d) });
+      if (!r.ok) throw new Error(r.error || "create failed");
+      toast("Goal created");
+      await refresh();
+      selectGoal(r.goal_id);
+    });
+  }
+
+  // ── loop detail view ──
+  async function selectLoop(loopId) {
+    showView("loop");
+    const v = $("view-loop");
+    v.innerHTML = `<div class="detail-head"><h2>loading…</h2></div>`;
+    let d;
+    try { d = await api("/api/loops/" + loopId); }
+    catch (e) { v.innerHTML = `<div class="detail-head"><h2>loop not found</h2></div>`; return; }
+    const mark = d.status === "active" ? "↻" : "‖";
+    const runs = (d.runs || []).map((r) =>
+      `<div class="run-row"><span class="run-dot ${r.status === "success" ? "dot-working" : "dot-blocked"}"></span>
+       <span class="run-summary">${escapeHtml(r.summary || "(no summary)")}</span>
+       <span class="run-age">${escapeHtml(r.age || "")}</span></div>`).join("")
+      || `<div class="empty-line">No runs yet.</div>`;
+    const rulePolicy = d.feed_rule ? d.feed_rule.policy : "";
+    v.innerHTML = `
+      <div class="detail-head">
+        <h2>${mark} ${escapeHtml(d.name)}</h2>
+        <div class="meta">${escapeHtml(d.status)} · every ${escapeHtml(d.interval)} ·
+          next ${escapeHtml(d.next_due || "now")}</div>
+        <div class="detail-actions">
+          <button class="btn-ghost" data-act="${d.status === "active" ? "pause" : "resume"}">
+            ${d.status === "active" ? "‖ Pause" : "↻ Resume"}</button>
+          <button class="btn-ghost" data-act="run_now">▶ Run now</button>
+          <button class="btn-ghost btn-danger" data-act="delete">✕ Delete</button>
+        </div>
+      </div>
+      <div class="detail-body">
+        <div class="mc-field"><div class="label">Prompt</div>
+          <div class="value mono">${escapeHtml(d.prompt)}</div></div>
+        <div class="mc-field"><div class="label">Command</div>
+          <div class="value mono">${escapeHtml(d.command || "(default)")}</div></div>
+        <div class="mc-section-head">Feed subscription</div>
+        <div class="feed-rule-row">
+          <select class="ctl-select" id="loop-feed-policy">
+            ${FEED_POLICY_OPTIONS.map(([val, lab]) =>
+              `<option value="${val}" ${val === rulePolicy ? "selected" : ""}>${lab}</option>`).join("")}
+          </select>
+          <input id="loop-feed-pattern" placeholder="regex threshold (for on-match)"
+            value="${escapeHtml(d.feed_rule?.pattern || "")}" />
+          <button class="btn-ghost" id="loop-feed-save">Save</button>
+        </div>
+        <div class="mc-section-head">Run history</div>
+        <div class="run-list">${runs}</div>
+      </div>`;
+    for (const btn of v.querySelectorAll("[data-act]")) {
+      btn.onclick = async () => {
+        const act = btn.dataset.act;
+        if (act === "delete" && !confirm(`Delete loop "${d.name}"?`)) return;
+        btn.disabled = true;
+        const r = await api(`/api/loops/${loopId}/action`, {
+          method: "POST", body: JSON.stringify({ action: act }) });
+        if (!r.ok && r.error) toast(r.error, "blocked");
+        else toast(act === "run_now" ? `Run: ${r.summary || r.status}` : `Loop ${r.status || "deleted"}`);
+        await refresh();
+        if (act === "delete") showView("chat"); else selectLoop(loopId);
+      };
+    }
+    v.querySelector("#loop-feed-save").onclick = async () => {
+      const policy = v.querySelector("#loop-feed-policy").value;
+      const pattern = v.querySelector("#loop-feed-pattern").value;
+      const r = await api(`/api/loops/${loopId}/feed-rule`, {
+        method: "POST", body: JSON.stringify({ policy, pattern }) });
+      toast(r.ok ? (policy ? `Pushing to feed: ${policy}` : "Feed push disabled")
+                 : (r.error || "failed"), r.ok ? "" : "blocked");
+    };
+  }
+
+  // ── goal detail view ──
+  async function selectGoal(goalId) {
+    showView("goal");
+    const v = $("view-goal");
+    const g = (state.fleet?.goals || []).find((x) => x.goal_id === goalId);
+    if (!g) { v.innerHTML = `<div class="detail-head"><h2>goal not found</h2></div>`; return; }
+    const tasks = (g.tasks || []).map((t) =>
+      `<div class="run-row"><span class="run-dot ${t.status === "done" ? "dot-working" : t.status === "failed" ? "dot-blocked" : "dot-idle"}"></span>
+       <span class="run-summary">${escapeHtml(t.title)} <span class="mono">(${escapeHtml(t.status)})</span></span></div>`).join("")
+      || `<div class="empty-line">No tasks yet.</div>`;
+    v.innerHTML = `
+      <div class="detail-head">
+        <h2>◎ ${escapeHtml(g.objective || g.goal_id)}</h2>
+        <div class="meta">${escapeHtml(g.status)} · turns ${g.turns_used}/${g.max_turns} ·
+          workers ${g.active_workers}/${g.max_workers} · ${escapeHtml(g.autonomy_level)}</div>
+        <div class="detail-actions">
+          ${g.status === "active"
+            ? `<button class="btn-ghost" data-act="pause">‖ Pause</button>`
+            : `<button class="btn-ghost" data-act="resume">↻ Resume</button>`}
+          <button class="btn-ghost" data-act="done">✓ Done</button>
+          <button class="btn-ghost btn-danger" data-act="clear">✕ Clear</button>
+        </div>
+      </div>
+      <div class="detail-body">
+        ${g.done_definition ? `<div class="mc-field"><div class="label">Done when</div>
+          <div class="value">${escapeHtml(g.done_definition)}</div></div>` : ""}
+        ${g.last_judge_reason ? `<div class="mc-field"><div class="label">Last judge reason</div>
+          <div class="value">${escapeHtml(g.last_judge_reason)}</div></div>` : ""}
+        <div class="mc-section-head">Tasks</div>
+        <div class="run-list">${tasks}</div>
+      </div>`;
+    for (const btn of v.querySelectorAll("[data-act]")) {
+      btn.onclick = async () => {
+        const act = btn.dataset.act;
+        if (act === "clear" && !confirm("Clear this goal?")) return;
+        const r = await api(`/api/goals/${encodeURIComponent(goalId)}/action`, {
+          method: "POST", body: JSON.stringify({ action: act }) });
+        if (!r.ok) toast(r.error || "failed", "blocked");
+        else toast(`Goal ${r.status}`);
+        await refresh();
+        selectGoal(goalId);
+      };
+    }
+  }
+
+  // ── mission cockpit (overview) ──
+  function renderCockpit() {
+    const f = state.fleet;
+    const grid = $("cockpit-grid");
+    if (!f) { grid.innerHTML = `<div class="empty-line">loading…</div>`; return; }
+    const sess = f.sessions.map((s) =>
+      `<div class="run-row"><span>${s.emoji}</span>
+       <span class="run-summary">${escapeHtml(s.goal || s.cmd || s.tab_id)}</span>
+       <span class="run-age">${escapeHtml(s.age || "")}</span></div>`).join("")
+      || `<div class="empty-line">No live sessions.</div>`;
+    const goals = f.goals.map((g) =>
+      `<div class="run-row"><span class="run-dot ${g.status === "active" ? "dot-working" : "dot-finished"}"></span>
+       <span class="run-summary">${escapeHtml(g.objective || g.goal_id)}</span>
+       <span class="run-age mono">${g.turns_used}/${g.max_turns}</span></div>`).join("")
+      || `<div class="empty-line">No goals.</div>`;
+    const loops = (f.loops || []).map((l) =>
+      `<div class="run-row"><span>${l.status === "active" ? "↻" : "‖"}</span>
+       <span class="run-summary">${escapeHtml(l.name)} — ${escapeHtml(l.last_summary || "no runs yet")}</span>
+       <span class="run-age">${escapeHtml(l.next_due || "")}</span></div>`).join("")
+      || `<div class="empty-line">No loops.</div>`;
+    const feed = (state.feedItems || []).slice(0, 8).map((it) =>
+      `<div class="run-row"><span>${it.priority > 0 ? "❗" : "·"}</span>
+       <span class="run-summary">${escapeHtml(it.title)}</span>
+       <span class="run-age">${escapeHtml(it.age || "")}</span></div>`).join("")
+      || `<div class="empty-line">Feed is quiet.</div>`;
+    const notes = (f.notes || []).slice(0, 6).map((n) =>
+      `<div class="run-row"><span class="mono">${escapeHtml(n.kind)}</span>
+       <span class="run-summary">${escapeHtml(n.text)}</span></div>`).join("")
+      || `<div class="empty-line">No notes.</div>`;
+    const h = f.health;
+    grid.innerHTML = `
+      <div class="cockpit-card wide">
+        <div class="cockpit-title">Fleet</div>
+        <div class="cockpit-health">
+          <span class="h-item"><span class="h-dot dot-working"></span>${h.working} working</span>
+          <span class="h-item"><span class="h-dot dot-idle"></span>${h.idle} idle</span>
+          <span class="h-item"><span class="h-dot dot-blocked"></span>${h.blocked} blocked</span>
+          <span class="h-item"><span class="h-dot dot-crashed"></span>${h.crashed} crashed</span>
+          <span class="h-item mono">$${(f.spend?.today_usd ?? 0).toFixed(2)} today</span>
+        </div>
+      </div>
+      <div class="cockpit-card"><div class="cockpit-title">Sessions</div>${sess}</div>
+      <div class="cockpit-card"><div class="cockpit-title">📡 Feed</div>${feed}</div>
+      <div class="cockpit-card"><div class="cockpit-title">Goals</div>${goals}</div>
+      <div class="cockpit-card"><div class="cockpit-title">Loops</div>${loops}</div>
+      <div class="cockpit-card wide"><div class="cockpit-title">Recent notes</div>${notes}</div>`;
+  }
+
+  // ── feed view ──
+  function renderFeedItems() {
+    const list = $("feed-list");
+    const items = state.feedItems || [];
+    list.innerHTML = items.map((it) =>
+      `<div class="feed-item ${it.priority > 0 ? "prio" : ""}">
+        <span class="feed-src mono">[${escapeHtml(it.source_kind)}]</span>
+        <span class="feed-title">${escapeHtml(it.title)}</span>
+        ${it.body ? `<span class="feed-body">${escapeHtml(it.body)}</span>` : ""}
+        <span class="run-age">${escapeHtml(it.age || "")}</span>
+      </div>`).join("") || `<div class="empty-line">Nothing yet — subscribe a loop to the feed, or post manually below.</div>`;
+  }
+
+  async function renderFeedRules() {
+    try {
+      const r = await api("/api/feed/rules");
+      $("feed-rules").innerHTML = (r.rules || []).map((rule) =>
+        `<div class="run-row"><span class="mono">${escapeHtml(rule.source_kind)}:${escapeHtml(rule.source_name)}</span>
+         <span class="run-summary">${escapeHtml(rule.policy)}${rule.pattern ? ` · /${escapeHtml(rule.pattern)}/` : ""}</span></div>`)
+        .join("") || `<div class="empty-line">No rules — open a loop and set its feed subscription.</div>`;
+    } catch {}
+  }
+
+  async function openFeedView() {
+    showView("feed");
+    try {
+      const r = await api("/api/feed");
+      state.feedItems = r.items || [];
+    } catch {}
+    renderFeedItems();
+    renderFeedRules();
+    $("feed-badge").textContent = "";
+  }
+
   // ── command palette ──
   function commands() {
     const cmds = [
       { label: "Chat with Morpheus", kind: "view", run: () => { showView("chat"); state.selected = null; renderSidebar(state.fleet); } },
+      { label: "Mission Cockpit", kind: "view", run: () => { closeCmdk(); showView("cockpit"); renderCockpit(); } },
+      { label: "Feed", kind: "view", run: () => { closeCmdk(); openFeedView(); } },
+      { label: "New loop…", kind: "action", run: () => { closeCmdk(); newLoopModal(); } },
+      { label: "New goal…", kind: "action", run: () => { closeCmdk(); newGoalModal(); } },
       { label: "Spawn a session…", kind: "action", run: () => focusComposer("/spawn ") },
       { label: "Broadcast to fleet…", kind: "action", run: () => focusComposer("/broadcast ") },
     ];
+    for (const l of state.fleet?.loops || [])
+      cmds.push({ label: `↻ ${l.name}`, kind: "loop", run: () => { closeCmdk(); selectLoop(l.id); } });
+    for (const g of state.fleet?.goals || [])
+      cmds.push({ label: `◎ ${g.objective || g.goal_id}`, kind: "goal", run: () => { closeCmdk(); selectGoal(g.goal_id); } });
     for (const s of state.fleet?.sessions || [])
       cmds.push({ label: `${s.emoji} ${s.goal || s.tab_id}`, kind: "session", run: () => selectSession(s) });
     return cmds;
@@ -439,10 +759,14 @@ if (typeof document !== "undefined") {
   }
   async function refresh() {
     try {
-      const [f, act] = await Promise.all([api("/api/fleet"), api("/api/activity")]);
+      const [f, act, feed] = await Promise.all([
+        api("/api/fleet"), api("/api/activity"), api("/api/feed?limit=50")]);
       f.loops = (await api("/api/loops")).loops;
+      state.feedItems = feed.items || [];
       applyFleet(f);
       renderTicker(act.activity);
+      if (state.view === "cockpit") renderCockpit();
+      if (state.view === "feed") renderFeedItems();
     } catch (e) { /* transient */ }
   }
   function connectStream() {
@@ -454,6 +778,18 @@ if (typeof document !== "undefined") {
         applyFleet(f);
         $("conn-dot").classList.add("live");
         renderTicker((await api("/api/activity")).activity);
+        if (state.view === "cockpit") renderCockpit();
+      } catch {}
+    });
+    es.addEventListener("feed", (ev) => {
+      try {
+        const { items } = JSON.parse(ev.data);
+        if (!items?.length) return;
+        state.feedItems = [...items, ...(state.feedItems || [])].slice(0, 100);
+        for (const it of items) if (it.priority > 0) toast(`📡 ${it.title}`, "blocked");
+        if (state.view === "feed") renderFeedItems();
+        else if (state.view === "cockpit") renderCockpit();
+        else $("feed-badge").textContent = "●";
       } catch {}
     });
     es.onerror = () => { $("conn-dot").classList.remove("live"); };
@@ -473,7 +809,12 @@ if (typeof document !== "undefined") {
       if (!v) return; inp.value = ""; inp.style.height = "auto"; sendChat(v);
     });
     $("composer-input").addEventListener("keydown", (e) => {
-      if ((e.metaKey || e.ctrlKey) && e.key === "Enter") { e.preventDefault(); $("composer").requestSubmit(); }
+      // Enter sends; Shift+Enter inserts a newline (the Claude Code / Codex
+      // convention). Cmd/Ctrl+Enter also sends. Respect IME composition.
+      if (e.key === "Enter" && !e.shiftKey && !e.isComposing) {
+        e.preventDefault();
+        $("composer").requestSubmit();
+      }
     });
     $("composer-input").addEventListener("input", (e) => {
       e.target.style.height = "auto"; e.target.style.height = e.target.scrollHeight + "px";
@@ -498,6 +839,23 @@ if (typeof document !== "undefined") {
     $("cmdk-overlay").addEventListener("click", (e) => { if (e.target === $("cmdk-overlay")) closeCmdk(); });
     document.addEventListener("keydown", (e) => {
       if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") { e.preventDefault(); openCmdk(); }
+      if (e.key === "Escape") closeModal();
+    });
+    // cockpit / feed / create buttons
+    $("nav-cockpit").onclick = () => { showView("cockpit"); renderCockpit(); };
+    $("nav-feed").onclick = openFeedView;
+    $("loop-add").onclick = (e) => { e.stopPropagation(); newLoopModal(); };
+    $("goal-add").onclick = (e) => { e.stopPropagation(); newGoalModal(); };
+    $("modal-overlay").addEventListener("click", (e) => {
+      if (e.target === $("modal-overlay")) closeModal();
+    });
+    $("feed-composer").addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const inp = $("feed-input"); const v = inp.value.trim(); if (!v) return;
+      inp.value = "";
+      const r = await api("/api/feed", { method: "POST", body: JSON.stringify({ title: v }) });
+      if (!r.ok) toast(r.error || "post failed", "blocked");
+      else { await refresh(); renderFeedItems(); }
     });
     // agent picker
     $("agent-select").addEventListener("change", (e) => {

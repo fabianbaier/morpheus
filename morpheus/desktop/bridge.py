@@ -295,6 +295,26 @@ def notes(limit: int = 30, tenant_id: Optional[str] = None) -> list[dict[str, An
     ]
 
 
+def _action_text(action: str, details: Any) -> str:
+    """Flatten a ledger action's details (a dict) into one readable line.
+
+    ledger.recent_actions() json-decodes the details column into a dict; sending
+    that raw to the browser renders as "[object Object]". Pick the most
+    informative fields, fall back to compact JSON, else just the action name.
+    """
+    if isinstance(details, str):
+        return details or action
+    if isinstance(details, dict) and details:
+        for key in ("summary", "goal", "title", "command", "prompt", "reason", "text", "name"):
+            val = details.get(key)
+            if val:
+                return f"{action}: {val}" if action else str(val)
+        flat = ", ".join(f"{k}={v}" for k, v in details.items()
+                         if isinstance(v, (str, int, float)) and str(v))
+        return f"{action}: {flat}"[:200] if flat else action
+    return action
+
+
 def activity_feed(limit: int = 40) -> list[dict[str, Any]]:
     """The 🐇 ticker: recent notes + recent autonomous actions, newest first."""
     items: list[dict[str, Any]] = []
@@ -313,7 +333,7 @@ def activity_feed(limit: int = 40) -> list[dict[str, Any]]:
             {
                 "ts": a.ts,
                 "kind": a.action,
-                "text": a.details or a.action,
+                "text": _action_text(a.action, a.details),
                 "source": "action",
                 "tab_id": a.tab_id,
             }
@@ -513,3 +533,246 @@ def spawn_session(goal: str, command: str) -> dict[str, Any]:
         return {"ok": True, "tab_id": info.tab_id, "mission_id": m.mission_id, "goal": goal}
     except Exception as e:  # pragma: no cover - mac-only path
         return {"ok": False, "error": str(e)}
+
+
+# ───────────────────────── loops management (TUI parity) ─────────────────────────
+
+
+def _loop_dict(lp: db.PromptLoop, now: Optional[float] = None) -> dict[str, Any]:
+    from morpheus import loops as loops_mod
+
+    now = now or time.time()
+    return {
+        "id": lp.id,
+        "name": lp.name,
+        "prompt": lp.prompt,
+        "command": lp.command,
+        "interval_seconds": lp.interval_seconds,
+        "interval": loops_mod.format_interval(lp.interval_seconds),
+        "status": lp.status,
+        "next_run_at": lp.next_run_at,
+        "next_due": _age(lp.next_run_at, now) if lp.next_run_at else "",
+        "due_now": bool(lp.next_run_at and lp.next_run_at <= now and lp.status == "active"),
+        "last_run_at": lp.last_run_at,
+        "last_run_status": lp.last_run_status,
+        "last_summary": lp.last_summary,
+        "target_mission_id": lp.target_mission_id,
+    }
+
+
+def loop_detail(loop_id: int) -> Optional[dict[str, Any]]:
+    """One loop + its run history + its feed rule (if any)."""
+    from morpheus import feeds
+
+    lp = db.get_loop(loop_id)
+    if lp is None:
+        return None
+    out = _loop_dict(lp)
+    out["runs"] = [
+        {
+            "id": r.id,
+            "started_at": r.started_at,
+            "age": _age(r.started_at),
+            "finished_at": r.finished_at,
+            "status": r.status,
+            "exit_code": r.exit_code,
+            "summary": r.summary,
+        }
+        for r in db.loop_runs(loop_id, limit=15)
+    ]
+    rule = next(iter(feeds.rules(source_kind="loop", source_ref=str(loop_id))), None)
+    out["feed_rule"] = (
+        {"id": rule.id, "policy": rule.policy, "pattern": rule.pattern} if rule else None
+    )
+    return out
+
+
+def loop_create(name: str, prompt: str, every: str = "30m",
+                command: str = "", *, feed_policy: str = "",
+                feed_pattern: str = "") -> dict[str, Any]:
+    """Create a recurring prompt loop; optionally subscribe it to the feed."""
+    from morpheus import feeds
+    from morpheus import loops as loops_mod
+
+    name = (name or "").strip()
+    prompt = (prompt or "").strip()
+    if not name or not prompt:
+        return {"ok": False, "error": "name and prompt are required"}
+    try:
+        interval = loops_mod.parse_interval(every)
+    except ValueError as e:
+        return {"ok": False, "error": str(e)}
+    lp = db.create_loop(
+        name=name,
+        prompt=prompt,
+        interval_seconds=interval,
+        command=loops_mod.normalize_command(command),
+    )
+    result: dict[str, Any] = {"ok": True, "loop": _loop_dict(lp)}
+    if feed_policy:
+        try:
+            rule = feeds.set_rule("loop", str(lp.id), policy=feed_policy, pattern=feed_pattern)
+            result["feed_rule"] = {"id": rule.id, "policy": rule.policy, "pattern": rule.pattern}
+        except ValueError as e:
+            result["feed_rule_error"] = str(e)
+    return result
+
+
+def loop_action(loop_id: int, action: str, *, timeout: int = 120) -> dict[str, Any]:
+    """pause | resume | delete | run_now — the TUI's loop verbs."""
+    from morpheus import loops as loops_mod
+
+    lp = db.get_loop(loop_id)
+    if lp is None:
+        return {"ok": False, "error": f"loop {loop_id} not found"}
+    if action == "pause":
+        db.set_loop_status(loop_id, "paused")
+        return {"ok": True, "status": "paused"}
+    if action == "resume":
+        db.set_loop_status(loop_id, "active")
+        return {"ok": True, "status": "active"}
+    if action == "delete":
+        db.delete_loop(loop_id)
+        return {"ok": True, "deleted": True}
+    if action == "run_now":
+        try:
+            # run_loop publishes the result itself (notes + feed routing).
+            run = loops_mod.run_loop(lp, timeout=timeout)
+            return {"ok": run.status in ("ok", "success"), "status": run.status,
+                    "summary": run.summary, "exit_code": run.exit_code}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+    return {"ok": False, "error": f"unknown action '{action}'"}
+
+
+def loop_set_feed_rule(loop_id: int, policy: str, pattern: str = "") -> dict[str, Any]:
+    """Subscribe/adjust how this loop pushes into the feed ('' clears the rule)."""
+    from morpheus import feeds
+
+    if db.get_loop(loop_id) is None:
+        return {"ok": False, "error": f"loop {loop_id} not found"}
+    existing = feeds.rules(source_kind="loop", source_ref=str(loop_id))
+    if not policy:
+        for r in existing:
+            feeds.delete_rule(r.id)
+        return {"ok": True, "feed_rule": None}
+    try:
+        rule = feeds.set_rule("loop", str(loop_id), policy=policy, pattern=pattern)
+    except (ValueError, Exception) as e:
+        return {"ok": False, "error": str(e)}
+    return {"ok": True, "feed_rule": {"id": rule.id, "policy": rule.policy, "pattern": rule.pattern}}
+
+
+# ───────────────────────── goals management (TUI parity) ─────────────────────────
+
+
+def goal_create(objective: str, *, done_definition: str = "", source: str = "",
+                autonomy_level: str = "ask_to_spawn", max_turns: int = 20,
+                max_workers: int = 3) -> dict[str, Any]:
+    """Create a durable goal run. `source` may be a PRD path or mission ref; when
+    empty, a fresh mission memory node is created from the objective so goals can
+    be started straight from the desktop without a PRD file."""
+    from morpheus import goals as goals_mod
+
+    objective = (objective or "").strip()
+    if not objective:
+        return {"ok": False, "error": "objective is required"}
+    try:
+        if not source:
+            now = time.time()
+            mem = db.MissionMemory(
+                mission_id=db.new_mission_id(now),
+                title=objective[:120],
+                why=objective,
+                done_definition=done_definition,
+                phase="planning",
+                source_kind="desktop",
+            )
+            db.upsert_memory(mem)
+            source = mem.mission_id
+        bundle = goals_mod.create_goal_run(
+            source,
+            objective=objective,
+            done_definition=done_definition or None,
+            autonomy_level=autonomy_level,
+            max_turns=max_turns,
+            max_workers=max_workers,
+        )
+    except (ValueError, Exception) as e:
+        return {"ok": False, "error": str(e)}
+    g = bundle.goal
+    return {"ok": True, "goal_id": g.goal_id, "objective": g.objective,
+            "status": g.status, "autonomy_level": g.autonomy_level}
+
+
+def goal_action(goal_id: str, action: str, *, reason: str = "") -> dict[str, Any]:
+    """pause | resume | done | clear — goal lifecycle controls."""
+    from morpheus import goals as goals_mod
+
+    status_map = {"pause": "paused", "resume": "active", "done": "done", "clear": "cleared"}
+    status = status_map.get(action)
+    if status is None:
+        return {"ok": False, "error": f"unknown action '{action}'"}
+    goal = goals_mod.resolve_goal(goal_id)
+    if goal is None:
+        return {"ok": False, "error": f"goal '{goal_id}' not found"}
+    try:
+        goals_mod.set_status(goal.goal_id, status, reason=reason or f"{action} from desktop")
+    except (ValueError, Exception) as e:
+        return {"ok": False, "error": str(e)}
+    return {"ok": True, "goal_id": goal.goal_id, "status": status}
+
+
+# ───────────────────────── feed (the aggregator) ─────────────────────────
+
+
+def feed_items(limit: int = 50, since_id: int = 0) -> list[dict[str, Any]]:
+    from morpheus import feeds
+
+    return [
+        {
+            "id": it.id,
+            "ts": it.ts,
+            "age": _age(it.ts),
+            "title": it.title,
+            "body": it.body,
+            "source_kind": it.source_kind,
+            "source_ref": it.source_ref,
+            "priority": it.priority,
+        }
+        for it in feeds.recent(limit, since_id=since_id)
+    ]
+
+
+def feed_post(title: str, body: str = "", priority: int = 0) -> dict[str, Any]:
+    from morpheus import feeds
+
+    try:
+        item_id = feeds.post(title, body, priority=priority)
+    except ValueError as e:
+        return {"ok": False, "error": str(e)}
+    return {"ok": True, "id": item_id}
+
+
+def feed_rules_list() -> list[dict[str, Any]]:
+    from morpheus import feeds
+
+    loops_by_id = {str(lp.id): lp.name for lp in db.all_loops()}
+    return [
+        {
+            "id": r.id,
+            "source_kind": r.source_kind,
+            "source_ref": r.source_ref,
+            "source_name": loops_by_id.get(r.source_ref, r.source_ref)
+            if r.source_kind == "loop" else r.source_ref,
+            "policy": r.policy,
+            "pattern": r.pattern,
+        }
+        for r in feeds.rules()
+    ]
+
+
+def feed_text(limit: int = 20) -> str:
+    from morpheus import feeds
+
+    return feeds.render_text(limit)
