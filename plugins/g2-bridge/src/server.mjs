@@ -4423,17 +4423,42 @@ async function submitTextToMorpheus(req, res, context) {
   if (!targetSessionId) {
     const promptProject = projectContextForPrompt(state);
     if (!promptProject) {
+      // Stock Even clients render nothing for error-shaped responses, so a
+      // bare 409 leaves the glasses stuck on an empty "Waiting input" view
+      // (e.g. after prompting from the client's own "+ Add session" row).
+      // Answer with a rendered assistant notice instead, mirroring the
+      // feed:main read-only response shape.
+      const projectNames = (cachedProjects(state, 3)?.projects || [])
+        .map((project) => project?.name || project?.id || "")
+        .filter(Boolean);
+      const notice = projectNames.length
+        ? `No project is open yet. Go back and open a project first (${projectNames.join(", ")}), then speak again.`
+        : "No project is open yet. Go back and open a project row first, then speak again.";
+      const textHash = sha256(textResult.text);
       const body = {
-        error: "Select a Morpheus project or session before sending text from G2.",
+        ok: true,
+        action: "project_not_selected_notice",
         code: "project_not_selected",
+        provider: provider.name,
+        requestId,
+        textHash,
+        state: "idle",
+        text: notice,
+        answer: notice,
+        message: notice,
+        response: notice,
+        output: { text: notice },
+        history: [{ role: "assistant", text: notice }],
+        messages: [{ type: "result", success: true, text: notice }],
+        selectedSession: state.selectedSession,
       };
       audit("remote_text_rejected", {
         requestId,
         reason: "project_not_selected",
         lastProjectId: projectKey(state.lastProject) || "",
       });
-      rememberReplay(req, state, requestId, 409, body, config.clock, config.requestIdTtlMs);
-      res.status(409).json(body);
+      rememberReplay(req, state, requestId, 200, body, config.clock, config.requestIdTtlMs);
+      res.status(200).json(body);
       return;
     }
     if (!state.selectedProject && state.lastProject) {

@@ -704,14 +704,32 @@ test("spawns a session for prompt submission without an existing selected sessio
   assert.match(resultMessage.text, /current directory tree/);
 });
 
-test("rejects prompt without selected project or session context", async (t) => {
+test("prompt without project context answers with a rendered notice instead of a bare 409", async (t) => {
   const { baseUrl } = await withBridge(t);
   const res = await request(baseUrl, "/api/prompt", {
     body: { text: "follow up please", clientRequestId: "prompt-followup-0001" },
   });
-  assert.equal(res.status, 409);
+  // Stock Even clients render nothing for error responses, so the bridge
+  // must answer 200 with the guidance in the redundant answer fields.
+  assert.equal(res.status, 200);
   const body = await res.json();
   assert.equal(body.code, "project_not_selected");
+  assert.equal(body.state, "idle");
+  assert.match(body.text, /open a project/i);
+  assert.equal(body.answer, body.text);
+  assert.equal(body.history[0].role, "assistant");
+});
+
+test("projectless prompt notice names cached projects when known", async (t) => {
+  const { baseUrl } = await withBridge(t);
+  await request(baseUrl, "/api/projects");
+  const res = await request(baseUrl, "/api/prompt", {
+    body: { text: "hello", clientRequestId: "prompt-followup-0002" },
+  });
+  assert.equal(res.status, 200);
+  const body = await res.json();
+  assert.match(body.text, /alpha/i);
+  assert.match(body.text, /open a project/i);
 });
 
 test("spawns in remembered project when Add session prompt omits sessionId", async (t) => {
