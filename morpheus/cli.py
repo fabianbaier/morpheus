@@ -126,6 +126,23 @@ def _remote_tenant_id(all_projects: bool = False, project_ref: Optional[str] = N
     return tenant_mod.ensure_project_tenant(Path.cwd()).tenant_id
 
 
+def _remote_iterm_run(coro) -> Optional[dict]:
+    """Run an iTerm coroutine for a remote-contract command.
+
+    Remote commands promise JSON on stdout; an iTerm connection failure must
+    become an {"ok": false} payload, never a traceback.
+    """
+    try:
+        iterm_client.run(coro)
+        return None
+    except Exception as exc:
+        return {
+            "ok": False,
+            "error": f"iTerm unavailable: {type(exc).__name__}: {exc}"[:300],
+            "hint": "Is iTerm2 running with the Python API enabled? iTerm2 -> Settings -> General -> Magic.",
+        }
+
+
 def _project_usage_dict(usage: db.ProjectTenantUsage) -> dict:
     return {
         "live_sessions": usage.live_sessions,
@@ -2000,7 +2017,9 @@ def remote_spawn(
             },
         }
 
-    iterm_client.run(_do)
+    failure = _remote_iterm_run(_do)
+    if failure is not None:
+        payload = failure
     if not payload.get("ok"):
         if compact:
             sys.stdout.write(json.dumps(payload, separators=(",", ":")) + "\n")
@@ -2101,7 +2120,9 @@ def remote_prompt(
             "error": "" if result and result.ok else (result.error if result else "send returned no result"),
         }
 
-    iterm_client.run(_do)
+    failure = _remote_iterm_run(_do)
+    if failure is not None:
+        submitted = failure
     if not submitted.get("ok"):
         payload = {"ok": False, "error": submitted.get("error", "send failed")}
         if compact:
@@ -2184,7 +2205,9 @@ def remote_output(
             "output": cleaned,
         }
 
-    iterm_client.run(_do)
+    failure = _remote_iterm_run(_do)
+    if failure is not None:
+        payload = failure
     if not payload.get("ok"):
         if compact:
             sys.stdout.write(json.dumps(payload, separators=(",", ":")) + "\n")
