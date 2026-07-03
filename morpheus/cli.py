@@ -913,7 +913,11 @@ def loops_run(
     if loop is None:
         console.print(f"[red]no loop #{loop_id}[/red]")
         raise typer.Exit(1)
-    run = loops_mod.run_loop(loop, timeout=timeout)
+    try:
+        run = loops_mod.run_loop(loop, timeout=timeout)
+    except loops_mod.LoopAlreadyRunning:
+        console.print(f"[yellow]loop #{loop.id} is already running[/yellow]")
+        raise typer.Exit(1)
     status_style = "green" if run.status == "success" else "red"
     console.print(f"[{status_style}]{run.status}[/{status_style}] loop #{loop.id}: {run.summary}")
     console.print(f"  output: {run.output_path}")
@@ -1830,7 +1834,7 @@ def remote_brief(
     if not result.get("found"):
         console.print(f"[red]{escape(str(result.get('error', 'not found')))}[/red]")
         raise typer.Exit(1)
-        console.print_json(json.dumps(result))
+    console.print_json(json.dumps(result))
 
 
 @remote_app.command("spawn")

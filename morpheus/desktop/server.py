@@ -460,7 +460,9 @@ def make_handler(cfg: Config) -> type[BaseHTTPRequestHandler]:
                     last_beat = now
                 # Push newly arrived feed items as their own event so a feed
                 # subscriber (desktop, glasses relay) gets them immediately.
-                new_items = bridge.feed_items(limit=20, since_id=last_feed_id)
+                # Cursor fetch is oldest-first: a burst of >20 items spills
+                # into the next poll instead of being skipped.
+                new_items = bridge.feed_items_after(last_feed_id, limit=20)
                 if new_items:
                     last_feed_id = max(it["id"] for it in new_items)
                     chunk = f"event: feed\ndata: {json.dumps({'items': new_items})}\n\n"

@@ -1,4 +1,6 @@
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -202,6 +204,276 @@ class LoopsTest(unittest.TestCase):
             self.assertIn("Summary: streamed while running.", run.summary)
             self.assertIn("Summary: streamed while running.", text)
             self.assertIn("[loop success; exit=0]", text)
+
+    def test_run_loop_raises_when_claim_already_held(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            with patch.object(db, "DB_DIR", tmp_path), patch.object(
+                db, "DB_PATH", tmp_path / "morpheus.db"
+            ):
+                loop = db.create_loop(
+                    name="busy",
+                    prompt="ignored prompt",
+                    interval_seconds=300,
+                    command="printf ok",
+                    next_run_at=0,
+                )
+                now = time.time()
+                claimed = db.claim_loop_run(
+                    loop.id, started_at=now, next_run_at=now + 300, stale_after=600
+                )
+                self.assertIsNotNone(claimed)
+                self.assertEqual(claimed.last_run_status, "running")
+
+                with self.assertRaises(loops.LoopAlreadyRunning):
+                    loops.run_loop(loop, timeout=600)
+
+    def test_run_due_skips_loop_still_running_from_previous_tick(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            with patch.object(db, "DB_DIR", tmp_path), patch.object(
+                db, "DB_PATH", tmp_path / "morpheus.db"
+            ):
+                loop = db.create_loop(
+                    name="slow",
+                    prompt="ignored prompt",
+                    interval_seconds=300,
+                    command="printf ok",
+                    next_run_at=0,
+                )
+                # A run that outlasted its interval: still running, but due again.
+                db.claim_loop_run(loop.id, started_at=time.time(), next_run_at=0,
+                                  stale_after=600)
+
+                self.assertEqual([lp.id for lp in db.due_loops(limit=5)], [loop.id])
+                self.assertEqual(loops.run_due(limit=5, timeout=600), [])
+
+    def test_stale_running_claim_can_be_reclaimed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            with patch.object(db, "DB_DIR", tmp_path), patch.object(
+                db, "DB_PATH", tmp_path / "morpheus.db"
+            ), patch.object(
+                loops.ctx_mod, "write_context_file", new=lambda: None
+            ), patch.object(
+                loops.ctx_mod, "write_context_json", new=lambda: None
+            ):
+                loop = db.create_loop(
+                    name="stuck",
+                    prompt="ignored prompt",
+                    interval_seconds=300,
+                    command="printf ok",
+                    next_run_at=0,
+                )
+                # A crashed runner left the loop 'running' far past its own
+                # stored staleness deadline.
+                db.claim_loop_run(loop.id, started_at=time.time() - 10_000,
+                                  next_run_at=0, stale_after=600)
+
+                run = loops.run_loop(loop, timeout=600)
+
+                self.assertEqual(run.status, "success")
+
+    def test_fresh_long_timeout_claim_blocks_short_timeout_contender(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            with patch.object(db, "DB_DIR", tmp_path), patch.object(
+                db, "DB_PATH", tmp_path / "morpheus.db"
+            ):
+                loop = db.create_loop(
+                    name="marathon",
+                    prompt="ignored prompt",
+                    interval_seconds=300,
+                    command="printf ok",
+                    next_run_at=0,
+                )
+                now = time.time()
+                # A run started with --timeout 5400 is 30 minutes in.
+                claimed = db.claim_loop_run(
+                    loop.id, started_at=now - 1800, next_run_at=now + 300,
+                    stale_after=5400,
+                )
+                self.assertIsNotNone(claimed)
+                self.assertEqual(claimed.last_run_stale_after, 5400)
+
+                # The run-due tick contends with the short default timeout: the
+                # claim's staleness is judged by ITS stored deadline (5400s),
+                # not the contender's 1200s — no double run.
+                self.assertIsNone(db.claim_loop_run(
+                    loop.id, started_at=now, next_run_at=now + 300,
+                    stale_after=1200,
+                ))
+                with self.assertRaises(loops.LoopAlreadyRunning):
+                    loops.run_loop(loop, timeout=1200)
+
+                # Once past its OWN deadline the claim is stale even for a
+                # short-timeout contender (crashed-runner recovery still works).
+                self.assertIsNotNone(db.claim_loop_run(
+                    loop.id, started_at=now + 4000, next_run_at=now + 4300,
+                    stale_after=1200,
+                ))
+
+    def test_claim_without_stored_deadline_falls_back_to_contender_timeout(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            with patch.object(db, "DB_DIR", tmp_path), patch.object(
+                db, "DB_PATH", tmp_path / "morpheus.db"
+            ):
+                loop = db.create_loop(
+                    name="legacy",
+                    prompt="ignored prompt",
+                    interval_seconds=300,
+                    command="printf ok",
+                    next_run_at=0,
+                )
+                now = time.time()
+                # A 'running' row written before last_run_stale_after existed
+                # (stored deadline 0): the contender's own timeout is the guard.
+                with db._connect() as conn:
+                    conn.execute(
+                        "UPDATE prompt_loops SET last_run_status = 'running',"
+                        " last_run_at = ?, last_run_stale_after = 0 WHERE id = ?",
+                        (now - 1300, loop.id),
+                    )
+                # fresh by the contender's 2000s timeout → blocked
+                self.assertIsNone(db.claim_loop_run(
+                    loop.id, started_at=now, next_run_at=now + 300,
+                    stale_after=2000,
+                ))
+                # stale by the contender's 1200s timeout → re-claimable
+                self.assertIsNotNone(db.claim_loop_run(
+                    loop.id, started_at=now, next_run_at=now + 300,
+                    stale_after=1200,
+                ))
+
+    def test_run_loop_preclaimed_skips_second_claim(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            with patch.object(db, "DB_DIR", tmp_path), patch.object(
+                db, "DB_PATH", tmp_path / "morpheus.db"
+            ), patch.object(
+                loops.ctx_mod, "write_context_file", new=lambda: None
+            ), patch.object(
+                loops.ctx_mod, "write_context_json", new=lambda: None
+            ):
+                loop = db.create_loop(
+                    name="preclaimed",
+                    prompt="ignored prompt",
+                    interval_seconds=300,
+                    command="printf ok",
+                    next_run_at=0,
+                )
+                now = time.time()
+                # The caller (desktop bridge run_now) holds the claim already;
+                # run_loop must not treat its own claim as a rival's.
+                self.assertIsNotNone(db.claim_loop_run(
+                    loop.id, started_at=now, next_run_at=now + 300,
+                    stale_after=600,
+                ))
+                run = loops.run_loop(loop, timeout=600, preclaimed=True)
+
+                self.assertEqual(run.status, "success")
+                refreshed = db.get_loop(loop.id)
+                self.assertEqual(refreshed.last_run_status, "success")
+
+    def test_concurrent_run_loop_lets_exactly_one_runner_win(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            with patch.object(db, "DB_DIR", tmp_path), patch.object(
+                db, "DB_PATH", tmp_path / "morpheus.db"
+            ), patch.object(
+                loops.ctx_mod, "write_context_file", new=lambda: None
+            ), patch.object(
+                loops.ctx_mod, "write_context_json", new=lambda: None
+            ):
+                loop = db.create_loop(
+                    name="raced",
+                    prompt="ignored prompt",
+                    interval_seconds=300,
+                    command="sleep 1",
+                    next_run_at=0,
+                )
+                results: list[db.PromptLoopRun] = []
+                rejected: list[str] = []
+
+                def _race() -> None:
+                    try:
+                        results.append(loops.run_loop(loop, timeout=30))
+                    except loops.LoopAlreadyRunning:
+                        rejected.append("busy")
+
+                threads = [threading.Thread(target=_race) for _ in range(2)]
+                for thread in threads:
+                    thread.start()
+                for thread in threads:
+                    thread.join()
+
+                self.assertEqual(len(results), 1)
+                self.assertEqual(rejected, ["busy"])
+                self.assertEqual(len(db.loop_runs(loop.id, limit=10)), 1)
+
+    def test_same_second_runs_get_distinct_output_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            collided = tmp_path / "loops" / "1" / "20260101T000000.txt"
+
+            with patch.object(db, "DB_DIR", tmp_path), patch.object(
+                db, "DB_PATH", tmp_path / "morpheus.db"
+            ), patch.object(
+                loops, "_output_path", new=lambda loop_id, ts: collided
+            ), patch.object(
+                loops.ctx_mod, "write_context_file", new=lambda: None
+            ), patch.object(
+                loops.ctx_mod, "write_context_json", new=lambda: None
+            ):
+                loop = db.create_loop(
+                    name="stampede",
+                    prompt="ignored prompt",
+                    interval_seconds=300,
+                    command="printf ok",
+                    next_run_at=0,
+                )
+
+                first = loops.run_loop(loop, timeout=5)
+                second = loops.run_loop(loop, timeout=5)
+
+            self.assertNotEqual(first.output_path, second.output_path)
+            self.assertIn("[loop success", Path(first.output_path).read_text(encoding="utf-8"))
+            self.assertIn("[loop success", Path(second.output_path).read_text(encoding="utf-8"))
+
+    def test_write_output_header_never_truncates_existing_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "20260101T000000.txt"
+            first = loops._write_output_header(target, "printf one", None, 0)
+            second = loops._write_output_header(target, "printf two", None, 0)
+
+            self.assertEqual(first, target)
+            self.assertNotEqual(second, target)
+            self.assertIn("printf one", target.read_text(encoding="utf-8"))
+            self.assertIn("printf two", second.read_text(encoding="utf-8"))
+
+    def test_next_run_at_anchors_to_schedule_not_finish_time(self) -> None:
+        loop = db.PromptLoop(
+            id=1, name="daily", prompt="p", interval_seconds=100,
+            command="printf ok", next_run_at=1000.0,
+        )
+        # A 25s run must not drift the schedule to 1130.
+        self.assertEqual(loops._next_run_at(loop, started=1005.0, finished=1030.0), 1100.0)
+
+    def test_next_run_at_catches_up_after_outage_without_bursting(self) -> None:
+        loop = db.PromptLoop(
+            id=1, name="daily", prompt="p", interval_seconds=100,
+            command="printf ok", next_run_at=1000.0,
+        )
+        # Three missed slots: schedule the next future one, keep the anchor phase.
+        self.assertEqual(loops._next_run_at(loop, started=1350.0, finished=1360.0), 1400.0)
+
+    def test_next_run_at_manual_early_run_reanchors_from_start(self) -> None:
+        loop = db.PromptLoop(
+            id=1, name="daily", prompt="p", interval_seconds=100,
+            command="printf ok", next_run_at=2000.0,
+        )
+        self.assertEqual(loops._next_run_at(loop, started=1500.0, finished=1510.0), 1600.0)
 
     def test_loop_lifecycle_helpers_update_target_history_and_delete(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -4940,6 +4940,10 @@ class MorpheusApp(App):
                 timeout=loops_mod.DEFAULT_TIMEOUT_SECONDS,
                 cwd=cwd,
             )
+        except loops_mod.LoopAlreadyRunning:
+            # Another runner (launchd tick, desktop bridge) already holds the
+            # claim — that's healthy coordination, not a failure.
+            self._push_alert(Alert(time.time(), "summary", f"loop [{loop.name}] already running"))
         except Exception as e:
             self._push_alert(Alert(time.time(), "error", f"loop [{loop.name}] run failed: {e}"))
         else:

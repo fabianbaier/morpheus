@@ -2,7 +2,7 @@
 // (also invoked from tests/test_desktop_web.py so it runs under `make test`).
 import assert from "node:assert";
 import { renderMarkdown, parseCommand, escapeHtml, stateDotClass, SUGGESTIONS,
-         parseSseBuffer, toolIcon, asText } from "./app.js";
+         parseSseBuffer, toolIcon, asText, mergeFeedBatch } from "./app.js";
 
 // asText never yields "[object Object]"
 assert.equal(asText("hi"), "hi");
@@ -51,6 +51,20 @@ assert.ok(sse.rest.startsWith("event: partial"), "partial frame retained");
 const cont = parseSseBuffer(sse.rest + '"z":3}\n\n');
 assert.equal(cont.frames.length, 1);
 assert.equal(cont.frames[0].data, '{"z":3}');
+
+// mergeFeedBatch: the server streams ascending (oldest→newest) batches; the
+// display list is newest-first, so the batch is prepended reversed.
+const mergedFeed = mergeFeedBatch([{ id: 5 }, { id: 4 }], [{ id: 6 }, { id: 7 }, { id: 8 }]);
+assert.deepEqual(mergedFeed.map(i => i.id), [8, 7, 6, 5, 4], "batch prepended newest-first");
+// the incoming batch array is not mutated by the reverse
+const feedBatch = [{ id: 1 }, { id: 2 }];
+mergeFeedBatch([], feedBatch);
+assert.deepEqual(feedBatch.map(i => i.id), [1, 2], "batch not mutated");
+// null-safety and cap
+assert.deepEqual(mergeFeedBatch(null, [{ id: 1 }]).map(i => i.id), [1]);
+assert.deepEqual(mergeFeedBatch([{ id: 1 }], null).map(i => i.id), [1]);
+assert.equal(mergeFeedBatch([{ id: 3 }, { id: 2 }, { id: 1 }], [{ id: 4 }], 2).length, 2);
+assert.deepEqual(mergeFeedBatch([{ id: 3 }, { id: 2 }, { id: 1 }], [{ id: 4 }], 2).map(i => i.id), [4, 3]);
 
 // toolIcon
 assert.equal(typeof toolIcon("Read"), "string");

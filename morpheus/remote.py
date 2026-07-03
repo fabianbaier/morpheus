@@ -371,12 +371,13 @@ def fleet_snapshot(*, limit: int = 8, tenant_id: Optional[str] = None) -> dict[s
     goals = _remote_goal_runs(tenant_id=tenant_id)
     counts = _state_counts(missions)
     cards = attention_cards(limit=limit, tenant_id=tenant_id)
+    active_goal_count = len([goal for goal in goals if goal.status not in _FINISHED_GOAL_STATES])
     return {
         "generated_at": time.time(),
         "version": __version__,
-        "summary": _voice_summary(counts, cards, len(goals)),
+        "summary": _voice_summary(counts, cards, active_goal_count),
         "counts": counts,
-        "active_goal_count": len([goal for goal in goals if goal.status not in _FINISHED_GOAL_STATES]),
+        "active_goal_count": active_goal_count,
         "cards": cards,
         "sessions": _session_rows(missions, memories),
         "goals": _goal_rows(goals),

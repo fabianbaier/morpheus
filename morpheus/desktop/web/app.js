@@ -101,6 +101,14 @@ export function parseSseBuffer(buf) {
   return { frames, rest: buf };
 }
 
+// Merge an SSE feed batch into the newest-first display list. The server sends
+// ascending (oldest→newest) batches — feed_items_after cursor order — so the
+// batch is prepended reversed to keep the global newest-first order. Pure →
+// unit-tested in Node.
+export function mergeFeedBatch(existing, batch, cap = 100) {
+  return [...(batch || [])].reverse().concat(existing || []).slice(0, cap);
+}
+
 // Icon for a tool name so tool use reads like Claude Code / Codex.
 export function toolIcon(name) {
   const map = {
@@ -826,7 +834,7 @@ if (typeof document !== "undefined") {
       try {
         const { items } = JSON.parse(ev.data);
         if (!items?.length) return;
-        state.feedItems = [...items, ...(state.feedItems || [])].slice(0, 100);
+        state.feedItems = mergeFeedBatch(state.feedItems, items);
         for (const it of items) if (it.priority > 0) toast(`📡 ${it.title}`, "blocked");
         if (state.view === "feed") renderFeedItems();
         else if (state.view === "cockpit") renderCockpit();

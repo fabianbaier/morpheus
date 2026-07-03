@@ -146,6 +146,21 @@ class RemoteSurfaceTest(unittest.TestCase):
         assignment = html.split("window.openai.toolOutput =", 1)[1].split(";", 1)[0]
         self.assertNotIn("&quot;", assignment)
 
+    def test_voice_summary_counts_only_active_goals(self) -> None:
+        with isolated_remote_runtime():
+            db.upsert_goal_run(db.GoalRun(goal_id="g_active", parent_mission_id="m_a", status="active"))
+            db.upsert_goal_run(db.GoalRun(goal_id="g_paused", parent_mission_id="m_b", status="paused"))
+            db.upsert_goal_run(db.GoalRun(goal_id="g_failed", parent_mission_id="m_c", status="failed"))
+
+            snapshot = remote.fleet_snapshot(limit=4)
+
+        # failed goals stay visible in the list, but must not inflate the
+        # spoken "active goals" count.
+        self.assertEqual(len(snapshot["goals"]), 3)
+        self.assertEqual(snapshot["active_goal_count"], 2)
+        self.assertIn("2 active goals", snapshot["summary"])
+        self.assertNotIn("3 active goals", snapshot["summary"])
+
     def test_codex_resume_ref_from_command_parses_quoted_resume_ids(self) -> None:
         thread = "019ebd79-adb0-7982-ad1a-ddd9d877a89e"
         mirror_cmd = (
@@ -191,6 +206,39 @@ class RemoteSurfaceTest(unittest.TestCase):
         by_ref = {row["tab_ref"]: row for row in snapshot["sessions"]}
         self.assertEqual(by_ref["mirror1"]["resume_ref"], thread)
         self.assertEqual(by_ref["plain1"]["resume_ref"], "")
+
+
+class RemoteBriefCliTest(unittest.TestCase):
+    def test_remote_brief_prints_json_on_success(self) -> None:
+        from typer.testing import CliRunner
+
+        from morpheus import cli
+
+        runner = CliRunner()
+        brief = {"found": True, "tab_ref": "abc123", "goal": "ship remote bridge"}
+        with patch.object(cli, "_remote_tenant_id", new=lambda **kwargs: None), patch.object(
+            remote, "session_brief", new=lambda ref, **kwargs: dict(brief)
+        ):
+            result = runner.invoke(cli.app, ["remote", "brief", "abc123", "--all"])
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertIn('"found"', result.output)
+        self.assertIn("ship remote bridge", result.output)
+
+    def test_remote_brief_exits_nonzero_when_not_found(self) -> None:
+        from typer.testing import CliRunner
+
+        from morpheus import cli
+
+        runner = CliRunner()
+        missing = {"found": False, "error": "no session or mission matching 'zzz'"}
+        with patch.object(cli, "_remote_tenant_id", new=lambda **kwargs: None), patch.object(
+            remote, "session_brief", new=lambda ref, **kwargs: dict(missing)
+        ):
+            result = runner.invoke(cli.app, ["remote", "brief", "zzz", "--all"])
+
+        self.assertEqual(result.exit_code, 1)
+        self.assertNotIn('"found"', result.output)
 
 
 if __name__ == "__main__":

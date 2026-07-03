@@ -55,6 +55,40 @@ class FeedItemsTest(unittest.TestCase):
             newer = feeds.recent(since_id=a)
             self.assertEqual([it.id for it in newer], [b])
 
+    def test_recent_after_pages_backlog_in_ascending_order(self):
+        with _TempDB():
+            ids = [feeds.post(f"item {i}") for i in range(5)]
+            first = feeds.recent_after(0, limit=2)
+            self.assertEqual([it.id for it in first], ids[:2])
+            # an overflowing burst arrives on the next poll, not never
+            second = feeds.recent_after(first[-1].id, limit=2)
+            self.assertEqual([it.id for it in second], ids[2:4])
+            # display callers keep the newest-first view of recent()
+            self.assertEqual([it.id for it in feeds.recent(limit=2)], [ids[4], ids[3]])
+
+    def test_init_memoizes_per_database_path_not_globally(self):
+        # _init() skips re-running the DDL for a database it already set up,
+        # but a repointed DB_PATH (the test-isolation pattern) is a *new*
+        # database that still needs its schema created.
+        with _TempDB():
+            feeds.post("first db item")
+            self.assertEqual(len(feeds.recent()), 1)
+        with _TempDB():
+            self.assertEqual(feeds.recent(), [])  # fresh DB, fresh schema
+            feeds.post("second db item")
+            self.assertEqual([it.title for it in feeds.recent()], ["second db item"])
+
+    def test_post_stores_normalized_title(self):
+        # Truncation at TITLE_MAX_CHARS can expose trailing whitespace; the
+        # stored title is the canonical normalized shape.
+        raw = "  " + "x" * 199 + "  tail  "
+        with _TempDB():
+            feeds.post(raw)
+            stored = feeds.recent()[0].title
+            self.assertEqual(stored, feeds._normalize_title(raw))
+            self.assertEqual(stored, "x" * 199)
+            self.assertLessEqual(len(stored), feeds.TITLE_MAX_CHARS)
+
     def test_render_text_is_plain_lines(self):
         with _TempDB():
             feeds.post("quiet update")
@@ -125,6 +159,24 @@ class RoutingTest(unittest.TestCase):
             feeds.route_loop_run(lp, _run(lp, summary="state B"))
             titles = [it.title for it in feeds.recent()]
             self.assertEqual(titles, ["state B", "state A"])
+
+    def test_on_change_ignores_storage_truncation_of_long_summaries(self):
+        with _TempDB():
+            lp = self._loop()
+            feeds.set_rule("loop", str(lp.id), policy="on_change")
+            long_summary = "market scan: " + "x" * 300  # post() stores title[:200]
+            feeds.route_loop_run(lp, _run(lp, summary=long_summary))
+            feeds.route_loop_run(lp, _run(lp, summary=long_summary))  # same → skipped
+            self.assertEqual(len(feeds.recent()), 1)
+
+    def test_on_change_evaluates_on_fresh_database(self):
+        with _TempDB():
+            # evaluate() must init the schema itself: routing can hit a brand-new
+            # DB before any post()/set_rule() call has created the feed tables.
+            rule = feeds.FeedRule(id=1, feed="main", source_kind="loop",
+                                  source_ref="1", policy="on_change", pattern="",
+                                  created_at=0.0)
+            self.assertTrue(feeds.evaluate(rule, summary="first result", failed=False))
 
     def test_failures_always_post_with_priority(self):
         with _TempDB():

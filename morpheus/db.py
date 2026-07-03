@@ -279,6 +279,7 @@ class PromptLoop:
     next_run_at: float = 0.0
     last_run_status: str = ""
     last_summary: str = ""
+    last_run_stale_after: float = 0.0
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
 
@@ -495,6 +496,7 @@ CREATE TABLE IF NOT EXISTS prompt_loops (
     next_run_at       REAL NOT NULL,
     last_run_status   TEXT NOT NULL DEFAULT '',
     last_summary      TEXT NOT NULL DEFAULT '',
+    last_run_stale_after REAL NOT NULL DEFAULT 0,
     created_at        REAL NOT NULL,
     updated_at        REAL NOT NULL
 );
@@ -568,6 +570,7 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
     _ensure_column(conn, "mission_memory", "closed_at", "REAL NOT NULL DEFAULT 0")
     _ensure_column(conn, "prompt_loops", "tenant_id", "TEXT NOT NULL DEFAULT ''")
     _ensure_column(conn, "prompt_loops", "project_root", "TEXT NOT NULL DEFAULT ''")
+    _ensure_column(conn, "prompt_loops", "last_run_stale_after", "REAL NOT NULL DEFAULT 0")
     _ensure_column(conn, "prompt_loop_runs", "mission_id", "TEXT NOT NULL DEFAULT ''")
     _ensure_column(conn, "prompt_loop_runs", "tab_id", "TEXT")
     _ensure_column(conn, "prompt_loop_runs", "session_id", "TEXT")
@@ -2638,26 +2641,45 @@ def update_loop_after_run(
     return _row_to_prompt_loop(row) if row else None
 
 
-def mark_loop_running(
+def claim_loop_run(
     loop_id: int,
     *,
     started_at: float,
     next_run_at: float,
+    stale_after: float,
 ) -> Optional[PromptLoop]:
+    """Atomically claim a loop for one runner.
+
+    The launchd `run-due` tick, the desktop bridge, and the dashboard can all
+    try to start the same loop; the WHERE guard makes exactly one of them win.
+    A claim marks the loop running and bumps ``next_run_at`` in a single UPDATE
+    so a slow run is not re-picked by the next tick. A stale claim — a crashed
+    runner that never cleared 'running' — may be re-claimed once it is older
+    than the claim's *own* recorded ``last_run_stale_after`` deadline (falling
+    back to this caller's ``stale_after`` for claims written before the column
+    existed). Comparing against the stored deadline means a run started with a
+    long timeout cannot be double-run by a contender using a shorter default.
+    Returns the claimed loop, or None if another runner holds a fresh claim.
+    """
     now = time.time()
     with _connect() as conn:
-        conn.execute(
+        cur = conn.execute(
             """
             UPDATE prompt_loops
                SET last_run_at = ?,
                    next_run_at = ?,
                    last_run_status = 'running',
                    last_summary = 'run started',
+                   last_run_stale_after = ?,
                    updated_at = ?
              WHERE id = ?
+               AND (last_run_status != 'running'
+                    OR ? - last_run_at > COALESCE(NULLIF(last_run_stale_after, 0), ?))
             """,
-            (started_at, next_run_at, now, loop_id),
+            (started_at, next_run_at, stale_after, now, loop_id, started_at, stale_after),
         )
+        if cur.rowcount == 0:
+            return None
         row = conn.execute("SELECT * FROM prompt_loops WHERE id = ?", (loop_id,)).fetchone()
     return _row_to_prompt_loop(row) if row else None
 
@@ -3082,6 +3104,7 @@ def _row_to_prompt_loop(row: sqlite3.Row) -> PromptLoop:
         next_run_at=row["next_run_at"],
         last_run_status=row["last_run_status"],
         last_summary=row["last_summary"],
+        last_run_stale_after=row["last_run_stale_after"],
         created_at=row["created_at"],
         updated_at=row["updated_at"],
     )

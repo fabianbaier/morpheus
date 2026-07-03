@@ -196,15 +196,88 @@ class BridgeLoopsTest(unittest.TestCase):
             self.assertFalse(detail["running"])
 
     def test_loop_run_now_rejected_while_running(self):
+        import time as _time
         with _TempDB():
             lid = bridge.loop_create("x", "p", command="echo")["loop"]["id"]
             from morpheus import db as _db
-            _db.mark_loop_running(lid, started_at=1.0, next_run_at=2.0)
+            now = _time.time()
+            _db.claim_loop_run(lid, started_at=now, next_run_at=now + 60,
+                               stale_after=1200)
             r = bridge.loop_action(lid, "run_now")
             self.assertFalse(r["ok"])
             self.assertIn("already", r["error"])
             detail = bridge.loop_detail(lid)
             self.assertTrue(detail["running"])
+
+    def test_loop_run_now_respects_running_claims_own_longer_deadline(self):
+        # A run claimed with a long timeout (e.g. --timeout 5400) 30 minutes in
+        # must not be double-started by a run_now using the short default.
+        import time as _time
+        with _TempDB():
+            lid = bridge.loop_create("x", "p", command="echo")["loop"]["id"]
+            from morpheus import db as _db
+            now = _time.time()
+            _db.claim_loop_run(lid, started_at=now - 1800, next_run_at=now + 60,
+                               stale_after=5400)
+            r = bridge.loop_action(lid, "run_now")  # default 1200s timeout
+            self.assertFalse(r["ok"])
+            self.assertIn("already", r["error"])
+            self.assertTrue(bridge.loop_detail(lid)["running"])
+
+    def test_concurrent_run_now_exactly_one_starts(self):
+        # Two simultaneous fire-and-forget run_nows: the atomic claim happens
+        # before the reply, so exactly one reports started:true and exactly one
+        # run row exists — the loser must not be told "started" only for the
+        # background thread to silently swallow LoopAlreadyRunning.
+        import threading
+        import time as _time
+        with _TempDB():
+            # the prompt is appended to the command; `sleep` keeps the claim
+            # held long enough that both contenders overlap
+            lid = bridge.loop_create("racer", "p",
+                                     command="sleep 1 && echo")["loop"]["id"]
+            results: list[dict] = []
+            lock = threading.Lock()
+            barrier = threading.Barrier(2)
+
+            def _go():
+                barrier.wait()
+                r = bridge.loop_action(lid, "run_now")
+                with lock:
+                    results.append(r)
+
+            threads = [threading.Thread(target=_go) for _ in range(2)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+
+            started = [r for r in results if r.get("started")]
+            rejected = [r for r in results if not r.get("ok")]
+            self.assertEqual(len(started), 1, results)
+            self.assertEqual(len(rejected), 1, results)
+            self.assertIn("already", rejected[0]["error"])
+            # wait for the winner's background run to finish, then exactly one
+            # run row exists
+            detail = bridge.loop_detail(lid)
+            for _ in range(100):
+                detail = bridge.loop_detail(lid)
+                if detail["runs"] and detail["runs"][0]["status"] != "running":
+                    break
+                _time.sleep(0.1)
+            self.assertEqual(len(detail["runs"]), 1)
+            self.assertEqual(detail["runs"][0]["status"], "success")
+
+    def test_loop_run_now_reclaims_stale_running_claim(self):
+        # A crashed runner that never cleared 'running' must not block run_now
+        # forever: a claim older than the run timeout is re-claimable.
+        with _TempDB():
+            lid = bridge.loop_create("x", "p", command="echo")["loop"]["id"]
+            from morpheus import db as _db
+            _db.claim_loop_run(lid, started_at=1.0, next_run_at=2.0, stale_after=600)
+            r = bridge.loop_action(lid, "run_now", wait=True)
+            self.assertTrue(r["ok"], r)
+            self.assertEqual(r["status"], "success")
 
     def test_loop_run_output(self):
         with _TempDB():
@@ -295,6 +368,15 @@ class BridgeFeedTest(unittest.TestCase):
             rules = bridge.feed_rules_list()
             self.assertEqual(rules[0]["source_ref"], str(lid))
             self.assertEqual(rules[0]["source_name"], "hn-watch")
+
+    def test_feed_items_after_pages_oldest_first(self):
+        from morpheus import feeds
+        with _TempDB():
+            ids = [feeds.post(f"item {i}") for i in range(3)]
+            items = bridge.feed_items_after(0, limit=2)
+            self.assertEqual([it["id"] for it in items], ids[:2])
+            rest = bridge.feed_items_after(items[-1]["id"], limit=2)
+            self.assertEqual([it["id"] for it in rest], ids[2:])
 
     def test_feed_text_plain(self):
         with _TempDB():

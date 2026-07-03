@@ -3121,6 +3121,43 @@ class DashboardTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("WMT disciplined zone", app.alerts[0].text)
         self.assertIn(run.id, app.alerted_loop_run_ids)
 
+    async def test_loop_already_running_shows_calm_alert_not_error(self) -> None:
+        # Losing the atomic claim to another runner (launchd tick, desktop
+        # bridge) is healthy coordination — it must not render as a red
+        # "run failed" alert.
+        app = DashboardHarness()
+        loop = dashboard.db.PromptLoop(
+            id=7,
+            name="market scan",
+            prompt="summarize catalysts",
+            interval_seconds=900,
+            command="codex exec",
+            next_run_at=0,
+        )
+
+        def fake_run_loop(loop_arg, *, timeout, cwd=None):
+            raise dashboard.loops_mod.LoopAlreadyRunning(
+                f"loop #{loop_arg.id} is already running")
+
+        with isolated_dashboard_runtime(), patch.object(
+            dashboard.db, "get_loop", new=lambda loop_id: loop if loop_id == loop.id else None
+        ), patch.object(
+            dashboard.loops_mod, "run_loop", new=fake_run_loop
+        ), patch.object(
+            app, "_refresh_table", new=lambda: None
+        ), patch.object(
+            app, "_refresh_mission_card", new=lambda missions=None: None
+        ):
+            async with app.run_test(size=(120, 40)) as pilot:
+                await app._run_loop_once(loop.id)
+                await pilot.pause()
+
+        self.assertNotIn(loop.id, app.running_loop_ids)
+        alert = app.alerts[0]
+        self.assertEqual(alert.kind, "summary")
+        self.assertIn("already running", alert.text)
+        self.assertFalse(any(a.kind == "error" for a in app.alerts))
+
     def test_scan_new_loop_runs_posts_white_rabbit_alert(self) -> None:
         app = DashboardHarness()
         with tempfile.TemporaryDirectory() as tmp:

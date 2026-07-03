@@ -163,6 +163,10 @@ def visible_output_lines(output: str, *, prompt: str = "") -> list[str]:
     return lines
 
 
+class LoopAlreadyRunning(RuntimeError):
+    """Another runner holds the claim on this loop — skip instead of doubling."""
+
+
 def run_due(
     *,
     limit: int = 5,
@@ -173,7 +177,10 @@ def run_due(
 ) -> list[db.PromptLoopRun]:
     runs: list[db.PromptLoopRun] = []
     for loop in db.due_loops(now=now, limit=limit, tenant_id=tenant_id):
-        runs.append(run_loop(loop, timeout=timeout, cwd=cwd))
+        try:
+            runs.append(run_loop(loop, timeout=timeout, cwd=cwd))
+        except LoopAlreadyRunning:
+            continue
     return runs
 
 
@@ -182,18 +189,30 @@ def run_loop(
     *,
     timeout: int = DEFAULT_TIMEOUT_SECONDS,
     cwd: Optional[Path] = None,
+    preclaimed: bool = False,
 ) -> db.PromptLoopRun:
     started = time.time()
-    db.mark_loop_running(
-        loop.id,
-        started_at=started,
-        next_run_at=started + loop.interval_seconds,
-    )
+    # Atomic claim: exactly one of the concurrent runners (launchd run-due,
+    # desktop bridge, dashboard) wins; the rest see LoopAlreadyRunning. A claim
+    # left behind by a crashed runner goes stale after the run timeout.
+    # ``preclaimed=True`` means the caller already holds the claim (it called
+    # db.claim_loop_run itself so it could report the outcome synchronously,
+    # e.g. the desktop bridge's fire-and-forget run_now) — don't claim twice,
+    # or our own fresh claim would look like a rival's.
+    if not preclaimed:
+        claimed = db.claim_loop_run(
+            loop.id,
+            started_at=started,
+            next_run_at=started + loop.interval_seconds,
+            stale_after=timeout,
+        )
+        if claimed is None:
+            raise LoopAlreadyRunning(f"loop #{loop.id} is already running")
     command = build_command(loop.command, loop.prompt)
     run_cwd = cwd or _loop_cwd(loop)
     output_path = _output_path(loop.id, started)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    _write_output_header(output_path, command, run_cwd, started)
+    output_path = _write_output_header(output_path, command, run_cwd, started)
     run = db.start_loop_run(
         loop.id,
         started_at=started,
@@ -244,7 +263,7 @@ def run_loop(
     db.update_loop_after_run(
         loop.id,
         last_run_at=finished,
-        next_run_at=finished + loop.interval_seconds,
+        next_run_at=_next_run_at(loop, started=started, finished=finished),
         last_run_status=status,
         last_summary=summary,
     )
@@ -327,12 +346,33 @@ def publish_run(loop: db.PromptLoop, run: db.PromptLoopRun) -> None:
     )
 
 
+def _next_run_at(loop: db.PromptLoop, *, started: float, finished: float) -> float:
+    """Anchor the next run to the scheduled slot, not the finish time.
+
+    Scheduling from `finished + interval` drifts a daily loop later by its run
+    duration every day. Instead anchor to the slot the run was due at
+    (`loop.next_run_at` before the claim bumped it); after an outage, catch up
+    to the next future slot rather than bursting through the missed ones. A
+    manual run before the due time re-anchors from its own start — the claim
+    already pushed next_run_at, so the old slot cannot double-fire.
+    """
+    scheduled = loop.next_run_at
+    anchor = scheduled if 0 < scheduled <= started else started
+    next_at = anchor + loop.interval_seconds
+    while next_at <= finished:
+        next_at += loop.interval_seconds
+    return next_at
+
+
 def _output_path(loop_id: int, ts: float) -> Path:
     stamp = time.strftime("%Y%m%dT%H%M%S", time.localtime(ts))
     return db.DB_DIR / "loops" / str(loop_id) / f"{stamp}.txt"
 
 
-def _write_output_header(output_path: Path, command: str, cwd: Optional[Path], started: float) -> None:
+def _write_output_header(output_path: Path, command: str, cwd: Optional[Path], started: float) -> Path:
+    """Create the output file exclusively, suffixing the name on collision so
+    two runs stamped to the same second never share (or truncate) one file.
+    Returns the path actually used."""
     lines = [
         f"$ {command}",
         f"started: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(started))}",
@@ -340,7 +380,17 @@ def _write_output_header(output_path: Path, command: str, cwd: Optional[Path], s
     if cwd:
         lines.append(f"cwd: {cwd}")
     lines.append("")
-    output_path.write_text("\n".join(lines), encoding="utf-8")
+    text = "\n".join(lines)
+    candidate = output_path
+    suffix = 1
+    while True:
+        try:
+            with candidate.open("x", encoding="utf-8") as out:
+                out.write(text)
+            return candidate
+        except FileExistsError:
+            candidate = output_path.with_name(f"{output_path.stem}-{suffix}{output_path.suffix}")
+            suffix += 1
 
 
 def _append_output_footer(

@@ -30,10 +30,15 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
+from morpheus import db as _db
 from morpheus.db import _connect
 
 DEFAULT_FEED = "main"
 POLICIES = ("always", "on_change", "on_match", "on_failure")
+# Stored titles are stripped and truncated; evaluate() must normalize candidate
+# summaries with the *same* recipe or a long unchanged summary would look
+# "changed" on every run. One constant + one helper so they cannot drift.
+TITLE_MAX_CHARS = 200
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS feed_items (
@@ -87,9 +92,27 @@ class FeedRule:
     created_at: float
 
 
+_initialized_db_paths: set[str] = set()
+
+
 def _init() -> None:
+    # The DDL is idempotent but not free, and _init() runs on hot paths
+    # (per-evaluate, per-SSE-tick). Memoize per resolved database path — not
+    # globally — because tests repoint db.DB_PATH at per-case temp dirs and
+    # each fresh file still needs its schema created.
+    key = str(_db.DB_PATH)
+    if key in _initialized_db_paths:
+        return
     with _connect() as conn:
         conn.executescript(_SCHEMA)
+    _initialized_db_paths.add(key)
+
+
+def _normalize_title(text: str) -> str:
+    """The canonical shape of a stored feed-item title: stripped, truncated to
+    ``TITLE_MAX_CHARS``, re-stripped (truncation can expose trailing space).
+    post() stores this shape; on_change comparisons must use the same one."""
+    return (text or "").strip()[:TITLE_MAX_CHARS].strip()
 
 
 # ── items ────────────────────────────────────────────────────────────────
@@ -99,7 +122,7 @@ def post(title: str, body: str = "", *, source_kind: str = "manual",
          source_ref: str = "", priority: int = 0, feed: str = DEFAULT_FEED,
          metadata: Optional[dict] = None) -> int:
     """Append one condensed item to a feed. Returns the item id."""
-    title = (title or "").strip()
+    title = _normalize_title(title)
     if not title:
         raise ValueError("feed item needs a title")
     _init()
@@ -107,7 +130,7 @@ def post(title: str, body: str = "", *, source_kind: str = "manual",
         cur = conn.execute(
             "INSERT INTO feed_items (feed, ts, title, body, source_kind, source_ref, priority, metadata)"
             " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (feed, time.time(), title[:200], body, source_kind, source_ref,
+            (feed, time.time(), title, body, source_kind, source_ref,
              int(priority), json.dumps(metadata or {})),
         )
         return cur.lastrowid
@@ -120,6 +143,21 @@ def recent(limit: int = 50, *, feed: str = DEFAULT_FEED,
         rows = conn.execute(
             "SELECT * FROM feed_items WHERE feed = ? AND id > ?"
             " ORDER BY ts DESC, id DESC LIMIT ?",
+            (feed, since_id, limit),
+        ).fetchall()
+    return [_item(r) for r in rows]
+
+
+def recent_after(since_id: int, limit: int = 50, *, feed: str = DEFAULT_FEED) -> list[FeedItem]:
+    """Cursor fetch for streaming consumers: the *oldest* ``limit`` items with
+    id > ``since_id``, ascending. A burst larger than ``limit`` then arrives
+    across successive polls instead of being skipped forever; ``recent()``
+    stays newest-first for display callers."""
+    _init()
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT * FROM feed_items WHERE feed = ? AND id > ?"
+            " ORDER BY id ASC LIMIT ?",
             (feed, since_id, limit),
         ).fetchall()
     return [_item(r) for r in rows]
@@ -215,6 +253,7 @@ def delete_rule(rule_id: int) -> bool:
 
 
 def _last_posted_title(source_kind: str, source_ref: str, feed: str) -> str:
+    _init()
     with _connect() as conn:
         row = conn.execute(
             "SELECT title FROM feed_items WHERE feed = ? AND source_kind = ?"
@@ -236,8 +275,11 @@ def evaluate(rule: FeedRule, *, summary: str, failed: bool) -> bool:
         except re.error:
             return False
     if rule.policy == "on_change":
-        return summary.strip() != _last_posted_title(
-            rule.source_kind, rule.source_ref, rule.feed).strip()
+        # Compare the candidate in the exact shape post() stores titles in
+        # (normalizing the stored side too, for rows written by older code).
+        candidate = _normalize_title(summary)
+        return candidate != _normalize_title(_last_posted_title(
+            rule.source_kind, rule.source_ref, rule.feed))
     return False
 
 

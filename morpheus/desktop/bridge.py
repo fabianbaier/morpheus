@@ -654,22 +654,36 @@ def loop_action(loop_id: int, action: str, *, timeout: int = 0,
         db.delete_loop(loop_id)
         return {"ok": True, "deleted": True}
     if action == "run_now":
-        if lp.last_run_status == "running":
-            return {"ok": False, "error": "a run is already in progress"}
         run_timeout = timeout or loops_mod.DEFAULT_TIMEOUT_SECONDS
         if wait:
             try:
-                # run_loop publishes the result itself (notes + feed routing).
+                # run_loop publishes the result itself (notes + feed routing);
+                # its atomic claim is the concurrency guard.
                 run = loops_mod.run_loop(lp, timeout=run_timeout)
                 return {"ok": run.status in ("ok", "success"), "status": run.status,
                         "summary": run.summary, "exit_code": run.exit_code}
+            except loops_mod.LoopAlreadyRunning:
+                return {"ok": False, "error": "a run is already in progress"}
             except Exception as e:
                 return {"ok": False, "error": str(e)}
+        # Fire-and-forget: take the atomic claim *before* replying, so of two
+        # concurrent run_nows exactly one reports started:true — the loser must
+        # not learn about the collision only after the background thread
+        # swallows LoopAlreadyRunning. The thread then runs the pre-claimed
+        # loop without claiming again.
+        started = time.time()
+        if db.claim_loop_run(
+            loop_id,
+            started_at=started,
+            next_run_at=started + lp.interval_seconds,
+            stale_after=run_timeout,
+        ) is None:
+            return {"ok": False, "error": "a run is already in progress"}
         import threading
 
         def _bg():
             try:
-                loops_mod.run_loop(lp, timeout=run_timeout)
+                loops_mod.run_loop(lp, timeout=run_timeout, preclaimed=True)
             except Exception:
                 pass
 
@@ -775,22 +789,31 @@ def goal_action(goal_id: str, action: str, *, reason: str = "") -> dict[str, Any
 # ───────────────────────── feed (the aggregator) ─────────────────────────
 
 
+def _feed_item_dict(it) -> dict[str, Any]:
+    return {
+        "id": it.id,
+        "ts": it.ts,
+        "age": _age(it.ts),
+        "title": it.title,
+        "body": it.body,
+        "source_kind": it.source_kind,
+        "source_ref": it.source_ref,
+        "priority": it.priority,
+    }
+
+
 def feed_items(limit: int = 50, since_id: int = 0) -> list[dict[str, Any]]:
     from morpheus import feeds
 
-    return [
-        {
-            "id": it.id,
-            "ts": it.ts,
-            "age": _age(it.ts),
-            "title": it.title,
-            "body": it.body,
-            "source_kind": it.source_kind,
-            "source_ref": it.source_ref,
-            "priority": it.priority,
-        }
-        for it in feeds.recent(limit, since_id=since_id)
-    ]
+    return [_feed_item_dict(it) for it in feeds.recent(limit, since_id=since_id)]
+
+
+def feed_items_after(since_id: int, limit: int = 50) -> list[dict[str, Any]]:
+    """Cursor variant for stream consumers: oldest-first after ``since_id`` so
+    a burst larger than ``limit`` is delivered across polls, never dropped."""
+    from morpheus import feeds
+
+    return [_feed_item_dict(it) for it in feeds.recent_after(since_id, limit)]
 
 
 def feed_post(title: str, body: str = "", priority: int = 0) -> dict[str, Any]:
