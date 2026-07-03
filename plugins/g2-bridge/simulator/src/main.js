@@ -86,8 +86,11 @@ function setBusy(isBusy) {
 }
 
 function saveConfig() {
-  const bridgeUrl = elements.bridgeUrl.value.trim();
+  // An emptied URL field resets to the default bridge URL everywhere: input,
+  // storage, and client stay in sync instead of silently diverging.
+  const bridgeUrl = elements.bridgeUrl.value.trim() || DEFAULT_BRIDGE_URL;
   const token = elements.bridgeToken.value.trim();
+  elements.bridgeUrl.value = bridgeUrl;
   saveBridgeConfig(window, { bridgeUrl, token });
   client.configure({ bridgeUrl, token });
 }
@@ -99,9 +102,14 @@ function render(snapshot) {
   elements.evenClientFrame.hidden = !isEvenSkin;
   if (isEvenSkin) renderEvenClient(snapshot);
   else elements.glassesText.textContent = text;
+  queueEvenDisplayRender(text);
+}
+
+function queueEvenDisplayRender(text) {
   pendingRender = pendingRender.then(() => renderEvenDisplay(text)).catch((err) => {
     log(`Even display render failed: ${err.message}`);
   });
+  return pendingRender;
 }
 
 function renderEvenClient(snapshot) {
@@ -199,13 +207,20 @@ async function initEvenDisplay() {
       void handleEvenEvent(eventType);
     });
     log("Even bridge ready");
-    await renderEvenDisplay(client.snapshot().glassesText);
+    // Route through the shared chain so the startup render serializes with any
+    // renders already in flight and the container is only created once.
+    await queueEvenDisplayRender(client.snapshot().glassesText);
   } catch (err) {
     log(`Even SDK unavailable: ${err.message}`);
   }
 }
 
+// OsEventTypeList: 0 = click, 1 = scroll top, 2 = scroll bottom, 3 = double click.
 async function handleEvenEvent(eventType) {
+  if (eventType === 0) {
+    await runAction(() => client.activateSelected());
+    return;
+  }
   if (eventType === 1) {
     client.move(-1);
     return;
@@ -218,10 +233,16 @@ async function handleEvenEvent(eventType) {
     await runAction(() => client.navigateBack());
     return;
   }
-  await runAction(() => client.activateSelected());
+  log(`Ignoring unrecognized Even hub event type: ${eventType}`);
 }
 
+let actionInFlight = false;
+
 async function runAction(action) {
+  // Buttons are disabled while busy, but Enter/Escape and Even hub gestures
+  // land here too; dropping them keeps async actions from overlapping.
+  if (actionInFlight) return;
+  actionInFlight = true;
   setBusy(true);
   try {
     await action();
@@ -230,6 +251,7 @@ async function runAction(action) {
     client.emit();
     log(err.message);
   } finally {
+    actionInFlight = false;
     setBusy(false);
   }
 }

@@ -58,10 +58,6 @@ function roleFromMessage(message) {
   return "system";
 }
 
-function lastMessageId(messages) {
-  return coerceArray(messages).reduce((max, message) => Math.max(max, Number(message?.id || 0)), 0);
-}
-
 function historyToMessages(history) {
   return coerceArray(history).map((entry, index) =>
     normalizeMessage(
@@ -102,10 +98,48 @@ function messagesFromResponseBody(body) {
             role: "assistant",
             text,
           },
-          { id: 1 },
+          { id: 0 },
         ),
       ]
     : [];
+}
+
+// Shared fallback chain for the session ids carried by bridge responses
+// (/api/sessions, /api/transcript/finalize). body.sessionId is only present on
+// finalize responses; /api/sessions never sets it, so including it in the
+// superset is safe for both endpoints. selectSession intentionally uses a
+// different chain (the just-requested sessionId, not prior state, is the
+// fallback there) and does not go through this helper.
+function sessionIdsFromResponse(body, state) {
+  const selected = body?.selectedSession || null;
+  return {
+    displaySessionId:
+      body?.displaySessionId ||
+      body?.projectActiveSessionId ||
+      selected?.projectActiveSessionId ||
+      selected?.id ||
+      state.displaySessionId ||
+      body?.sessionId ||
+      "",
+    activeSessionId:
+      body?.activeSessionId ||
+      selected?.activeSessionId ||
+      selected?.realSessionId ||
+      body?.sessionId ||
+      state.activeSessionId ||
+      "",
+  };
+}
+
+// Fabricated messages (history rows, optimistic local prompts, latest-output
+// snapshots) never carry a real server id; they get id <= 0 so they can never
+// advance the /api/messages cursor and dedupe purely by role + content.
+function isServerMessage(message) {
+  return Number(message?.id || 0) > 0;
+}
+
+function messageContentKey(message) {
+  return `${roleFromMessage(message)}:${textFromMessage(message)}`;
 }
 
 function truncateLine(value, max = 76) {
@@ -228,6 +262,15 @@ export class G2BridgeClient {
     this.onChange = options.onChange || (() => {});
     this.onLog = options.onLog || (() => {});
     this.eventSource = null;
+    // Server-side /api/messages cursor. Tracked apart from display messages so
+    // fabricated history/local ids can never reset or advance it.
+    this.serverCursor = 0;
+    this.localMessageSeq = 0;
+    // Background wait for the reply to the last submitted transcript. Kept as
+    // a handle so tests (and callers that care) can await it; bumping the
+    // epoch cancels a stale wait when a newer submit or reconfigure wins.
+    this.pendingResultWait = null;
+    this.resultWaitEpoch = 0;
     this.state = {
       info: null,
       mode: "projects",
@@ -244,8 +287,29 @@ export class G2BridgeClient {
   }
 
   configure({ bridgeUrl, token } = {}) {
-    if (bridgeUrl) this.bridgeUrl = trimTrailingSlash(bridgeUrl);
-    if (token !== undefined) this.token = token;
+    // An emptied field falls back to the default bridge URL instead of being
+    // silently ignored while the input keeps showing the stale value.
+    const nextBridgeUrl =
+      bridgeUrl !== undefined ? trimTrailingSlash(bridgeUrl) || DEFAULT_BRIDGE_URL : this.bridgeUrl;
+    const nextToken = token !== undefined ? token : this.token;
+    const changed = nextBridgeUrl !== this.bridgeUrl || nextToken !== this.token;
+    this.bridgeUrl = nextBridgeUrl;
+    this.token = nextToken;
+    if (changed) {
+      // A different bridge (or credential) invalidates the open stream and the
+      // /api/messages cursor: keeping the old cursor would make the new bridge
+      // skip every buffered message (`after` too high) while the old bridge's
+      // stream kept writing into the view.
+      this.close();
+      this.resultWaitEpoch += 1;
+      this.serverCursor = 0;
+      this.state = {
+        ...this.state,
+        messages: [],
+        status: "idle",
+        error: "",
+      };
+    }
     this.emit();
   }
 
@@ -293,9 +357,21 @@ export class G2BridgeClient {
       body: options.body ? JSON.stringify(options.body) : undefined,
     });
     const contentType = response.headers?.get?.("content-type") || "";
-    const body = contentType.includes("application/json") ? await response.json() : await response.text();
+    const raw = await response.text();
+    let body = raw;
+    if (contentType.includes("application/json") && raw) {
+      try {
+        body = JSON.parse(raw);
+      } catch (err) {
+        if (response.ok) throw new Error(`${method} ${path} returned invalid JSON: ${err.message}`);
+        // Fall through with the raw text so the HTTP status is surfaced below.
+      }
+    }
     if (!response.ok) {
-      const error = typeof body === "object" ? body.error || body.code || JSON.stringify(body) : body;
+      const error =
+        body && typeof body === "object"
+          ? body.error || body.code || JSON.stringify(body)
+          : String(body || "").trim();
       throw new Error(error || `${method} ${path} failed with ${response.status}`);
     }
     return body;
@@ -316,6 +392,7 @@ export class G2BridgeClient {
   async refreshProjects() {
     const body = await this.api("/api/sessions?view=projects");
     this.close();
+    this.serverCursor = 0;
     this.state = {
       ...this.state,
       mode: "projects",
@@ -340,17 +417,7 @@ export class G2BridgeClient {
     const view = body.mode || body.view || "sessions";
     const selectedSession = body.selectedSession || null;
     const messages = messagesFromResponseBody(body);
-    const displaySessionId =
-      body.displaySessionId ||
-      body.projectActiveSessionId ||
-      selectedSession?.projectActiveSessionId ||
-      selectedSession?.id ||
-      this.state.displaySessionId;
-    const activeSessionId =
-      body.activeSessionId ||
-      selectedSession?.activeSessionId ||
-      selectedSession?.realSessionId ||
-      this.state.activeSessionId;
+    const { displaySessionId, activeSessionId } = sessionIdsFromResponse(body, this.state);
     this.state = {
       ...this.state,
       mode: view,
@@ -396,6 +463,7 @@ export class G2BridgeClient {
         clientRequestId: requestId("sim-select-project"),
       },
     });
+    this.serverCursor = 0;
     this.state = {
       ...this.state,
       selectedProject: body.selectedProject || this.state.selectedProject,
@@ -419,8 +487,12 @@ export class G2BridgeClient {
       },
     });
     const selected = body.selectedSession || null;
+    // Intentionally not sessionIdsFromResponse: after an explicit selection the
+    // just-requested sessionId (not prior state) is the correct fallback, and
+    // the selected row's own id outranks projectActiveSessionId.
     const displaySessionId = selected?.id || body.projectActiveSessionId || sessionId;
     const activeSessionId = body.activeSessionId || selected?.activeSessionId || selected?.realSessionId || sessionId;
+    this.serverCursor = 0;
     this.state = {
       ...this.state,
       mode: "session",
@@ -432,8 +504,10 @@ export class G2BridgeClient {
       status: selected?.status || "idle",
       error: "",
     };
-    this.openEventStream(displaySessionId);
+    // Load history before the stream opens so replayed SSE messages merge on
+    // top of the history baseline instead of being wiped by it.
     await this.loadHistory(displaySessionId);
+    this.openEventStream(displaySessionId);
     await this.refreshMessages(displaySessionId);
     return this.snapshot();
   }
@@ -442,6 +516,7 @@ export class G2BridgeClient {
     const body = await this.api("/api/back", {
       body: { clientRequestId: requestId("sim-back") },
     });
+    this.serverCursor = 0;
     this.state = {
       ...this.state,
       selectedProject: body.selectedProject || null,
@@ -468,22 +543,12 @@ export class G2BridgeClient {
         clientRequestId: requestId("sim-transcript"),
       },
     });
-    const displaySessionId =
-      body.displaySessionId ||
-      body.projectActiveSessionId ||
-      body.selectedSession?.projectActiveSessionId ||
-      body.selectedSession?.id ||
-      this.state.displaySessionId ||
-      body.sessionId;
-    const activeSessionId =
-      body.activeSessionId ||
-      body.selectedSession?.activeSessionId ||
-      body.selectedSession?.realSessionId ||
-      body.sessionId ||
-      this.state.activeSessionId;
-    const responseMessages = coerceArray(body.messages).length
+    const { displaySessionId, activeSessionId } = sessionIdsFromResponse(body, this.state);
+    const responseMessages = (coerceArray(body.messages).length
       ? body.messages
-      : coerceArray(body.activeMessages);
+      : coerceArray(body.activeMessages)
+    ).map((message) => normalizeMessage(message));
+    this.advanceServerCursor(responseMessages);
     this.state = {
       ...this.state,
       mode: "session",
@@ -491,7 +556,7 @@ export class G2BridgeClient {
       selectedSession: body.selectedSession || this.state.selectedSession,
       displaySessionId,
       activeSessionId,
-      messages: responseMessages.map((message) => normalizeMessage(message)),
+      messages: responseMessages,
       status: body.state || "busy",
       error: "",
     };
@@ -504,13 +569,14 @@ export class G2BridgeClient {
   async submitTranscriptViaSessionPolling(text, options = {}) {
     const clean = String(text || "").trim();
     if (!clean) return this.snapshot();
+    this.localMessageSeq -= 1;
     const localMessage = normalizeMessage(
       {
         type: "user_prompt",
         role: "user",
         text: clean,
       },
-      { id: lastMessageId(this.state.messages) + 1 },
+      { id: this.localMessageSeq },
     );
     this.state = {
       ...this.state,
@@ -521,7 +587,8 @@ export class G2BridgeClient {
     };
     this.emit();
 
-    await this.api("/api/transcript/finalize", {
+    const submittedAfter = this.serverCursor;
+    const body = await this.api("/api/transcript/finalize", {
       body: {
         text: clean,
         sessionId: this.state.displaySessionId || undefined,
@@ -529,11 +596,34 @@ export class G2BridgeClient {
       },
     });
 
+    const { displaySessionId, activeSessionId } = sessionIdsFromResponse(body, this.state);
+    this.state = {
+      ...this.state,
+      selectedProject: body.selectedProject || this.state.selectedProject,
+      selectedSession: body.selectedSession || this.state.selectedSession,
+      displaySessionId,
+      activeSessionId: activeSessionId || "",
+      status: body.state || this.state.status,
+    };
+    this.emit();
+    this.openEventStream(displaySessionId);
+
     const waitFor = options.waitFor || options.pattern || null;
     if (waitFor) {
       return this.waitForTextViaSessions(waitFor, options);
     }
-    return this.refreshSessions();
+    // The transcript is accepted and the event stream is open: resolve now so
+    // callers (the simulator's single-action UI gate) are not blocked for a
+    // whole agent turn. The result wait keeps running in the background and
+    // lands its updates through the normal onChange path; tests and curious
+    // callers can await the handle.
+    const epoch = ++this.resultWaitEpoch;
+    this.pendingResultWait = this.waitForResultViaMessages({
+      ...options,
+      after: submittedAfter,
+      epoch,
+    });
+    return this.snapshot();
   }
 
   async loadHistory(sessionId = this.state.displaySessionId) {
@@ -543,7 +633,7 @@ export class G2BridgeClient {
     if (historyMessages.length) {
       this.state = {
         ...this.state,
-        messages: historyMessages,
+        messages: this.mergeMessages(historyMessages),
         selectedProject: body.selectedProject || this.state.selectedProject,
         selectedSession: body.selectedSession || this.state.selectedSession,
       };
@@ -554,11 +644,12 @@ export class G2BridgeClient {
 
   async refreshMessages(sessionId = this.state.displaySessionId) {
     if (!sessionId) return [];
-    const after = lastMessageId(this.state.messages);
+    const after = this.serverCursor;
     const body = await this.api(
       `/api/messages?sessionId=${encodeURIComponent(sessionId)}&after=${encodeURIComponent(after)}`,
     );
     const messages = coerceArray(body.messages).map((message) => normalizeMessage(message));
+    this.advanceServerCursor(messages);
     if (messages.length || body.state) {
       this.state = {
         ...this.state,
@@ -573,15 +664,42 @@ export class G2BridgeClient {
     return messages;
   }
 
-  mergeMessages(messages) {
-    const byKey = new Map();
-    for (const message of coerceArray(this.state.messages)) {
-      byKey.set(`${message.id}:${message.type}:${textFromMessage(message)}`, message);
-    }
+  advanceServerCursor(messages) {
     for (const message of coerceArray(messages)) {
-      byKey.set(`${message.id}:${message.type}:${textFromMessage(message)}`, message);
+      const id = Number(message?.id || 0);
+      if (id > this.serverCursor) this.serverCursor = id;
     }
-    return [...byKey.values()].slice(-30);
+  }
+
+  mergeMessages(messages) {
+    const incoming = coerceArray(messages);
+    // Server-buffered copies supersede their fabricated history/local twins so
+    // each exchange renders exactly once, in buffer order.
+    const incomingServerKeys = new Set(
+      incoming.filter((message) => isServerMessage(message)).map((message) => messageContentKey(message)),
+    );
+    const existing = coerceArray(this.state.messages).filter(
+      (message) => isServerMessage(message) || !incomingServerKeys.has(messageContentKey(message)),
+    );
+
+    const merged = [];
+    const seenIds = new Set();
+    const seenContent = new Set();
+    for (const message of [...existing, ...incoming]) {
+      const contentKey = messageContentKey(message);
+      if (isServerMessage(message)) {
+        const idKey = `${message.id}:${message.type}:${textFromMessage(message)}`;
+        if (seenIds.has(idKey)) continue;
+        seenIds.add(idKey);
+      } else if (seenContent.has(contentKey)) {
+        // Fabricated rows dedupe purely by role + content against everything
+        // already rendered, including buffered copies of the same exchange.
+        continue;
+      }
+      seenContent.add(contentKey);
+      merged.push(message);
+    }
+    return merged.slice(-30);
   }
 
   openEventStream(sessionId = this.state.displaySessionId) {
@@ -597,6 +715,7 @@ export class G2BridgeClient {
       try {
         const parsed = JSON.parse(event.data);
         const message = normalizeMessage(parsed, { id: Number(event.lastEventId || 0) });
+        this.advanceServerCursor([message]);
         this.state = {
           ...this.state,
           messages: this.mergeMessages([message]),
@@ -630,6 +749,47 @@ export class G2BridgeClient {
       await new Promise((resolve) => setTimeout(resolve, intervalMs));
     }
     throw new Error(`Timed out waiting for ${String(pattern)}`);
+  }
+
+  // Bounded wait for the reply to a just-submitted transcript: returns once a
+  // new terminal message landed and the session settled, or after timeoutMs
+  // without throwing (the open event stream keeps delivering afterwards).
+  // While the SSE stream is open it already delivers every message, so the
+  // wait resolves off SSE-driven state changes and only polls /api/messages as
+  // a coarse fallback; the tight intervalMs polling cadence is reserved for
+  // runs without an open stream.
+  async waitForResultViaMessages(options = {}) {
+    const timeoutMs = options.timeoutMs || 15000;
+    const intervalMs = options.intervalMs || 250;
+    const streamPollIntervalMs = options.streamPollIntervalMs || 2000;
+    const epoch = options.epoch;
+    const after = Number(options.after || 0);
+    const started = Date.now();
+    // With an open stream the first fallback poll waits a full coarse
+    // interval; without one, polling starts immediately as before.
+    let lastPollAt = this.eventSource ? Date.now() : 0;
+    while (Date.now() - started < timeoutMs) {
+      // A newer submit or a reconfigure supersedes this wait.
+      if (epoch !== undefined && epoch !== this.resultWaitEpoch) return this.snapshot();
+      const pollEvery = this.eventSource ? streamPollIntervalMs : intervalMs;
+      if (Date.now() - lastPollAt >= pollEvery) {
+        lastPollAt = Date.now();
+        await this.refreshMessages().catch((err) => {
+          this.state = { ...this.state, error: err.message };
+          this.emit();
+        });
+      }
+      const answered = coerceArray(this.state.messages).some(
+        (message) =>
+          isServerMessage(message) &&
+          message.id > after &&
+          (message.type === "result" || message.type === "error"),
+      );
+      if (answered && this.state.status !== "busy") return this.snapshot();
+      await new Promise((resolve) => setTimeout(resolve, intervalMs));
+    }
+    this.log(`No result after ${timeoutMs}ms; the event stream keeps listening`);
+    return this.snapshot();
   }
 
   async waitForTextViaSessions(pattern, options = {}) {

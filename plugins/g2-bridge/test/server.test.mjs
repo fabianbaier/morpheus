@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
-import { createBridge, startBridge } from "../src/server.mjs";
+import { createBridge, createMorpheusProvider, runJsonCommand, startBridge } from "../src/server.mjs";
 import { G2BridgeClient } from "../simulator/src/bridge-client.js";
 
 const TOKEN = "test-token-123456";
@@ -3751,4 +3751,732 @@ test("stream and poll messages carry the session id the client asked for", async
   const polledResult = polledBody.messages.find((message) => message.type === "result");
   assert.equal(polledResult.sessionId, "project-session:p_alpha");
   assert.equal(polledResult.activeSessionId, "codex-thread-1");
+});
+
+test("failed spawn publishes a failure result and returns the project row to idle", async (t) => {
+  const { baseUrl, state } = await withBridge(t, {
+    agentBackend: "codex_app_server",
+    createCodexAgentProvider: fakeCodexAgentProvider({
+      promptFailuresBeforeSuccess: 1,
+      promptFailureMessage: "model refused the request",
+    }),
+    mirrorCodexTui: false,
+    showProjectsFirst: true,
+  });
+
+  // A stale busy mark on the selected project row must also be cleared by the
+  // spawn failure, exactly as the prompt-failure path clears its session.
+  state.selectedSession = {
+    id: "project:p_alpha",
+    title: "alpha",
+    provider: "codex",
+    status: "busy",
+  };
+
+  const prompt = await request(baseUrl, "/api/prompt", {
+    body: {
+      sessionId: "project:p_alpha",
+      text: "this spawn will fail",
+      clientRequestId: "spawn-failure-idle-prompt",
+    },
+  });
+  assert.equal(prompt.status, 500);
+  assert.equal((await prompt.json()).code, "spawn_failed");
+
+  // Polls must not report the project row as busy forever after the failure.
+  const messages = await request(baseUrl, "/api/messages?sessionId=project:p_alpha");
+  const messagesBody = await messages.json();
+  assert.equal(messagesBody.state, "idle");
+
+  const buffered = state.sessions.get("project:p_alpha")?.messages || [];
+  const failure = buffered.find((message) => message.type === "result" && message.success === false);
+  assert.match(failure?.text || "", /model refused the request/);
+  assert.equal(buffered.at(-1)?.type, "status");
+  assert.equal(buffered.at(-1)?.state, "idle");
+
+  // The internal busy marks are cleared too, so session polls report idle.
+  assert.equal(state.selectedSession?.status, "idle", "spawn failure must mark the selected session idle");
+  for (const projectSession of state.projectActiveSessions.values()) {
+    assert.notEqual(projectSession?.status, "busy", "no project session may stay busy after a failed spawn");
+  }
+  const sessions = await request(baseUrl, "/api/sessions");
+  assert.equal(sessions.status, 200);
+  assert.equal((await sessions.json()).state, "idle");
+});
+
+test("failed follow-up prompt returns the session to idle with a failure message", async (t) => {
+  let failNextPrompt = false;
+  const { baseUrl } = await withBridge(t, {
+    agentBackend: "codex_app_server",
+    createCodexAgentProvider: (emit, client) => {
+      const provider = fakeCodexAgentProvider()(emit, client);
+      const originalPrompt = provider.prompt.bind(provider);
+      provider.prompt = async (...args) => {
+        if (failNextPrompt) {
+          failNextPrompt = false;
+          throw new Error("model refused the request");
+        }
+        return originalPrompt(...args);
+      };
+      return provider;
+    },
+    mirrorCodexTui: false,
+    showProjectsFirst: true,
+  });
+
+  const first = await request(baseUrl, "/api/prompt", {
+    body: {
+      sessionId: "project:p_alpha",
+      text: "first working turn",
+      clientRequestId: "prompt-failure-idle-first",
+    },
+  });
+  assert.equal(first.status, 202);
+
+  failNextPrompt = true;
+  const second = await request(baseUrl, "/api/prompt", {
+    body: {
+      sessionId: "project:p_alpha",
+      text: "second failing turn",
+      clientRequestId: "prompt-failure-idle-second",
+    },
+  });
+  assert.equal(second.status, 500);
+  assert.equal((await second.json()).code, "prompt_failed");
+
+  const messages = await request(baseUrl, "/api/messages?sessionId=codex-thread-1");
+  const messagesBody = await messages.json();
+  assert.equal(messagesBody.state, "idle");
+  const failure = messagesBody.messages.find(
+    (message) => message.type === "result" && message.success === false,
+  );
+  assert.match(failure?.text || "", /model refused the request/);
+  const lastStatus = messagesBody.messages.filter((message) => message.type === "status").at(-1);
+  assert.equal(lastStatus.state, "idle");
+
+  // The failed turn must not leave a dangling stale-mirror hold: the project
+  // row mirrors the same terminal messages.
+  const projectMessages = await request(baseUrl, "/api/messages?sessionId=project-session:p_alpha");
+  const projectMessagesBody = await projectMessages.json();
+  assert.equal(projectMessagesBody.state, "idle");
+});
+
+test("select-session project rows fail as JSON and use cached projects when the provider is down", async (t) => {
+  let failProjects = false;
+  const base = fakeMorpheusRunner();
+  const runner = async (command, args, options) => {
+    if (args[1] === "projects" && failProjects) throw new Error("project list down");
+    return base(command, args, options);
+  };
+  const { baseUrl } = await withBridge(t, { runner, showProjectsFirst: true });
+
+  // No cached project list yet: the failure must surface as JSON, not as
+  // Express's default HTML 500 page.
+  failProjects = true;
+  const cold = await request(baseUrl, "/api/select-session", {
+    body: {
+      sessionId: "project-session:p_alpha",
+      clientRequestId: "select-session-provider-down-cold",
+    },
+  });
+  assert.equal(cold.status, 500);
+  assert.match(cold.headers.get("content-type") || "", /application\/json/);
+  assert.match((await cold.json()).error, /project list down/);
+
+  // Prime the cache and remember an active session, then the same selection
+  // succeeds from the cached project list while the provider stays down.
+  failProjects = false;
+  const projects = await request(baseUrl, `/api/sessions?token=${TOKEN}`, { token: null });
+  assert.equal(projects.status, 200);
+  const seed = await request(baseUrl, "/api/prompt", {
+    body: {
+      sessionId: "project:p_alpha",
+      text: "seed active session",
+      clientRequestId: "select-session-provider-down-seed",
+    },
+  });
+  assert.equal(seed.status, 202);
+  failProjects = true;
+  const warm = await request(baseUrl, "/api/select-session", {
+    body: {
+      sessionId: "project-session:p_alpha",
+      clientRequestId: "select-session-provider-down-warm",
+    },
+  });
+  assert.equal(warm.status, 200);
+  const warmBody = await warm.json();
+  assert.equal(warmBody.ok, true);
+  assert.equal(warmBody.selectedProject.id, "p_alpha");
+  assert.equal(warmBody.activeSessionId, "mirror-tab");
+});
+
+test("prompt result wait ignores a stale buffered answer when the provider redirects the session id", async (t) => {
+  const seeded = {
+    id: "old-cached-thread",
+    title: "Old cached Codex thread",
+    timestamp: new Date(1_779_999_000_000).toISOString(),
+    cwd: "/tmp/morpheus-alpha",
+    status: "idle",
+  };
+  const { baseUrl } = await withBridge(t, {
+    agentBackend: "codex_app_server",
+    createCodexAgentProvider: (emit) => ({
+      async getInfo() {
+        return { provider: "codex", model: "Codex", version: "test" };
+      },
+      async listSessions(_limit, cwd) {
+        return !cwd || seeded.cwd === cwd ? [seeded] : [];
+      },
+      getStatus() {
+        return null;
+      },
+      async getSessionStatus() {
+        return "idle";
+      },
+      async getHistory() {
+        return [];
+      },
+      async prompt(sessionId, text) {
+        const finish = () => {
+          emit("codex-thread-stale", {
+            type: "result",
+            success: true,
+            text: `answer for: ${text}`,
+            provider: "codex",
+            sessionId: "codex-thread-stale",
+          });
+          emit("codex-thread-stale", {
+            type: "status",
+            state: "idle",
+            provider: "codex",
+            sessionId: "codex-thread-stale",
+          });
+        };
+        if (!sessionId) {
+          // Turn one spawns the thread that later holds the stale answer.
+          finish();
+        } else {
+          // Follow-ups on other threads resolve to the same redirected id,
+          // whose buffer already holds the previous turn's answer.
+          const timer = setTimeout(finish, 120);
+          if (typeof timer.unref === "function") timer.unref();
+        }
+        return { sessionId: "codex-thread-stale", provider: "codex" };
+      },
+    }),
+    mirrorCodexTui: false,
+    showProjectsFirst: true,
+    waitForPromptResult: true,
+    promptWaitForResultMs: 2000,
+  });
+
+  const first = await request(baseUrl, "/api/prompt", {
+    body: {
+      sessionId: "project:p_beta",
+      text: "first stale turn",
+      clientRequestId: "redirect-stale-first",
+    },
+  });
+  assert.equal(first.status, 202);
+  assert.equal((await first.json()).text, "answer for: first stale turn");
+
+  await request(baseUrl, "/api/select-project", {
+    body: { projectId: "p_alpha", clientRequestId: "redirect-stale-select-project" },
+  });
+  // Opening the seeded thread row selects it as the outbound session.
+  const open = await request(baseUrl, "/api/sessions/old-cached-thread/history");
+  assert.equal(open.status, 200);
+
+  const follow = await request(baseUrl, "/api/prompt", {
+    body: {
+      text: "redirected follow-up",
+      clientRequestId: "redirect-stale-follow",
+    },
+  });
+  assert.equal(follow.status, 202);
+  const followBody = await follow.json();
+  assert.equal(
+    followBody.text,
+    "answer for: redirected follow-up",
+    "the previous turn's buffered answer must not resolve the new prompt",
+  );
+});
+
+test("expired pre-auth rate limit buckets are swept from memory", async (t) => {
+  const { baseUrl, state } = await withBridge(t);
+  for (let i = 0; i < 50; i += 1) {
+    state.rateLimits.set(`10.0.0.${i}:read`, { windowStart: 1, count: 3 });
+  }
+
+  const res = await request(baseUrl, "/api/info");
+  assert.equal(res.status, 200);
+  for (let i = 0; i < 50; i += 1) {
+    assert.equal(state.rateLimits.has(`10.0.0.${i}:read`), false, "expired buckets must be swept");
+  }
+  assert.ok(state.rateLimits.size >= 1, "the live requester keeps its bucket");
+
+  // Even unexpired buckets cannot grow past the hard cap.
+  const now = Date.now();
+  for (let i = 0; i < 4200; i += 1) {
+    state.rateLimits.set(`10.1.${Math.floor(i / 250)}.${i % 250}:read`, {
+      windowStart: now,
+      count: 1,
+    });
+  }
+  const capped = await request(baseUrl, "/api/info");
+  assert.equal(capped.status, 200);
+  assert.ok(
+    state.rateLimits.size <= 4097,
+    `rate limit map must stay capped, got ${state.rateLimits.size}`,
+  );
+});
+
+test("evicts idle per-session state beyond the tracked session cap", async (t) => {
+  const { baseUrl, state } = await withBridge(t, {
+    agentBackend: "codex_app_server",
+    createCodexAgentProvider: fakeCodexAgentProvider(),
+    mirrorCodexTui: false,
+    showProjectsFirst: true,
+    maxTrackedSessions: 6,
+  });
+  const prompt = await request(baseUrl, "/api/prompt", {
+    body: {
+      sessionId: "project:p_alpha",
+      text: "keep this conversation",
+      clientRequestId: "evict-keep-prompt",
+    },
+  });
+  assert.equal(prompt.status, 202);
+
+  // Clients can name arbitrary session ids; each opens (and closes) a stream.
+  for (let i = 0; i < 12; i += 1) {
+    const events = await fetch(`${baseUrl}/api/events?sessionId=junk-${i}&token=${TOKEN}`);
+    assert.equal(events.status, 200);
+    await readStreamFor(events.body, 10);
+  }
+  for (let attempt = 0; attempt < 20 && state.sessions.has("junk-0"); attempt += 1) {
+    const extra = await fetch(`${baseUrl}/api/events?sessionId=junk-extra-${attempt}&token=${TOKEN}`);
+    await readStreamFor(extra.body, 10);
+    await sleep(20);
+  }
+
+  assert.equal(state.sessions.has("junk-0"), false, "idle junk session buffers must be evicted");
+  assert.equal(state.sessions.has("codex-thread-1"), true);
+  assert.equal(state.sessions.has("project-session:p_alpha"), true);
+  assert.ok(
+    state.sessions.size <= 8,
+    `tracked sessions must stay near the cap, got ${state.sessions.size}`,
+  );
+
+  // The surviving conversation still serves its transcript.
+  const messages = await request(baseUrl, "/api/messages?sessionId=project-session:p_alpha");
+  const messagesBody = await messages.json();
+  assert.equal(
+    messagesBody.messages.find((message) => message.type === "result")?.text,
+    "answer for: keep this conversation",
+  );
+});
+
+test("runner semaphore hands released slots to queued waiters without over-admitting", async () => {
+  let running = 0;
+  let peak = 0;
+  const gates = [];
+  const provider = createMorpheusProvider({
+    runnerConcurrency: 1,
+    runner: () =>
+      new Promise((resolve) => {
+        running += 1;
+        peak = Math.max(peak, running);
+        gates.push(() => {
+          running -= 1;
+          resolve({ projects: [] });
+        });
+      }),
+  });
+
+  const first = provider.listProjects(1);
+  const second = provider.listProjects(1);
+  await sleep(0);
+  assert.equal(gates.length, 1, "only one runner may start under concurrency 1");
+
+  // Release the held slot and race a brand-new call against the queued waiter.
+  gates.shift()();
+  const third = Promise.resolve().then(() => provider.listProjects(1));
+  await sleep(10);
+  assert.equal(peak, 1, "a fresh call must not run concurrently with the woken waiter");
+
+  for (let i = 0; i < 10 && gates.length; i += 1) {
+    gates.shift()();
+    await sleep(0);
+  }
+  await Promise.all([first, second, third]);
+  assert.equal(peak, 1);
+});
+
+test("non-numeric limit query params fall back to defaults", async (t) => {
+  const { baseUrl } = await withBridge(t);
+  const sessions = await request(baseUrl, "/api/sessions?limit=abc");
+  assert.equal(sessions.status, 200);
+  assert.equal((await sessions.json()).sessions[0]?.id, "abc123");
+
+  const projects = await request(baseUrl, "/api/projects?limit=abc");
+  assert.equal(projects.status, 200);
+  assert.equal((await projects.json()).projects.length, 2);
+
+  const historyLimits = [];
+  const codex = await withBridge(t, {
+    agentBackend: "codex_app_server",
+    createCodexAgentProvider: (emit, client) => {
+      const provider = fakeCodexAgentProvider({
+        history: {
+          "codex-thread-1": [
+            { role: "user", text: "limits" },
+            { role: "assistant", text: "bounded answer" },
+          ],
+        },
+      })(emit, client);
+      const originalGetHistory = provider.getHistory.bind(provider);
+      provider.getHistory = async (sessionId, limit) => {
+        historyLimits.push(limit);
+        return originalGetHistory(sessionId, limit);
+      };
+      return provider;
+    },
+    mirrorCodexTui: false,
+    showProjectsFirst: true,
+  });
+  const history = await request(codex.baseUrl, "/api/sessions/codex-thread-1/history?limit=abc");
+  assert.equal(history.status, 200);
+  assert.ok(historyLimits.length >= 1);
+  for (const limit of historyLimits) {
+    assert.equal(
+      Number.isFinite(limit) && limit >= 1,
+      true,
+      `getHistory limit must be a bounded number, got ${limit}`,
+    );
+  }
+});
+
+test("duplicate in-flight selection requests replay instead of re-resolving", async (t) => {
+  let projectsCalls = 0;
+  let snapshotCalls = 0;
+  const base = fakeMorpheusRunner({
+    snapshotDelayMs: 40,
+    snapshotSessions: [
+      {
+        tab_ref: "abc123",
+        mission_ref: "missionalpha",
+        tenant_id: "p_alpha",
+        project_root: "/tmp/morpheus-alpha",
+        state: "idle",
+        goal: "G2: Test Morpheus session",
+        age_secs: 4,
+      },
+    ],
+  });
+  const runner = async (command, args, options) => {
+    if (args[1] === "projects") {
+      projectsCalls += 1;
+      await sleep(40);
+    }
+    if (args[1] === "snapshot") snapshotCalls += 1;
+    return base(command, args, options);
+  };
+  const { baseUrl } = await withBridge(t, { runner });
+
+  const [projectOne, projectTwo] = await Promise.all([
+    request(baseUrl, "/api/select-project", {
+      body: { projectId: "p_alpha", clientRequestId: "dup-select-project" },
+    }),
+    request(baseUrl, "/api/select-project", {
+      body: { projectId: "p_alpha", clientRequestId: "dup-select-project" },
+    }),
+  ]);
+  assert.equal(projectOne.status, 200);
+  assert.equal(projectTwo.status, 200);
+  const projectBodies = [await projectOne.json(), await projectTwo.json()];
+  assert.equal(projectBodies.some((body) => body.duplicate === true), true);
+  assert.equal(projectsCalls, 1, "duplicate select-project must not resolve twice");
+
+  const [sessionOne, sessionTwo] = await Promise.all([
+    request(baseUrl, "/api/select-session", {
+      body: { sessionId: "abc123", clientRequestId: "dup-select-session" },
+    }),
+    request(baseUrl, "/api/select-session", {
+      body: { sessionId: "abc123", clientRequestId: "dup-select-session" },
+    }),
+  ]);
+  assert.equal(sessionOne.status, 200);
+  assert.equal(sessionTwo.status, 200);
+  const sessionBodies = [await sessionOne.json(), await sessionTwo.json()];
+  assert.equal(sessionBodies.some((body) => body.duplicate === true), true);
+  assert.equal(snapshotCalls, 1, "duplicate select-session must not resolve twice");
+});
+
+test("runJsonCommand reports oversized output and escalates to SIGKILL", async () => {
+  // The child ignores SIGTERM and keeps spewing output, so only the SIGKILL
+  // escalation can end it before the (much longer) timeout.
+  const script = [
+    'process.on("SIGTERM", () => {});',
+    'setInterval(() => process.stdout.write("x".repeat(65536)), 5);',
+  ].join("\n");
+  const started = Date.now();
+  await assert.rejects(
+    runJsonCommand(process.execPath, ["-e", script], {
+      timeoutMs: 8000,
+      outputLimitBytes: 1024,
+    }),
+    /output exceeded 1024 bytes/,
+  );
+  assert.ok(
+    Date.now() - started < 4000,
+    "oversized output must be killed well before the runner timeout",
+  );
+});
+
+test("a whitespace-padded configured token still authenticates clients", async (t) => {
+  // MORPHEUS_G2_TOKEN with a trailing space must mean the same secret as the
+  // trimmed value clients send: the trimmed token is canonical at config time.
+  const { baseUrl, config } = await withBridge(t, { token: "secret42 " });
+  assert.equal(config.token, "secret42");
+  const res = await request(baseUrl, "/api/sessions", { token: "secret42" });
+  assert.equal(res.status, 200);
+});
+
+test("the session buffer being created is exempt from cap eviction", async (t) => {
+  const { baseUrl, state } = await withBridge(t, {
+    agentBackend: "codex_app_server",
+    createCodexAgentProvider: fakeCodexAgentProvider(),
+    mirrorCodexTui: false,
+    showProjectsFirst: true,
+    maxTrackedSessions: 6,
+  });
+  const open = [];
+  t.after(async () => {
+    for (const res of open) {
+      await res.body.cancel().catch(() => {});
+    }
+  });
+
+  // Fill the cap with streams that stay connected, so every existing buffer
+  // is protected and the only evictable key is whatever comes next.
+  for (let i = 0; i < 6; i += 1) {
+    const res = await fetch(`${baseUrl}/api/events?sessionId=held-${i}&token=${TOKEN}`);
+    assert.equal(res.status, 200);
+    open.push(res);
+  }
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    const registered = [...Array(6).keys()].every(
+      (i) => state.sessions.get(`held-${i}`)?.clients?.size === 1,
+    );
+    if (registered) break;
+    await sleep(10);
+  }
+
+  // The (cap+1)-th subscriber names a brand-new session id; its just-created
+  // buffer must not be evicted out from under the connecting client, or the
+  // stream stays attached to an orphaned buffer and never delivers a message.
+  const extra = await fetch(`${baseUrl}/api/events?sessionId=fresh-key&token=${TOKEN}`);
+  assert.equal(extra.status, 200);
+  open.push(extra);
+  for (
+    let attempt = 0;
+    attempt < 100 && state.sessions.get("fresh-key")?.clients?.size !== 1;
+    attempt += 1
+  ) {
+    await sleep(10);
+  }
+  assert.equal(state.sessions.has("fresh-key"), true, "the just-created buffer must survive eviction");
+  assert.equal(
+    state.sessions.get("fresh-key")?.clients?.size,
+    1,
+    "the SSE client must be attached to the tracked buffer",
+  );
+});
+
+test("actively polled sessions keep their transcript across cap eviction", async (t) => {
+  const { baseUrl, state } = await withBridge(t, {
+    agentBackend: "codex_app_server",
+    createCodexAgentProvider: fakeCodexAgentProvider(),
+    mirrorCodexTui: false,
+    showProjectsFirst: true,
+    maxTrackedSessions: 6,
+  });
+
+  async function openAndClose(sessionId) {
+    const res = await fetch(`${baseUrl}/api/events?sessionId=${sessionId}&token=${TOKEN}`);
+    assert.equal(res.status, 200);
+    await readStreamFor(res.body, 10);
+    // Wait for the stream to detach so the buffer becomes evictable again.
+    for (
+      let attempt = 0;
+      attempt < 100 && state.sessions.get(sessionId)?.clients?.size;
+      attempt += 1
+    ) {
+      await sleep(10);
+    }
+  }
+
+  // A poll-only client: the stream that created the buffer is gone, and the
+  // client keeps reading the transcript through GET /api/messages only.
+  await openAndClose("poll-target");
+  for (let i = 0; i < 10; i += 1) {
+    await openAndClose(`junk-${i}`);
+    const poll = await request(baseUrl, "/api/messages?sessionId=poll-target");
+    assert.equal(poll.status, 200);
+  }
+
+  assert.equal(state.sessions.has("poll-target"), true, "a session read on every poll must not be evicted");
+  assert.equal(state.sessions.has("junk-0"), false, "idle junk buffers are evicted instead");
+});
+
+test("codex live-event check marks stay bounded by the configured cap", async (t) => {
+  const { provider, state } = await withBridge(t, {
+    agentBackend: "codex_app_server",
+    createCodexAgentProvider: (emit, client) => ({
+      ...fakeCodexAgentProvider()(emit, client),
+      getSubscribedSessions: () => [],
+    }),
+    codexClient: { threadResume: async () => ({}) },
+    mirrorCodexTui: false,
+    showProjectsFirst: true,
+    maxTrackedSessions: 10,
+  });
+
+  // A burst of distinct thread ids within one freshness window used to grow
+  // the map unbounded, and the sweep ignored the configured cap.
+  const now = Date.now();
+  for (let i = 0; i < 40; i += 1) {
+    state.codexLiveEventsCheckedAt.set(`burst-thread-${i}`, now);
+  }
+  const resubscribed = await provider.ensureLiveEvents("fresh-live-thread");
+  assert.equal(resubscribed, true);
+  assert.equal(state.codexLiveEventsCheckedAt.has("fresh-live-thread"), true);
+  assert.ok(
+    state.codexLiveEventsCheckedAt.size <= 10,
+    `live-event check marks must stay within the cap, got ${state.codexLiveEventsCheckedAt.size}`,
+  );
+});
+
+test("non-numeric after param on messages polls returns the transcript", async (t) => {
+  const { baseUrl } = await withBridge(t, {
+    agentBackend: "codex_app_server",
+    createCodexAgentProvider: fakeCodexAgentProvider(),
+    mirrorCodexTui: false,
+    showProjectsFirst: true,
+  });
+  const prompt = await request(baseUrl, "/api/prompt", {
+    body: {
+      sessionId: "project:p_alpha",
+      text: "cursor turn",
+      clientRequestId: "after-garbage-prompt",
+    },
+  });
+  assert.equal(prompt.status, 202);
+
+  // `after=abc` used to parse to NaN, making every `id > NaN` comparison
+  // false and blanking the transcript for that client forever.
+  const res = await request(baseUrl, "/api/messages?sessionId=codex-thread-1&after=abc");
+  assert.equal(res.status, 200);
+  const body = await res.json();
+  assert.equal(
+    body.messages.some(
+      (message) => message.type === "result" && message.text === "answer for: cursor turn",
+    ),
+    true,
+    "garbage after cursors must fall back to the full transcript",
+  );
+});
+
+test("ambiguous cached project references fail with 409 when the provider is down", async (t) => {
+  let failProjects = false;
+  const projects = [
+    { id: "p_dup1", tenant_id: "p_dup1", name: "dup", root_path: "/tmp/dup-one", archived: false, usage: {} },
+    { id: "p_dup2", tenant_id: "p_dup2", name: "dup", root_path: "/tmp/dup-two", archived: false, usage: {} },
+  ];
+  const runner = async (_command, args) => {
+    if (args[1] === "projects") {
+      if (failProjects) throw new Error("project list down");
+      return { current_project_id: "p_dup1", projects };
+    }
+    throw new Error(`unexpected remote command: ${args.slice(1).join(" ")}`);
+  };
+  const { baseUrl } = await withBridge(t, { runner, showProjectsFirst: true });
+
+  const prime = await request(baseUrl, "/api/sessions?view=projects");
+  assert.equal(prime.status, 200);
+
+  failProjects = true;
+  const res = await request(baseUrl, "/api/select-session", {
+    body: { sessionId: "project:dup", clientRequestId: "ambiguous-cached-select" },
+  });
+  assert.equal(res.status, 409, "cached ambiguity must match the live path's 409, not a 500");
+  assert.match((await res.json()).error, /ambiguous project reference/);
+});
+
+test("refuses to start with an empty or whitespace bearer token", () => {
+  assert.throws(
+    () => createBridge({ token: "", morpheusBin: FIXTURE, auditPath: "", logger: silentLogger() }),
+    /empty bearer token/i,
+  );
+  assert.throws(
+    () => createBridge({ token: "   ", morpheusBin: FIXTURE, auditPath: "", logger: silentLogger() }),
+    /empty bearer token/i,
+  );
+});
+
+test("startBridge reports a friendly message when the port is already in use", async (t) => {
+  const blocker = http.createServer(() => {});
+  await new Promise((resolve) => blocker.listen(0, "127.0.0.1", resolve));
+  const port = blocker.address().port;
+  const logs = [];
+  const errors = [];
+  let shutdownCalls = 0;
+  const previousExitCode = process.exitCode;
+  const server = startBridge({
+    host: "127.0.0.1",
+    port,
+    token: TOKEN,
+    tokenSource: "env",
+    morpheusBin: FIXTURE,
+    agentBackend: "morpheus",
+    auditPath: "",
+    provider: {
+      name: "fake",
+      allowedActions: [],
+      promptBehavior: "send_prompt",
+      async shutdown() {
+        shutdownCalls += 1;
+      },
+    },
+    logger: {
+      log: (line) => logs.push(String(line)),
+      warn: (line) => logs.push(String(line)),
+      error: (line) => errors.push(String(line)),
+    },
+  });
+  t.after(() => {
+    try {
+      server.close();
+    } catch {
+      // the server never listened
+    }
+    blocker.close();
+    process.exitCode = previousExitCode;
+  });
+
+  for (let attempt = 0; attempt < 100 && !errors.length; attempt += 1) {
+    await sleep(10);
+  }
+  assert.ok(errors.length >= 1, "the listen failure must be reported");
+  assert.match(errors[0], /already in use/);
+  assert.match(errors[0], /--port|PORT/);
+  assert.equal(process.exitCode, 1);
+  assert.deepEqual(logs, [], "the startup banner must not print when listen fails");
+  // Whatever startBridge started (provider warm-up state) must be torn down
+  // again, otherwise the failed process hangs on a live event loop.
+  for (let attempt = 0; attempt < 100 && !shutdownCalls; attempt += 1) {
+    await sleep(10);
+  }
+  assert.equal(shutdownCalls, 1, "the listen failure must shut the provider down");
 });

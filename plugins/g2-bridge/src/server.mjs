@@ -33,6 +33,9 @@ const DEFAULT_STALE_MIRROR_GRACE_MS = 4000;
 const CODEX_LIVE_EVENTS_CHECK_MS = 60_000;
 const LIVE_DELTA_HOLD_MS = 10_000;
 const MAX_MESSAGES_PER_SESSION = 500;
+const MAX_TRACKED_SESSIONS = 256;
+const MAX_PROJECT_SESSION_ROW_CACHE_ENTRIES = 64;
+const RATE_LIMIT_MAX_TRACKED_KEYS = 4096;
 const AGENT_BACKEND_MORPHEUS = "morpheus";
 const AGENT_BACKEND_CODEX_APP_SERVER = "codex_app_server";
 const EVEN_APP_ORIGINS = [
@@ -61,6 +64,18 @@ function envInt(env, key, fallback, { min = 1, max = Number.MAX_SAFE_INTEGER } =
   const parsed = Number.parseInt(raw, 10);
   if (!Number.isFinite(parsed)) return fallback;
   return Math.min(Math.max(parsed, min), max);
+}
+
+// Clients may send garbage numeric params; NaN must fall back to the default
+// instead of poisoning comparisons (`id > NaN` is always false) or producing
+// `--limit NaN` CLI calls.
+function parseIntParam(value, fallback) {
+  const parsed = Number.parseInt(String(value ?? ""), 10);
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+function parseLimitParam(value, fallback, max) {
+  return Math.min(Math.max(parseIntParam(value, fallback), 1), max);
 }
 
 function envList(value) {
@@ -320,14 +335,112 @@ function bridgeFlow(config, event, fields = {}) {
   config.logger.log(`[g2-flow] ${event}${payload}`);
 }
 
+// Monotonic touch counter gives least-recently-touched eviction ordering
+// without consulting the clock.
+function touchSessionBuffer(state, buffer) {
+  state.sessionTouchCounter = (state.sessionTouchCounter || 0) + 1;
+  buffer.touchedAt = state.sessionTouchCounter;
+}
+
 function cleanMessageState(state, sessionId) {
   const key = sessionId || "morpheus";
   let buffer = state.sessions.get(key);
-  if (!buffer) {
+  const created = !buffer;
+  if (created) {
     buffer = { messages: [], clients: new Set() };
     state.sessions.set(key, buffer);
   }
+  touchSessionBuffer(state, buffer);
+  // The key being created is exempt from eviction: at this point it has no
+  // SSE clients yet, so protectedSessionKeys may not cover it, and evicting
+  // it would hand the caller an orphaned buffer that never receives (or
+  // delivers) another message.
+  if (created) evictIdleSessionState(state, key);
   return buffer;
+}
+
+// Session ids that eviction must never drop: the default buffer, anything a
+// connected SSE client, active poller, in-flight refresh, or pending result
+// waiter still references, and the selected/active/pending sessions of every
+// remembered project — including all aliases fanned out from those ids.
+function protectedSessionKeys(state) {
+  const keys = new Set(["morpheus"]);
+  function protect(id) {
+    const key = String(id || "").trim();
+    if (!key || keys.has(key)) return;
+    keys.add(key);
+    for (const alias of state.sessionAliases.get(key) || []) keys.add(alias);
+  }
+  protect(state.selectedSession?.id);
+  for (const session of state.projectActiveSessions.values()) protect(session?.id);
+  for (const pending of state.pendingProjectPrompts.values()) {
+    protect(pending?.id);
+    protect(pending?.projectSessionId);
+  }
+  for (const project of [state.selectedProject, state.lastProject]) {
+    if (!projectKey(project)) continue;
+    protect(projectSessionId(project));
+    protect(activeProjectSessionId(project));
+  }
+  for (const [key, buffer] of state.sessions) {
+    if (buffer?.clients?.size) protect(key);
+  }
+  for (const key of state.outputPollers.keys()) protect(key);
+  for (const key of state.outputRefreshInflight.keys()) protect(key);
+  for (const [key, waiters] of state.resultWaiters) {
+    if (waiters?.length) protect(key);
+  }
+  // A protected alias keeps its real session (and that session's other
+  // aliases) alive too, so live fan-out never loses its source buffer.
+  for (const [realId, aliases] of state.sessionAliases) {
+    if (keys.has(realId) || [...aliases].some((alias) => keys.has(alias))) {
+      keys.add(realId);
+      for (const alias of aliases) keys.add(alias);
+    }
+  }
+  return keys;
+}
+
+// Shared bounded-map eviction: once `map` grows past `cap`, drop the entries
+// with the oldest `tsOf(value)` down to a low-water mark below the cap. The
+// low-water headroom matters: evicting to exactly the cap would re-run the
+// full scan+sort on every subsequent insert while the map sits at the cap
+// (per-request O(n log n) for pre-auth maps like the rate limiter).
+function evictOldest(map, { cap, lowWater, tsOf = (value) => value, skip = () => false, onEvict } = {}) {
+  if (map.size <= cap) return;
+  const floor = Math.max(1, lowWater ?? Math.floor(cap * 0.875));
+  const evictable = [...map.entries()]
+    .filter(([key, value]) => !skip(key, value))
+    .sort(([, left], [, right]) => (tsOf(left) || 0) - (tsOf(right) || 0));
+  for (const [key, value] of evictable) {
+    if (map.size <= floor) break;
+    map.delete(key);
+    onEvict?.(key, value);
+  }
+}
+
+// Any client may name a brand-new session id (e.g. /api/events?sessionId=...),
+// so per-session state must not grow forever. Once the tracked session count
+// passes the cap, drop the least-recently-touched sessions nothing still
+// references, together with the side-band state keyed by the same id. The
+// key being created or touched right now (`activeKey`) is never evicted.
+function evictIdleSessionState(state, activeKey = "") {
+  const cap = state.maxTrackedSessions;
+  if (state.sessions.size <= cap) return;
+  const protectedKeys = protectedSessionKeys(state);
+  evictOldest(state.sessions, {
+    cap,
+    tsOf: (buffer) => buffer?.touchedAt || 0,
+    skip: (key) => key === activeKey || protectedKeys.has(key),
+    onEvict: (key) => {
+      state.outputHashes.delete(key);
+      state.sessionAliases.delete(key);
+      state.promptMirrorBaselines.delete(key);
+      state.codexSessions.delete(key);
+      state.codexLiveEventsCheckedAt.delete(key);
+      state.outputPollStats.delete(key);
+    },
+  });
 }
 
 // Message ids are allocated from one bridge-wide counter so the same logical
@@ -339,6 +452,14 @@ function allocateMessageId(state) {
   const id = state.nextMessageId;
   state.nextMessageId += 1;
   return id;
+}
+
+// Last allocated bridge-wide message id. Prompt waits use this as a floor when
+// the provider resolves to a session id whose cursor was not captured before
+// submission: anything already buffered for that session predates the prompt,
+// so it must not be returned as this turn's result.
+function currentMessageId(state) {
+  return Number(state.nextMessageId || 1) - 1;
 }
 
 // Stock Even clients drop stream/poll messages whose sessionId does not match
@@ -492,7 +613,10 @@ function resolveResultWaiters(state, sessionId, msg) {
   else state.resultWaiters.delete(key);
 }
 
-function waitForResultMessage(state, sessionId, timeoutMs, after = 0) {
+// `after` is required on purpose: an implicit 0 made any previously buffered
+// result on the session look like this turn's answer (the stale-answer bug).
+// Callers must pass the message-id floor captured before submission.
+function waitForResultMessage(state, sessionId, timeoutMs, after) {
   const existing = latestTerminalMessage(state, sessionId, after);
   if (existing) return Promise.resolve(existing);
   const key = String(sessionId || "morpheus");
@@ -587,6 +711,31 @@ function markSessionIdle(state, sessionId) {
       state.projectActiveSessions.set(projectId, { ...projectSession, status: "idle" });
     }
   }
+}
+
+// A turn that fails before its provider call completes must still terminate
+// like a normal turn: publish the failure result and idle status into every
+// buffer fanned out from sessionId, then return the selected/project session
+// marks to idle — the same terminal sequence publishAssistantResultIfNew
+// performs for successful turns. Without the markSessionIdle step the session
+// row stays "busy" forever after a failure.
+function publishTurnFailure(state, config, sessionId, providerName, text) {
+  pushMessageForSession(state, sessionId, {
+    type: "result",
+    success: false,
+    provider: providerName,
+    sessionId,
+    text,
+    at: nowIso(config.clock),
+  });
+  pushMessageForSession(state, sessionId, {
+    type: "status",
+    state: "idle",
+    provider: providerName,
+    sessionId,
+    at: nowIso(config.clock),
+  });
+  markSessionIdle(state, sessionId);
 }
 
 function resultAlreadyPublishedAfterLatestPrompt(state, sessionId, text) {
@@ -826,6 +975,10 @@ function sseMessagePayload(entry) {
 function getMessages(state, sessionId, after) {
   const buffer = state.sessions.get(sessionId || "morpheus");
   if (!buffer) return [];
+  // Reading counts as use: a poll-only client (no SSE stream keeping the key
+  // protected) must refresh the buffer's LRU stamp, or eviction wipes the
+  // transcript of a session that is actively being read.
+  touchSessionBuffer(state, buffer);
   return buffer.messages.filter((entry) => entry.id > after);
 }
 
@@ -878,15 +1031,18 @@ class Semaphore {
 
   async run(fn) {
     if (this.active >= this.max) {
+      // The waiter inherits the releasing task's slot; `active` stays put so a
+      // fresh caller racing the handoff cannot slip in and over-admit.
       await new Promise((resolve) => this.queue.push(resolve));
+    } else {
+      this.active += 1;
     }
-    this.active += 1;
     try {
       return await fn();
     } finally {
-      this.active -= 1;
       const next = this.queue.shift();
       if (next) next();
+      else this.active -= 1;
     }
   }
 }
@@ -916,12 +1072,16 @@ function runJsonCommand(command, args, options = {}) {
       child.kill("SIGTERM");
       setTimeout(() => child.kill("SIGKILL"), 500).unref();
     }, timeoutMs);
+    timer.unref();
 
     child.stdout.on("data", (chunk) => {
       stdoutBytes += chunk.length;
       if (stdoutBytes > outputLimitBytes) {
-        tooLarge = true;
-        child.kill("SIGTERM");
+        if (!tooLarge) {
+          tooLarge = true;
+          child.kill("SIGTERM");
+          setTimeout(() => child.kill("SIGKILL"), 500).unref();
+        }
         return;
       }
       stdout += chunk.toString("utf8");
@@ -938,12 +1098,14 @@ function runJsonCommand(command, args, options = {}) {
     });
     child.on("close", (code) => {
       clearTimeout(timer);
-      if (timedOut) {
-        reject(new Error(`${command} timed out after ${timeoutMs}ms`));
-        return;
-      }
+      // The oversized-output kill can outlast the timeout; report the real
+      // cause instead of misattributing it to a timeout.
       if (tooLarge) {
         reject(new Error(`${command} output exceeded ${outputLimitBytes} bytes`));
+        return;
+      }
+      if (timedOut) {
+        reject(new Error(`${command} timed out after ${timeoutMs}ms`));
         return;
       }
       if (code !== 0) {
@@ -1418,6 +1580,11 @@ async function projectSessionMenuRows(provider, state, config, project, limit) {
       snapshot: Array.isArray(result) ? undefined : result.snapshot,
       at: config.clock(),
     });
+    evictOldest(state.projectSessionRowsCache, {
+      cap: MAX_PROJECT_SESSION_ROW_CACHE_ENTRIES,
+      tsOf: (entry) => entry?.at || 0,
+      skip: (key) => key === cacheKey,
+    });
   } catch (err) {
     listError = safeJsonError(err);
     bridgeDebug(config, "project-session-menu-list-failed", {
@@ -1631,18 +1798,22 @@ function projectsResponseBody(result, state) {
   };
 }
 
+function projectMatches(project, ref) {
+  return (
+    project.id === ref ||
+    project.tenant_id === ref ||
+    project.name === ref ||
+    project.root_path === ref
+  );
+}
+
 async function resolveProject(provider, ref, limit) {
   const { projects, current_project_id: currentProjectId } = await listProjects(provider, limit);
   const needle = String(ref || currentProjectId || "").trim();
   if (!needle) {
     return { ok: false, status: 404, error: "no project selected", projects };
   }
-  const matches = projects.filter((project) => (
-    project.id === needle ||
-    project.tenant_id === needle ||
-    project.name === needle ||
-    project.root_path === needle
-  ));
+  const matches = projects.filter((project) => projectMatches(project, needle));
   if (matches.length === 0) {
     return { ok: false, status: 404, error: `no project matching '${needle}'`, projects };
   }
@@ -1650,6 +1821,35 @@ async function resolveProject(provider, ref, limit) {
     return { ok: false, status: 409, error: `ambiguous project reference '${needle}'`, projects };
   }
   return { ok: true, project: matches[0], projects };
+}
+
+// Selecting project-shaped rows must not crash into Express's default HTML 500
+// when the provider is down; resolve from the cached project list when it can,
+// and report the failure as a JSON error result otherwise.
+async function resolveProjectWithCachedFallback(provider, state, config, ref) {
+  try {
+    return await resolveProject(provider, ref, config.projectLimit);
+  } catch (err) {
+    const message = safeJsonError(err);
+    bridgeDebug(config, "resolve-project-failed", { ref, reason: message });
+    const cached = cachedProjects(state, config.projectLimit);
+    const matches = (cached?.projects || []).filter((project) => projectMatches(project, ref));
+    if (matches.length === 1) {
+      config.logger?.warn?.(`[g2-projects] using cached project for '${ref}': ${message}`);
+      return { ok: true, project: matches[0], projects: cached.projects, stale: true };
+    }
+    if (matches.length > 1) {
+      // Ambiguity is a client-addressable error, exactly as on the live path;
+      // it must not degrade into a 500 just because the resolve came from cache.
+      return {
+        ok: false,
+        status: 409,
+        error: `ambiguous project reference '${ref}'`,
+        projects: cached.projects,
+      };
+    }
+    return { ok: false, status: 500, error: message, projects: cached?.projects || [] };
+  }
 }
 
 function createAuditLogger({ auditPath, clock, logger }) {
@@ -1849,6 +2049,29 @@ function createCorsMiddleware(config) {
   };
 }
 
+// Rate-limit buckets are keyed by pre-auth client address, so an attacker (or
+// a busy tailnet) can mint arbitrarily many keys. Expired buckets are swept at
+// most once per window, and the map is hard-capped by dropping the oldest
+// windows when it still overflows.
+function sweepRateLimits(state, config, now) {
+  if (
+    state.rateLimits.size <= RATE_LIMIT_MAX_TRACKED_KEYS &&
+    now - (state.rateLimitsSweptAt || 0) < config.rateLimitWindowMs
+  ) {
+    return;
+  }
+  state.rateLimitsSweptAt = now;
+  for (const [key, bucket] of state.rateLimits) {
+    if (now - bucket.windowStart > config.rateLimitWindowMs) {
+      state.rateLimits.delete(key);
+    }
+  }
+  evictOldest(state.rateLimits, {
+    cap: RATE_LIMIT_MAX_TRACKED_KEYS,
+    tsOf: (bucket) => bucket.windowStart,
+  });
+}
+
 function createRateLimitMiddleware(config, state, clock) {
   return (req, res, next) => {
     // Glasses clients poll sessions/messages/status continuously, so read
@@ -1859,6 +2082,7 @@ function createRateLimitMiddleware(config, state, clock) {
     const ip = req.ip || req.socket?.remoteAddress || "unknown";
     const key = `${ip}:${isRead ? "read" : "write"}`;
     const current = clock();
+    sweepRateLimits(state, config, current);
     const bucket = state.rateLimits.get(key) || { windowStart: current, count: 0 };
     if (current - bucket.windowStart > config.rateLimitWindowMs) {
       bucket.windowStart = current;
@@ -1911,12 +2135,19 @@ function createRequestLogMiddleware(config, audit) {
 }
 
 function createAuthMiddleware(config) {
+  // timingSafeEqual over two zero-length buffers reports "equal", so an empty
+  // configured token would silently disable bearer auth. createBridge refuses
+  // to start with one; this guard keeps the middleware safe regardless.
+  // createBridge normalizes (trims) the token, and this trim mirrors the one
+  // normalizeTokenHeader applies to the client value, so a whitespace-padded
+  // MORPHEUS_G2_TOKEN cannot lock every client out with 401s.
+  const configuredToken = typeof config.token === "string" ? config.token.trim() : "";
   return (req, res, next) => {
     const isEventStream = req.path === "/events" || req.originalUrl?.startsWith("/api/events");
     const provided = normalizeTokenHeader(req, {
       acceptQueryToken: config.acceptQueryToken || isEventStream,
     });
-    if (!secureEqual(provided, config.token)) {
+    if (!configuredToken || !secureEqual(provided, configuredToken)) {
       res.status(401).json({ error: "Unauthorized" });
       return;
     }
@@ -2344,6 +2575,13 @@ function createCodexAppServerBridgeProvider(options = {}) {
       return true;
     },
 
+    // Releases everything the provider keeps alive outside request handling
+    // (the codex app-server WebSocket and its pending calls) so a bridge that
+    // failed to start can actually exit instead of hanging on a live socket.
+    async shutdown() {
+      if (typeof client.close === "function") await client.close();
+    },
+
     listProjects(limit) {
       return morpheusProvider.listProjects(limit);
     },
@@ -2532,6 +2770,14 @@ function createCodexAppServerBridgeProvider(options = {}) {
       const lastCheck = state.codexLiveEventsCheckedAt.get(threadId) || 0;
       if (now - lastCheck < CODEX_LIVE_EVENTS_CHECK_MS) return false;
       state.codexLiveEventsCheckedAt.set(threadId, now);
+      // Client polls can name arbitrary thread ids; drop the oldest check
+      // marks (they are re-checkable anyway) so the map stays bounded by the
+      // configured cap even when a burst of distinct ids arrives within one
+      // freshness window.
+      evictOldest(state.codexLiveEventsCheckedAt, {
+        cap: state.maxTrackedSessions,
+        skip: (id) => id === threadId,
+      });
       try {
         await client.threadResume({ threadId });
         bridgeFlow(config, "codex-live-events-resubscribed", { sessionId: threadId });
@@ -2596,6 +2842,7 @@ async function spawnSessionFromText({ req, res, context, requestId, text, projec
     });
   }
   try {
+    const waitFloorId = currentMessageId(state);
     const spawnResult = await provider.spawnSession({
       projectId: project.id || project.tenant_id,
       goal: goalFromRemoteText(text),
@@ -2650,7 +2897,7 @@ async function spawnSessionFromText({ req, res, context, requestId, text, projec
     const shouldWaitForResult =
       config.waitForPromptResult && provider.agentBackend === AGENT_BACKEND_CODEX_APP_SERVER;
     const finalMessage = shouldWaitForResult
-      ? await waitForResultMessage(state, spawned.id, config.promptWaitForResultMs)
+      ? await waitForResultMessage(state, spawned.id, config.promptWaitForResultMs, waitFloorId)
       : null;
     const responseHistory = bufferedHistoryForRow(
       state,
@@ -2733,6 +2980,18 @@ async function spawnSessionFromText({ req, res, context, requestId, text, projec
     clearPendingProjectPrompt(state, project, requestId);
     const message = safeJsonError(err);
     const body = { error: message, code: "spawn_failed" };
+    // The project row was marked busy before the spawn attempt; publish the
+    // failure as that turn's terminal message so polls drop back to idle and
+    // the glasses see why nothing started.
+    if (pendingProjectRow) {
+      publishTurnFailure(
+        state,
+        config,
+        projectSessionId(project),
+        provider.name,
+        `Could not start a G2 session: ${message}`,
+      );
+    }
     audit("remote_spawn_failed", {
       requestId,
       projectId: project.id || project.tenant_id,
@@ -2758,6 +3017,9 @@ async function sendPromptToSession({ req, res, context, requestId, text, session
 
   const textHash = sha256(text);
   const promptNavigationEpoch = navigationEpoch(state);
+  // Remembers which session buffer received the prompt_submitted/busy markers
+  // so the failure path can publish a terminal message into the same buffers.
+  let promptMarkedSessionId = "";
   try {
     const requestSessionId = typeof req.body?.sessionId === "string" ? req.body.sessionId : "";
     const promptProject = state.selectedProject;
@@ -2810,6 +3072,8 @@ async function sendPromptToSession({ req, res, context, requestId, text, session
       sessionId: outboundSession.id,
       at: nowIso(config.clock),
     });
+    promptMarkedSessionId = outboundSession.id;
+    const waitFloorId = currentMessageId(state);
     const result = await provider.sendPrompt({
       sessionId: outboundSession.id,
       text,
@@ -2835,7 +3099,10 @@ async function sendPromptToSession({ req, res, context, requestId, text, session
     });
     const shouldWaitForResult =
       config.waitForPromptResult && provider.agentBackend === AGENT_BACKEND_CODEX_APP_SERVER;
-    const waitAfterId = waitBeforeIds.get(activeSessionId) || 0;
+    // A session id first seen at resolution time may already hold a previous
+    // turn's result; falling back to the pre-submission floor (instead of 0)
+    // keeps waitForResultMessage from short-circuiting on that stale answer.
+    const waitAfterId = waitBeforeIds.get(activeSessionId) ?? waitFloorId;
     const finalMessage = shouldWaitForResult
       ? await waitForResultMessage(state, activeSessionId, config.promptWaitForResultMs, waitAfterId)
       : null;
@@ -2923,6 +3190,12 @@ async function sendPromptToSession({ req, res, context, requestId, text, session
   } catch (err) {
     const message = safeJsonError(err);
     const body = { error: message, code: "prompt_failed" };
+    // The prompt_submitted/busy markers already landed in the session buffers;
+    // publish the failure as this turn's terminal message so status polls
+    // return to idle, stale-mirror holds disarm, and the glasses see why.
+    if (promptMarkedSessionId) {
+      publishTurnFailure(state, config, promptMarkedSessionId, provider.name, `Prompt failed: ${message}`);
+    }
     audit("remote_prompt_failed", {
       requestId,
       sessionId: session.id,
@@ -3886,6 +4159,10 @@ function buildConfigFromEnv(env = process.env, argv = process.argv.slice(2)) {
     ),
     sessionLimit: envInt(env, "MORPHEUS_G2_SESSION_LIMIT", 12, { min: 1, max: 50 }),
     projectLimit: envInt(env, "MORPHEUS_G2_PROJECT_LIMIT", DEFAULT_PROJECT_LIMIT, { min: 1, max: 50 }),
+    maxTrackedSessions: envInt(env, "MORPHEUS_G2_MAX_TRACKED_SESSIONS", MAX_TRACKED_SESSIONS, {
+      min: 8,
+      max: 10_000,
+    }),
     spawnCommand: env.MORPHEUS_G2_SPAWN_COMMAND || "codex",
     agentBackend: env.MORPHEUS_G2_AGENT_BACKEND || AGENT_BACKEND_CODEX_APP_SERVER,
     mirrorCodexTui: env.MORPHEUS_G2_MIRROR_CODEX_TUI !== "0",
@@ -3922,12 +4199,29 @@ function createBridge(options = {}) {
   config.allowAnyHost = config.allowAnyHost === true || config.allowAnyHost === "1";
   config.clock = config.clock || Date.now;
   config.logger = config.logger || console;
+  if (typeof config.token !== "string" || !config.token.trim()) {
+    // An empty token would make every bearer comparison succeed (see
+    // createAuthMiddleware); refusing to start is the only safe default.
+    throw new Error(
+      "Refusing to start the Morpheus G2 bridge with an empty bearer token. " +
+        "Set MORPHEUS_G2_TOKEN to a non-empty secret.",
+    );
+  }
+  // The trimmed token is the canonical secret: clients' values are trimmed by
+  // normalizeTokenHeader, so a whitespace-padded MORPHEUS_G2_TOKEN must mean
+  // the same secret everywhere (QR payloads, auth comparison, startup guard).
+  config.token = config.token.trim();
   const state = {
     sessions: new Map(),
     nextMessageId: 1,
+    sessionTouchCounter: 0,
+    // Single source of truth for the tracked-session cap: envInt already
+    // clamped the env value, and this fallback covers direct options.
+    maxTrackedSessions: Number(config.maxTrackedSessions) || MAX_TRACKED_SESSIONS,
     codexSessions: new Map(),
     idempotency: new Map(),
     rateLimits: new Map(),
+    rateLimitsSweptAt: 0,
     outputHashes: new Map(),
     outputPollers: new Map(),
     outputPollStats: new Map(),
@@ -4016,10 +4310,7 @@ function createBridge(options = {}) {
   });
 
   app.get("/api/sessions", async (req, res) => {
-    const limit = Math.min(
-      Math.max(Number.parseInt(req.query.limit || String(config.sessionLimit), 10), 1),
-      config.sessionLimit,
-    );
+    const limit = parseLimitParam(req.query.limit, config.sessionLimit, config.sessionLimit);
     const wantsProjects =
       req.query.view === "projects" ||
       req.query.scope === "projects" ||
@@ -4229,10 +4520,7 @@ function createBridge(options = {}) {
   });
 
   app.get("/api/projects", async (req, res) => {
-    const limit = Math.min(
-      Math.max(Number.parseInt(req.query.limit || String(config.projectLimit), 10), 1),
-      config.projectLimit,
-    );
+    const limit = parseLimitParam(req.query.limit, config.projectLimit, config.projectLimit);
     try {
       const result = await listProjectsForResponse(provider, state, config, limit);
       res.json({
@@ -4383,6 +4671,9 @@ function createBridge(options = {}) {
       res.status(400).json({ error: "Missing projectId", code: "missing_project_id" });
       return;
     }
+    if (!reserveReplay(req, state, requestId, config.clock, config.requestIdTtlMs)) {
+      if (await maybeReplay(req, res, state, requestId)) return;
+    }
     if (isProjectsNavProjectId(projectId) || isProjectMenuSessionId(req.body?.sessionId)) {
       const priorProject = state.selectedProject;
       state.selectedProject = null;
@@ -4424,7 +4715,9 @@ function createBridge(options = {}) {
       const resolved = await resolveProject(provider, projectId, config.projectLimit);
       if (!resolved.ok) {
         audit("select_project_failed", { requestId, projectId, reason: resolved.error });
-        res.status(resolved.status).json({ error: resolved.error });
+        const body = { error: resolved.error };
+        rememberReplay(req, state, requestId, resolved.status, body, config.clock, config.requestIdTtlMs);
+        res.status(resolved.status).json(body);
         return;
       }
       rememberProjectContext(state, resolved.project);
@@ -4449,7 +4742,9 @@ function createBridge(options = {}) {
     } catch (err) {
       const message = safeJsonError(err);
       audit("select_project_failed", { requestId, projectId, reason: message });
-      res.status(500).json({ error: message });
+      const body = { error: message };
+      rememberReplay(req, state, requestId, 500, body, config.clock, config.requestIdTtlMs);
+      res.status(500).json(body);
     }
   });
 
@@ -4461,6 +4756,9 @@ function createBridge(options = {}) {
     if (!sessionId || typeof sessionId !== "string" || sessionId.length > 128) {
       res.status(400).json({ error: "Missing sessionId", code: "missing_session_id" });
       return;
+    }
+    if (!reserveReplay(req, state, requestId, config.clock, config.requestIdTtlMs)) {
+      if (await maybeReplay(req, res, state, requestId)) return;
     }
     if (isProjectMenuSessionId(sessionId)) {
       const priorProject = state.selectedProject;
@@ -4481,9 +4779,17 @@ function createBridge(options = {}) {
     }
     const activeProjectSelectId = projectIdFromActiveSessionId(sessionId);
     if (activeProjectSelectId) {
-      const resolved = await resolveProject(provider, activeProjectSelectId, config.projectLimit);
+      const resolved = await resolveProjectWithCachedFallback(
+        provider,
+        state,
+        config,
+        activeProjectSelectId,
+      );
       if (!resolved.ok) {
-        res.status(resolved.status).json({ error: resolved.error });
+        audit("select_session_failed", { requestId, sessionId, reason: resolved.error });
+        const body = { error: resolved.error };
+        rememberReplay(req, state, requestId, resolved.status, body, config.clock, config.requestIdTtlMs);
+        res.status(resolved.status).json(body);
         return;
       }
       rememberProjectContext(state, resolved.project);
@@ -4513,9 +4819,12 @@ function createBridge(options = {}) {
     }
     const projectId = projectIdFromSessionId(sessionId);
     if (projectId) {
-      const resolved = await resolveProject(provider, projectId, config.projectLimit);
+      const resolved = await resolveProjectWithCachedFallback(provider, state, config, projectId);
       if (!resolved.ok) {
-        res.status(resolved.status).json({ error: resolved.error });
+        audit("select_session_failed", { requestId, sessionId, reason: resolved.error });
+        const body = { error: resolved.error };
+        rememberReplay(req, state, requestId, resolved.status, body, config.clock, config.requestIdTtlMs);
+        res.status(resolved.status).json(body);
         return;
       }
       rememberProjectContext(state, resolved.project);
@@ -4548,7 +4857,9 @@ function createBridge(options = {}) {
       });
       if (!resolved.ok) {
         audit("select_session_failed", { requestId, sessionId, reason: resolved.error });
-        res.status(resolved.status).json({ error: resolved.error });
+        const body = { error: resolved.error };
+        rememberReplay(req, state, requestId, resolved.status, body, config.clock, config.requestIdTtlMs);
+        res.status(resolved.status).json(body);
         return;
       }
       state.selectedSession = resolved.session;
@@ -4571,7 +4882,9 @@ function createBridge(options = {}) {
     } catch (err) {
       const message = safeJsonError(err);
       audit("select_session_failed", { requestId, sessionId, reason: message });
-      res.status(500).json({ error: message });
+      const body = { error: message };
+      rememberReplay(req, state, requestId, 500, body, config.clock, config.requestIdTtlMs);
+      res.status(500).json(body);
     }
   });
 
@@ -4666,7 +4979,7 @@ function createBridge(options = {}) {
 
   app.get("/api/sessions/:id/history", async (req, res) => {
     const sessionId = String(req.params.id || "");
-    const limit = Math.min(Math.max(Number.parseInt(req.query.limit || "10", 10), 1), 10);
+    const limit = parseLimitParam(req.query.limit, 10, 10);
     if (isProjectMenuSessionId(sessionId)) {
       const priorProject = state.selectedProject;
       state.selectedProject = null;
@@ -4931,7 +5244,7 @@ function createBridge(options = {}) {
 
   app.get("/api/messages", async (req, res) => {
     const sessionId = String(req.query.sessionId || state.selectedSession?.id || "morpheus");
-    const after = Number.parseInt(req.query.after || "0", 10);
+    const after = parseIntParam(req.query.after, 0);
     if (isProjectMenuSessionId(sessionId)) {
       state.selectedProject = null;
       state.selectedSession = null;
@@ -5018,16 +5331,16 @@ function createBridge(options = {}) {
     }
     bridgeFlow(config, "messages-response", {
       sessionId,
-      after: Number.isFinite(after) ? after : 0,
+      after,
       activeSessionId: activeSession?.id || projectActiveSession?.id || "",
       projectRowIsLiveRequest: Boolean(projectRowIsLiveRequest),
       state: responseStatus,
-      messages: getMessages(state, sessionId, Number.isFinite(after) ? after : 0).length,
+      messages: getMessages(state, sessionId, after).length,
       selectedProjectId: projectKey(state.selectedProject) || "",
       selectedSessionId: state.selectedSession?.id || "",
     });
     res.json({
-      messages: getMessages(state, sessionId, Number.isFinite(after) ? after : 0).map((entry) =>
+      messages: getMessages(state, sessionId, after).map((entry) =>
         presentMessageForSession(entry, sessionId),
       ),
       state: responseStatus,
@@ -5046,8 +5359,7 @@ function createBridge(options = {}) {
   app.get("/api/events", async (req, res) => {
     const requestedSessionId = typeof req.query.sessionId === "string" ? req.query.sessionId : "";
     const sessionId = String(requestedSessionId || state.selectedSession?.id || "morpheus");
-    const lastEventId = Number.parseInt(req.headers["last-event-id"] || req.query.after || "0", 10);
-    const safeLastEventId = Number.isFinite(lastEventId) ? lastEventId : 0;
+    const safeLastEventId = parseIntParam(req.headers["last-event-id"] || req.query.after, 0);
     const replayRequested =
       req.query.needReplay === "true" ||
       req.query.needReplay === "1" ||
@@ -5179,7 +5491,10 @@ function startBridge(options = {}) {
         config.logger.warn(`[g2-bridge] codex app-server warm-up failed: ${safeJsonError(err)}`),
       );
   }
-  const server = app.listen(config.port, config.host, () => {
+  const server = app.listen(config.port, config.host, (err) => {
+    // Express 5 also invokes this callback with the listen error; the "error"
+    // handler below owns reporting, so skip the startup banner then.
+    if (err) return;
     const localUrl = trimTrailingSlash(config.localUrl || `http://${config.host}:${config.port}`);
     const publicUrl = trimTrailingSlash(config.publicUrl || "");
     const qrUrl = publicUrl || localUrl;
@@ -5207,6 +5522,29 @@ function startBridge(options = {}) {
       config.logger.warn("Non-local bind host. Keep this behind Tailscale ACLs or a trusted tunnel.");
     }
     qrcode.generate(qrUrl, { small: true });
+  });
+  server.on("error", (err) => {
+    if (err?.code === "EADDRINUSE") {
+      config.logger.error(
+        `Morpheus G2 bridge could not listen on ${config.host}:${config.port}: the port is already in use. ` +
+          "Stop the other process or pick a different port (--port flag or PORT env).",
+      );
+    } else {
+      config.logger.error(
+        `Morpheus G2 bridge could not listen on ${config.host}:${config.port}: ${safeJsonError(err)}`,
+      );
+    }
+    process.exitCode = 1;
+    // startBridge already kicked off the provider warm-up (codex app-server
+    // WebSocket). Tear down what it started so the failed process can drain
+    // its event loop and exit, instead of hanging unreachable; process.exit()
+    // is deliberately avoided so in-process embedders (and tests) survive.
+    try {
+      Promise.resolve(provider.shutdown?.()).catch(() => {});
+    } catch {
+      // best-effort teardown only
+    }
+    server.close(() => {});
   });
   return server;
 }
