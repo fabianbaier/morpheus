@@ -30,6 +30,9 @@ alone.
 
 from __future__ import annotations
 
+import os
+import shutil
+import sys
 from dataclasses import dataclass
 from typing import Optional
 
@@ -98,6 +101,28 @@ Keep each fact short, concrete, and dated by the tool itself — do not write \
 to the file directly."""
 
 
+def _morpheus_bin() -> str:
+    """Absolute path of the morpheus CLI, for embedding into loop prompts.
+
+    Loop agents run through `codex exec` in a shell whose PATH often lacks
+    the venv/user shim (`zsh:1: command not found: morpheus` on real
+    hardware), so the templates carry the absolute path resolved at init
+    time. Falls back to the bare name when nothing absolute is resolvable.
+    """
+    candidate = sys.argv[0] or ""
+    if os.path.isabs(candidate) and os.path.basename(candidate).startswith("morpheus"):
+        return candidate
+    return shutil.which("morpheus") or "morpheus"
+
+
+def render_prompt(template: str, morpheus_bin: Optional[str] = None) -> str:
+    """Substitute the resolved CLI path into a template's backticked commands."""
+    binary = morpheus_bin or _morpheus_bin()
+    if binary == "morpheus":
+        return template
+    return template.replace("`morpheus ", f"`{binary} ")
+
+
 @dataclass
 class TemplateResult:
     name: str
@@ -144,7 +169,7 @@ def ensure_templates(*, tenant_id: str = "", project_root: str = "",
     results: list[TemplateResult] = []
 
     loc_loop, loc_action = _ensure_loop(
-        LOCATION_LOOP_NAME, LOCATION_PROMPT, LOCATION_INTERVAL_SECONDS,
+        LOCATION_LOOP_NAME, render_prompt(LOCATION_PROMPT), LOCATION_INTERVAL_SECONDS,
         tenant_id=tenant_id, project_root=project_root, force=force)
     # set_rule replaces any prior rule for this source, so re-running (or
     # --force with a fresh loop id) always leaves exactly one rule. threshold=0
@@ -155,7 +180,7 @@ def ensure_templates(*, tenant_id: str = "", project_root: str = "",
                                   loop_id=loc_loop.id, rule_id=rule.id))
 
     mem_loop, mem_action = _ensure_loop(
-        MEMORY_LOOP_NAME, MEMORY_PROMPT, MEMORY_INTERVAL_SECONDS,
+        MEMORY_LOOP_NAME, render_prompt(MEMORY_PROMPT), MEMORY_INTERVAL_SECONDS,
         tenant_id=tenant_id, project_root=project_root, force=force)
     # Deliberately no feed rule: this loop feeds memory.md, not the glasses.
     results.append(TemplateResult(name=MEMORY_LOOP_NAME, action=mem_action,

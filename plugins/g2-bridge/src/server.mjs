@@ -43,6 +43,10 @@ const DEFAULT_FEED_LIMIT = 20;
 const MAX_FEED_LIMIT = 100;
 const FEED_SESSION_ID = "feed:main";
 const FEED_SESSION_TITLE = "Morpheus Feed";
+// Synthetic session that carries guidance notices (e.g. "open a project
+// first") for stock clients, which reject prompt responses without a session
+// id and render errors as nothing.
+const PROJECT_NOTICE_SESSION_ID = "notice:select-project";
 const FEED_ACK_ACTIONS = new Set(["expanded", "dismissed"]);
 const FEED_READ_ONLY_NOTICE =
   "Morpheus Feed is read-only. New pushes keep arriving here; open a project row to start a conversation.";
@@ -1565,11 +1569,20 @@ async function getOmniStatus({ provider, state, config }) {
       at: now,
     };
   } catch (err) {
-    bridgeDebug(config, "omni-status-failed", { reason: safeJsonError(err) });
+    const reason = safeJsonError(err);
+    bridgeDebug(config, "omni-status-failed", { reason });
+    // Surface the first failure (and reason changes) at warn level — a
+    // silently-hidden feed row is undebuggable from the glasses side.
+    if (cache.warnedReason !== reason) {
+      config.logger.warn(
+        `[g2-bridge] omni-status check failed (${reason}); feed row hidden until it succeeds.`,
+      );
+    }
     state.omniStatusCache = {
       value: cache.value || { enabled: false },
       at: now,
       stale: true,
+      warnedReason: reason,
     };
   }
   return state.omniStatusCache.value;
@@ -4435,11 +4448,26 @@ async function submitTextToMorpheus(req, res, context) {
         ? `No project is open yet. Go back and open a project first (${projectNames.join(", ")}), then speak again.`
         : "No project is open yet. Go back and open a project row first, then speak again.";
       const textHash = sha256(textResult.text);
+      // Stock clients reject prompt responses without a session id ("empty
+      // session id"), so the notice rides a synthetic session whose buffer
+      // holds the notice for follow-up message/history polls.
+      const noticeSessionId = bodySessionId || PROJECT_NOTICE_SESSION_ID;
+      pushMessageForSession(state, noticeSessionId, {
+        type: "result",
+        success: true,
+        provider: provider.name,
+        sessionId: noticeSessionId,
+        text: notice,
+        promptNotice: true,
+        at: nowIso(config.clock),
+      });
       const body = {
         ok: true,
         action: "project_not_selected_notice",
         code: "project_not_selected",
         provider: provider.name,
+        sessionId: noticeSessionId,
+        activeSessionId: noticeSessionId,
         requestId,
         textHash,
         state: "idle",
@@ -4449,7 +4477,9 @@ async function submitTextToMorpheus(req, res, context) {
         response: notice,
         output: { text: notice },
         history: [{ role: "assistant", text: notice }],
-        messages: [{ type: "result", success: true, text: notice }],
+        messages: getMessages(state, noticeSessionId, 0).map((entry) =>
+          presentMessageForSession(entry, noticeSessionId),
+        ),
         selectedSession: state.selectedSession,
       };
       audit("remote_text_rejected", {
@@ -6149,7 +6179,7 @@ function startBridge(options = {}) {
         "MORPHEUS_G2_ALLOW_UNSAFE_BIND=1 only behind trusted ACLs.",
     );
   }
-  const { app, provider } = createBridge(config);
+  const { app, state, provider } = createBridge(config);
   if (
     config.warmCodexAppServer &&
     provider.agentBackend === AGENT_BACKEND_CODEX_APP_SERVER &&
@@ -6193,6 +6223,13 @@ function startBridge(options = {}) {
       config.logger.warn("Non-local bind host. Keep this behind Tailscale ACLs or a trusted tunnel.");
     }
     qrcode.generate(qrUrl, { small: true });
+    // Resolve omnipresence once at startup and say so — whether the feed row
+    // shows is otherwise invisible until a client connects.
+    void getOmniStatus({ provider, state, config }).then((omni) => {
+      config.logger.log(
+        `[g2-bridge] omnipresence ${omni?.enabled ? "enabled — feed row shown" : "disabled — feed row hidden (run: morpheus omni on)"}`,
+      );
+    });
   });
   server.on("error", (err) => {
     if (err?.code === "EADDRINUSE") {

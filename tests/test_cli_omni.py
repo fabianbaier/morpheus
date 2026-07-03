@@ -463,7 +463,10 @@ class OmniInitTest(unittest.TestCase):
             self.assertEqual(len(by_name), 2)
             new_loc = by_name["omni-location"]
             self.assertNotEqual(new_loc.id, old["omni-location"].id)
-            self.assertEqual(new_loc.prompt, omni_templates.LOCATION_PROMPT)
+            self.assertEqual(
+                new_loc.prompt,
+                omni_templates.render_prompt(omni_templates.LOCATION_PROMPT),
+            )
             rules = feeds.rules(source_kind="loop", source_ref=str(new_loc.id))
             self.assertEqual([r.policy for r in rules], ["on_threshold"])
 
@@ -629,3 +632,21 @@ class ContextCliTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TemplateBinPathTest(unittest.TestCase):
+    """Loop agents run in shells whose PATH often lacks the morpheus shim, so
+    the rendered prompts must carry the resolved absolute CLI path."""
+
+    def test_render_prompt_substitutes_backticked_commands(self):
+        rendered = omni_templates.render_prompt(
+            omni_templates.LOCATION_PROMPT, "/opt/venv/bin/morpheus")
+        self.assertIn("`/opt/venv/bin/morpheus context latest --kind location`", rendered)
+        self.assertIn("`/opt/venv/bin/morpheus memory show --max-chars 2000`", rendered)
+        self.assertNotIn("`morpheus ", rendered)
+
+    def test_render_prompt_keeps_bare_name_without_resolution(self):
+        self.assertEqual(
+            omni_templates.render_prompt(omni_templates.MEMORY_PROMPT, "morpheus"),
+            omni_templates.MEMORY_PROMPT,
+        )
