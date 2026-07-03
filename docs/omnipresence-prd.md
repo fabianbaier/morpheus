@@ -2,7 +2,7 @@
 
 | Field | Value |
 | --- | --- |
-| Status | Draft for architecture review — no implementation yet |
+| Status | Phases 0–4 implemented (feed delivery, context ingestion, memory, judge); Phase 5 polish partially landed — see [omnipresence.md](omnipresence.md) for the quickstart |
 | Owner | Morpheus |
 | Surface | Core (feeds, loops, memory) + `plugins/g2-bridge` + simulator |
 | Last updated | 2026-07-03 |
