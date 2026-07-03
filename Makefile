@@ -5,11 +5,18 @@ LOOP_INTERVAL ?= 60
 LOOP_LIMIT ?= 5
 LOCAL_BIN ?= $(HOME)/.local/bin
 
+# Omnipresence / G2 bridge defaults. Override per-invocation, e.g.
+#   make start-omni G2_PUBLIC_URL=https://other-host.ts.net
+G2_PUBLIC_URL ?= https://fabians-macbook-pro.tail3387a8.ts.net
+G2_PORT ?= 3456
+G2_TOKEN_FILE ?= $(HOME)/.morpheus/g2-token
+G2_DIR := plugins/g2-bridge
+
 VENV_PY := $(VENV)/bin/python
 MORPHEUS := $(VENV)/bin/morpheus
 LOCAL_MORPHEUS := $(LOCAL_BIN)/morpheus
 
-.PHONY: help bootstrap install install-cli uninstall-cli start up dashboard desktop daemon daemon-start daemon-stop daemon-status status loop-runner loop-runner-stop loop-runner-status watch doctor logs loop-logs graph-status test clean
+.PHONY: help bootstrap install install-cli uninstall-cli start up dashboard desktop daemon daemon-start daemon-stop daemon-status status loop-runner loop-runner-stop loop-runner-status watch doctor logs loop-logs graph-status test clean start-omni omni-off omni-status g2-bridge g2-token
 
 help:
 	@printf "Morpheus dev commands\n\n"
@@ -26,7 +33,12 @@ help:
 	@printf "  make logs          Tail ~/.morpheus/daemon.log\n"
 	@printf "  make loop-logs     Tail ~/.morpheus/loop-runner.log\n"
 	@printf "  make test          Run lightweight local checks\n"
+	@printf "  make start-omni    Omnipresence: omni on + init, loop runner, tailscale serve, G2 bridge\n"
+	@printf "  make g2-bridge     Start only the G2 bridge (foreground) with the persisted token\n"
+	@printf "  make omni-status   Show omnipresence settings, template loops, and recent pushes\n"
+	@printf "  make omni-off      Disable omnipresence pushes\n"
 	@printf "\nOverride polling with POLL=2, e.g. make start POLL=2\n"
+	@printf "Override the glasses URL with G2_PUBLIC_URL=https://your-mac.your-tailnet.ts.net\n"
 
 $(VENV_PY):
 	$(PYTHON) -m venv $(VENV)
@@ -114,3 +126,36 @@ test: bootstrap
 
 clean:
 	rm -rf $(VENV) build dist *.egg-info
+
+g2-token:
+	@mkdir -p "$(HOME)/.morpheus"
+	@if [ ! -s "$(G2_TOKEN_FILE)" ]; then \
+		umask 177; openssl rand -hex 24 > "$(G2_TOKEN_FILE)"; \
+		printf "Generated G2 bridge token: %s\n" "$(G2_TOKEN_FILE)"; \
+	fi
+
+g2-bridge: bootstrap g2-token
+	@if [ ! -d "$(G2_DIR)/node_modules" ]; then npm --prefix "$(G2_DIR)" install; fi
+	@printf "G2 bridge: public URL %s (token file %s)\n" "$(G2_PUBLIC_URL)" "$(G2_TOKEN_FILE)"
+	MORPHEUS_G2_TOKEN="$$(cat "$(G2_TOKEN_FILE)")" \
+	MORPHEUS_G2_PUBLIC_URL="$(G2_PUBLIC_URL)" \
+	MORPHEUS_G2_ALLOWED_ORIGINS="$(G2_PUBLIC_URL)" \
+	MORPHEUS_BIN="$(abspath $(MORPHEUS))" \
+	PORT=$(G2_PORT) \
+	npm --prefix "$(G2_DIR)" start
+
+start-omni: bootstrap loop-runner
+	$(MORPHEUS) omni on
+	$(MORPHEUS) omni init
+	@if command -v tailscale >/dev/null 2>&1; then \
+		tailscale serve --bg $(G2_PORT) || printf "warning: 'tailscale serve --bg %s' failed — glasses need it to reach the bridge\n" "$(G2_PORT)"; \
+	else \
+		printf "warning: tailscale not found — run 'tailscale serve --bg %s' yourself so the glasses can reach the bridge\n" "$(G2_PORT)"; \
+	fi
+	$(MAKE) g2-bridge
+
+omni-off: bootstrap
+	$(MORPHEUS) omni off
+
+omni-status: bootstrap
+	$(MORPHEUS) omni status

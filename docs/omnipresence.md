@@ -7,8 +7,24 @@ file, and pushes one-line updates to the glasses. Design and decisions live in
 
 ## 1. Laptop setup
 
+One command does everything (enable omni, create template loops, install the
+loop runner, `tailscale serve`, and start the G2 bridge with a persisted
+token):
+
 ```bash
 cd ~/github/fabianbaier/morpheus
+make start-omni
+# override the tailnet URL if needed:
+#   make start-omni G2_PUBLIC_URL=https://your-mac.your-tailnet.ts.net
+```
+
+Related targets: `make g2-bridge` (bridge only), `make omni-status`,
+`make omni-off`. The bearer token is generated once into
+`~/.morpheus/g2-token` and reused across restarts.
+
+Or step by step:
+
+```bash
 pip install -e .          # or: make start (installs venv + daemon)
 
 morpheus omni on          # enable omnipresence
