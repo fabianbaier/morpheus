@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -1725,8 +1726,13 @@ def _print_broadcast_targets(selected: list[db.Mission]) -> None:
     console.print(table)
 
 
-@app.command()
+context_app = typer.Typer(help="Cross-session snapshot and ambient context signals.")
+app.add_typer(context_app, name="context")
+
+
+@context_app.callback(invoke_without_command=True)
 def context(
+    ctx: typer.Context,
     fmt: str = typer.Option("md", "--format", "-f", help="md | json | short"),
     refresh: bool = typer.Option(False, "--refresh", "-r",
                                   help="Force re-poll iTerm before printing (slower)."),
@@ -1736,7 +1742,10 @@ def context(
 
     Default reads ~/.morpheus/context.md which the watch loop maintains every
     few seconds. --refresh forces a live re-poll (use sparingly).
+    Subcommands (add/latest/list) manage ambient context signals instead.
     """
+    if ctx.invoked_subcommand is not None:
+        return
     if refresh:
         # Live re-poll — pulls fresh tabs + state, writes file, then continues.
         async def _do(connection):
@@ -1761,6 +1770,85 @@ def context(
         md = ctx_mod.build_markdown(self_tab, self_session, tenant_id=tenant_id)
         # Render with Rich's markdown for terminal display.
         console.print(Markdown(md))
+
+
+def _signal_row(signal) -> tuple[str, str, str, str]:
+    stamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(signal.ts))
+    payload = json.dumps(signal.payload, separators=(",", ":"))
+    if len(payload) > 120:
+        payload = payload[:117] + "..."
+    return (str(signal.id), signal.kind, stamp, payload)
+
+
+@context_app.command("add")
+def context_add(
+    kind: str = typer.Option(..., "--kind", help="Signal kind, e.g. location."),
+    data: str = typer.Option(..., "--data", help="Signal payload as a JSON object."),
+):
+    """Store one ambient context signal (phone/glasses sensor reading)."""
+    from morpheus import signals as signals_mod
+
+    try:
+        # Length check BEFORE json.loads: parsing a huge/deep string costs
+        # memory and can hit the recursion limit; anything over twice the
+        # stored payload cap can never be accepted anyway.
+        if len(data) > 2 * signals_mod.PAYLOAD_MAX_CHARS:
+            raise ValueError(
+                f"data too large (> {2 * signals_mod.PAYLOAD_MAX_CHARS} chars)")
+        payload = json.loads(data)
+        if not isinstance(payload, dict):
+            raise ValueError("data must be a JSON object")
+        signal_id = signals_mod.add_signal(kind, payload)
+    except (ValueError, json.JSONDecodeError, RecursionError) as exc:
+        console.print(f"[red]{escape(str(exc))}[/red]")
+        raise typer.Exit(1)
+    console.print(f"[green]stored[/green] context signal #{signal_id} ({escape(kind)})")
+
+
+@context_app.command("latest")
+def context_latest(
+    kind: Optional[str] = typer.Option(None, "--kind", help="Signal kind; omit for latest per kind."),
+):
+    """Show the newest context signal (per kind, or for one kind)."""
+    from morpheus import signals as signals_mod
+
+    if kind:
+        signal = signals_mod.latest(kind)
+        if signal is None:
+            console.print(f"[yellow]no '{escape(kind)}' signals yet.[/yellow]")
+            raise typer.Exit(1)
+        signals = [signal]
+    else:
+        signals = signals_mod.latest_per_kind()
+        if not signals:
+            console.print("[yellow]no context signals yet.[/yellow]")
+            return
+    table = Table(title="latest context signals")
+    for column in ("id", "kind", "ts", "payload"):
+        table.add_column(column)
+    for signal in signals:
+        table.add_row(*_signal_row(signal))
+    console.print(table)
+
+
+@context_app.command("list")
+def context_list(
+    kind: str = typer.Option(..., "--kind", help="Signal kind, e.g. location."),
+    limit: int = typer.Option(20, "--limit", min=1, max=1000, help="Maximum signals to show."),
+):
+    """List recent context signals of one kind, newest first."""
+    from morpheus import signals as signals_mod
+
+    signals = signals_mod.recent(kind, limit=limit)
+    if not signals:
+        console.print(f"[yellow]no '{escape(kind)}' signals yet.[/yellow]")
+        return
+    table = Table(title=f"context signals · {kind}")
+    for column in ("id", "kind", "ts", "payload"):
+        table.add_column(column)
+    for signal in signals:
+        table.add_row(*_signal_row(signal))
+    console.print(table)
 
 
 @remote_app.command("snapshot")
@@ -2138,6 +2226,482 @@ def remote_widget(
         console.print(f"[green]wrote[/green] {out}")
         return
     console.print(html_text, markup=False)
+
+
+# ── omnipresence remote contract (consumed by the g2-bridge) ─────────────
+#
+# These four commands are the exact CLI contract the Node bridge shells out
+# to; shapes are frozen — change them only together with plugins/g2-bridge.
+
+FEED_BODY_MAX_CHARS = 2000
+FEED_REF_MAX_CHARS = 200
+# Serialized metadata larger than this is replaced by a stub (keeping the
+# judge score when extractable) so one huge item cannot blow the bridge's
+# per-command output cap and take down /api/feed for every item after it.
+FEED_METADATA_MAX_CHARS = 2048
+
+
+def _bounded_metadata(metadata: dict) -> dict:
+    try:
+        encoded = json.dumps(metadata)
+    except (TypeError, ValueError, RecursionError):
+        return {"truncated": True}
+    if len(encoded) <= FEED_METADATA_MAX_CHARS:
+        return metadata
+    stub: dict = {"truncated": True}
+    judge_meta = metadata.get("judge")
+    if isinstance(judge_meta, dict):
+        score = judge_meta.get("score")
+        if isinstance(score, (int, float)) and not isinstance(score, bool):
+            stub["judge"] = {"score": float(score)}
+    return stub
+
+
+def _remote_feed_item(item) -> dict:
+    """Bounded, display-safe feed item for remote surfaces (no raw buffers)."""
+    metadata = item.metadata if isinstance(item.metadata, dict) else {}
+    return {
+        "id": int(item.id),
+        "ts": float(item.ts),
+        "title": str(item.title or "")[:200],
+        "body": str(item.body or "")[:FEED_BODY_MAX_CHARS],
+        "priority": int(item.priority or 0),
+        "source_kind": str(item.source_kind or "")[:64],
+        "source_ref": str(item.source_ref or "")[:FEED_REF_MAX_CHARS],
+        "metadata": _bounded_metadata(metadata),
+    }
+
+
+def _emit_remote_payload(payload: dict, compact: bool) -> None:
+    if compact:
+        sys.stdout.write(json.dumps(payload, separators=(",", ":")) + "\n")
+    else:
+        console.print_json(json.dumps(payload))
+
+
+@remote_app.command("feed")
+def remote_feed(
+    after: int = typer.Option(0, "--after", min=0, help="Cursor: return items with id > after."),
+    limit: int = typer.Option(20, "--limit", min=1, max=200, help="Maximum items to return."),
+    feed: Optional[str] = typer.Option(None, "--feed", help="Feed name (default: the configured [omni] feed)."),
+    include_dismissed: bool = typer.Option(
+        False, "--include-dismissed",
+        help="Also return items the user already dismissed (excluded by default)."),
+    compact: bool = typer.Option(False, "--compact", help="Print compact JSON."),
+):
+    """Print feed items for the glasses bridge (ascending by id).
+
+    Serves the feed omnipresence routes to ([omni].feed) unless --feed
+    overrides it, and hides items the user dismissed so a bridge/simulator
+    restart never resurrects them.
+    """
+    from morpheus import feeds as feeds_mod
+
+    feed_name = feed or cfg_mod.omni_settings()["feed"]
+    exclude_dismissed = not include_dismissed
+    if after > 0:
+        items = feeds_mod.recent_after(after, limit, feed=feed_name,
+                                       exclude_dismissed=exclude_dismissed)
+    else:
+        # No cursor yet: hand the client the newest `limit` items, still in
+        # ascending order so it can render and adopt the last id as cursor.
+        items = list(reversed(feeds_mod.recent(limit, feed=feed_name,
+                                               exclude_dismissed=exclude_dismissed)))
+    payload = {
+        "items": [_remote_feed_item(item) for item in items],
+        "latest_id": feeds_mod.latest_id(feed=feed_name),
+    }
+    _emit_remote_payload(payload, compact)
+
+
+@remote_app.command("feed-ack")
+def remote_feed_ack(
+    item: int = typer.Option(..., "--item", help="Feed item id being acknowledged."),
+    action: str = typer.Option(..., "--action", help="expanded | dismissed"),
+    compact: bool = typer.Option(False, "--compact", help="Print compact JSON."),
+):
+    """Record a glasses-side expand/dismiss ack for one pushed feed item."""
+    from morpheus import feeds as feeds_mod
+
+    try:
+        feeds_mod.record_ack(item, action)
+    except ValueError as exc:
+        _emit_remote_payload({"ok": False, "error": str(exc)}, compact)
+        raise typer.Exit(1)
+    _emit_remote_payload({"ok": True, "item": int(item), "action": action.strip().lower()}, compact)
+
+
+@remote_app.command("context-add")
+def remote_context_add(
+    kind: str = typer.Option(..., "--kind", help="Signal kind, e.g. location."),
+    data: str = typer.Option(..., "--data", help="Signal payload as a JSON object."),
+    compact: bool = typer.Option(False, "--compact", help="Print compact JSON."),
+):
+    """Store one context signal posted through the bridge (/api/context)."""
+    from morpheus import signals as signals_mod
+
+    try:
+        # Length check BEFORE json.loads (see context_add): bound parse cost
+        # and recursion for bridge-supplied payloads too.
+        if len(data) > 2 * signals_mod.PAYLOAD_MAX_CHARS:
+            raise ValueError(
+                f"data too large (> {2 * signals_mod.PAYLOAD_MAX_CHARS} chars)")
+        payload = json.loads(data)
+        if not isinstance(payload, dict):
+            raise ValueError("data must be a JSON object")
+        signal_id = signals_mod.add_signal(kind, payload)
+    except (ValueError, json.JSONDecodeError, RecursionError) as exc:
+        _emit_remote_payload({"ok": False, "error": str(exc)[:200]}, compact)
+        raise typer.Exit(1)
+    _emit_remote_payload({"ok": True, "id": signal_id}, compact)
+
+
+@remote_app.command("omni-status")
+def remote_omni_status(
+    compact: bool = typer.Option(False, "--compact", help="Print compact JSON."),
+):
+    """Print the resolved omnipresence settings the bridge advertises."""
+    settings = cfg_mod.omni_settings()
+    payload = {
+        "enabled": bool(settings["enabled"]),
+        "threshold": float(settings["threshold"]),
+        "push_per_hour": int(settings["push_per_hour"]),
+        "quiet_hours": settings["quiet_hours"],
+        "feed": settings["feed"],
+    }
+    _emit_remote_payload(payload, compact)
+
+
+# ── user memory (~/.morpheus/memory.md) ──────────────────────────────────
+
+memory_app = typer.Typer(help="User-level relevance memory (~/.morpheus/memory.md).")
+app.add_typer(memory_app, name="memory")
+
+
+@memory_app.command("show")
+def memory_show(
+    max_chars: int = typer.Option(0, "--max-chars", min=0, help="Truncate safely to N chars (0 = full file)."),
+):
+    """Print the user memory file."""
+    from morpheus import memory as memory_mod
+
+    text = memory_mod.top_entries(max_chars) if max_chars else memory_mod.read_memory()
+    # Raw write, never console.print: rich hard-wraps at ~80 cols when stdout
+    # is not a TTY, and the omni-memory agent reads this output — wrapped
+    # fragments would break its never-duplicate-a-fact contract.
+    if text and not text.endswith("\n"):
+        text += "\n"
+    sys.stdout.write(text)
+
+
+@memory_app.command("path")
+def memory_path():
+    """Print the memory file path (creating the template if missing)."""
+    from morpheus import memory as memory_mod
+
+    console.print(str(memory_mod.ensure_file()), markup=False)
+
+
+@memory_app.command("add")
+def memory_add(
+    text: str = typer.Argument(..., help="One-line fact to remember."),
+    section: str = typer.Option("Current", "--section", help="People | Interests | Current | Never push."),
+    custom_section: bool = typer.Option(
+        False, "--custom-section",
+        help="Allow a non-canonical section name (off by default so agents cannot invent sections)."),
+):
+    """Append a dated one-line fact under a section of memory.md.
+
+    --section is restricted to the canonical sections unless --custom-section
+    is passed; the omni-memory agent runs this command, and free-form section
+    names would let mined feed content sprawl the memory file.
+    """
+    from morpheus import memory as memory_mod
+
+    canonical = {name.lower() for name in memory_mod.SECTIONS}
+    if not custom_section and " ".join(str(section or "").split()).lstrip("#").strip().lower() not in canonical:
+        console.print(
+            f"[red]--section must be one of {' | '.join(memory_mod.SECTIONS)} "
+            "(pass --custom-section to use a custom name)[/red]")
+        raise typer.Exit(1)
+    try:
+        line = memory_mod.append_entry(section, text)
+    except ValueError as exc:
+        console.print(f"[red]{escape(str(exc))}[/red]")
+        raise typer.Exit(1)
+    console.print(f"[green]added under ## {escape(section)}:[/green] {escape(line)}")
+
+
+@memory_app.command("candidates")
+def memory_candidates(
+    limit: int = typer.Option(20, "--limit", min=1, max=100, help="Maximum recent feed items to review."),
+    feed: Optional[str] = typer.Option(None, "--feed", help="Feed name (default: the configured [omni] feed)."),
+):
+    """Recent pushes + how the user reacted — raw material for the
+    omni-memory loop (expanded = relevant signal, dismissed = negative)."""
+    from morpheus import feeds as feeds_mod
+
+    # Mine the feed omnipresence actually pushes to ([omni].feed), not a
+    # hardwired 'main' — otherwise a non-default feed is never mined.
+    feed_name = feed or cfg_mod.omni_settings()["feed"]
+    items = feeds_mod.recent(limit, feed=feed_name)
+    if not items:
+        console.print("[dim]no feed items yet — nothing to mine.[/dim]")
+        return
+    reactions: dict[int, str] = {}
+    for ack in reversed(feeds_mod.recent_acks(limit * 5)):
+        reactions[ack.item_id] = ack.action  # newest ack per item wins
+    lines = []
+    for item in items:
+        action = reactions.get(item.id, "no-ack")
+        stamp = time.strftime("%Y-%m-%d %H:%M", time.localtime(item.ts))
+        lines.append(f"[{action}] {stamp} [{item.source_kind}] {item.title}")
+    # Raw write (see memory_show): the omni-memory agent parses these lines;
+    # rich would hard-wrap long titles into fragments off a TTY.
+    sys.stdout.write("\n".join(lines) + "\n")
+
+
+@memory_app.command("log")
+def memory_log(
+    limit: int = typer.Option(20, "--limit", min=1, max=500, help="Maximum log entries to show."),
+):
+    """Show recent memory changes (what was appended, where, when)."""
+    from morpheus import memory as memory_mod
+
+    entries = memory_mod.read_log(limit)
+    if not entries:
+        console.print("[yellow]no memory changes logged yet.[/yellow]")
+        return
+    table = Table(title="memory changes (newest first)")
+    for column in ("ts", "section", "text"):
+        table.add_column(column)
+    for entry in entries:
+        table.add_row(entry["ts"], entry["section"], entry["text"])
+    console.print(table)
+
+
+# ── feeds: route your own loops into ambient feeds ──────────────────────
+
+feeds_app = typer.Typer(help="Route loop output into ambient feeds (rules, recent items).")
+app.add_typer(feeds_app, name="feeds")
+
+
+def _require_loop(loop_id: int) -> db.PromptLoop:
+    loop = db.get_loop(loop_id)
+    if loop is None:
+        console.print(f"[red]no loop #{loop_id}[/red]")
+        raise typer.Exit(1)
+    return loop
+
+
+@feeds_app.command("rules")
+def feeds_rules(
+    feed: Optional[str] = typer.Option(None, "--feed", help="Only rules for this feed (default: all feeds)."),
+):
+    """List feed routing rules (which sources push into which feed, and when)."""
+    from morpheus import feeds as feeds_mod
+
+    rules = feeds_mod.rules(feed=feed)
+    if not rules:
+        console.print("[dim]no feed rules yet — route a loop with `morpheus feeds route <loop-id>`.[/dim]")
+        return
+    table = Table(title=f"FEED RULES — {len(rules)}", header_style="bold green")
+    table.add_column("ID", style="cyan", no_wrap=True)
+    table.add_column("FEED")
+    table.add_column("SOURCE")
+    table.add_column("POLICY")
+    table.add_column("THRESHOLD", justify="right")
+    table.add_column("PATTERN")
+    for rule in rules:
+        source = f"{rule.source_kind}:{rule.source_ref}"
+        if rule.source_kind == "loop":
+            try:
+                loop = db.get_loop(int(rule.source_ref))
+            except (TypeError, ValueError):
+                loop = None
+            if loop is not None:
+                source = f"loop #{loop.id} {loop.name}"
+        threshold = ""
+        if rule.policy == "on_threshold":
+            threshold = f"{rule.threshold:g}" if rule.threshold > 0 else "(omni default)"
+        table.add_row(str(rule.id), rule.feed, source, rule.policy,
+                      threshold, rule.pattern or "")
+    console.print(table)
+
+
+@feeds_app.command("route")
+def feeds_route(
+    loop_id: int = typer.Argument(..., help="Loop id whose output should be routed."),
+    policy: str = typer.Option("on_threshold", "--policy",
+                               help="always | on_change | on_match | on_failure | on_threshold"),
+    threshold: float = typer.Option(0.0, "--threshold",
+                                    help="on_threshold only: judge score in [0,1] needed to push (0 = [omni] default)."),
+    pattern: str = typer.Option("", "--pattern", help="on_match only: regex the summary must match."),
+    feed: Optional[str] = typer.Option(None, "--feed", help="Feed name (default: the configured [omni] feed)."),
+):
+    """Create or replace the feed rule for one loop (one rule per source)."""
+    from morpheus import feeds as feeds_mod
+
+    loop = _require_loop(loop_id)
+    feed_name = feed or cfg_mod.omni_settings()["feed"]
+    try:
+        rule = feeds_mod.set_rule("loop", str(loop.id), policy=policy,
+                                  pattern=pattern, threshold=threshold,
+                                  feed=feed_name)
+    except (ValueError, re.error) as exc:
+        console.print(f"[red]{escape(str(exc))}[/red]")
+        raise typer.Exit(1)
+    detail = f"policy [cyan]{rule.policy}[/cyan]"
+    if rule.policy == "on_threshold":
+        detail += f" · threshold {rule.threshold:g}" if rule.threshold > 0 else " · threshold (omni default)"
+    if rule.pattern:
+        detail += f" · pattern {escape(rule.pattern)}"
+    console.print(
+        f"[green]rule #{rule.id}[/green] loop #{loop.id} {escape(loop.name)}"
+        f" → feed '{escape(rule.feed)}' · {detail}")
+
+
+@feeds_app.command("unroute")
+def feeds_unroute(
+    loop_id: int = typer.Argument(..., help="Loop id to stop routing."),
+    feed: Optional[str] = typer.Option(None, "--feed", help="Only remove the rule for this feed (default: all feeds)."),
+):
+    """Delete the feed rule(s) for one loop."""
+    from morpheus import feeds as feeds_mod
+
+    loop = _require_loop(loop_id)
+    rules = feeds_mod.rules(source_kind="loop", source_ref=str(loop.id), feed=feed)
+    if not rules:
+        console.print(f"[yellow]loop #{loop.id} has no feed rule — nothing to remove.[/yellow]")
+        return
+    for rule in rules:
+        feeds_mod.delete_rule(rule.id)
+        console.print(
+            f"[green]removed[/green] rule #{rule.id}"
+            f" (loop #{loop.id} {escape(loop.name)} → feed '{escape(rule.feed)}')")
+
+
+@feeds_app.command("recent")
+def feeds_recent(
+    limit: int = typer.Option(20, "--limit", min=1, max=200, help="Maximum items to show."),
+    feed: Optional[str] = typer.Option(None, "--feed", help="Feed name (default: the configured [omni] feed)."),
+):
+    """Show recent feed items, newest first."""
+    from morpheus import feeds as feeds_mod
+
+    feed_name = feed or cfg_mod.omni_settings()["feed"]
+    items = feeds_mod.recent(limit, feed=feed_name)
+    if not items:
+        console.print(f"[dim]no items in feed '{escape(feed_name)}' yet.[/dim]")
+        return
+    table = Table(title=f"FEED '{feed_name}' — {len(items)} items", header_style="bold green")
+    table.add_column("ID", style="cyan", no_wrap=True)
+    table.add_column("WHEN", no_wrap=True)
+    table.add_column("!", no_wrap=True)
+    table.add_column("SOURCE", no_wrap=True)
+    table.add_column("TITLE", overflow="fold")
+    for item in items:
+        stamp = time.strftime("%m-%d %H:%M", time.localtime(item.ts))
+        source = item.source_kind
+        if item.source_ref:
+            source += f":{item.source_ref}"
+        table.add_row(str(item.id), stamp, "!" if item.priority > 0 else "",
+                      source, item.title)
+    console.print(table)
+
+
+# ── omnipresence mode controls ───────────────────────────────────────────
+
+omni_app = typer.Typer(help="Omnipresence mode — ambient pushes to connected glasses.")
+app.add_typer(omni_app, name="omni")
+
+
+def _print_omni_status() -> None:
+    from morpheus import feeds as feeds_mod
+    from morpheus import omni_templates
+
+    settings = cfg_mod.omni_settings()
+    quiet = settings["quiet_hours"]
+    table = Table(title="omnipresence")
+    table.add_column("setting")
+    table.add_column("value")
+    table.add_row("enabled", "[green]on[/green]" if settings["enabled"] else "[red]off[/red]")
+    table.add_row("threshold", f"{settings['threshold']:g}")
+    table.add_row("push_per_hour", str(settings["push_per_hour"]))
+    table.add_row("quiet_hours", f"{quiet['start']}-{quiet['end']}" if quiet else "none")
+    table.add_row("feed", settings["feed"])
+    table.add_row(
+        "judge_command",
+        settings["judge_command"] or f"(default: {loops_mod.DEFAULT_COMMAND})",
+    )
+    for tpl in omni_templates.template_status():
+        label = f"#{tpl['loop_id']} {tpl['status']}" if tpl["present"] else "[yellow]missing — run `morpheus omni init`[/yellow]"
+        table.add_row(f"loop {tpl['name']}", label)
+    table.add_row("feed rules", str(len(feeds_mod.rules(feed=settings["feed"]))))
+    console.print(table)
+    items = feeds_mod.recent(3, feed=settings["feed"])
+    if items:
+        console.print("[bold]last feed items[/bold]")
+        for item in items:
+            stamp = time.strftime("%H:%M", time.localtime(item.ts))
+            console.print(f"  {stamp} [{item.source_kind}] {item.title}", markup=False)
+    else:
+        console.print("[dim]no feed items yet[/dim]")
+
+
+@omni_app.command("init")
+def omni_init(
+    force: bool = typer.Option(False, "--force", help="Recreate the template loops from the current templates."),
+):
+    """Create the omnipresence template loops (idempotent, PRD §3.4).
+
+    omni-location (5m, on_threshold feed rule) and omni-memory (hourly, no
+    feed rule) are ordinary loops: visible in `morpheus loops list`,
+    editable, pausable, deletable. Re-running reports existing loops instead
+    of duplicating them; nothing is paused.
+    """
+    from morpheus import omni_templates
+
+    settings = cfg_mod.omni_settings()
+    project = tenant_mod.ensure_project_tenant(Path.cwd())
+    results = omni_templates.ensure_templates(
+        tenant_id=project.tenant_id,
+        project_root=project.root_path,
+        feed=settings["feed"],
+        force=force,
+    )
+    for res in results:
+        color = {"created": "green", "recreated": "green"}.get(res.action, "yellow")
+        line = f"[{color}]{res.action}[/{color}] loop #{res.loop_id} {res.name}"
+        if res.rule_id is not None:
+            line += f" · feed rule #{res.rule_id} on_threshold → feed '{settings['feed']}'"
+        else:
+            line += " · no feed rule (feeds memory.md, not the glasses)"
+        console.print(line)
+    if not settings["enabled"]:
+        console.print("[dim]omnipresence is off — enable pushes with `morpheus omni on`.[/dim]")
+
+
+@omni_app.command("on")
+def omni_on():
+    """Enable omnipresence mode (persists [omni].enabled in config.toml)."""
+    path = cfg_mod.set_omni_enabled(True)
+    console.print(f"[green]omnipresence enabled[/green] ({path})")
+    _print_omni_status()
+
+
+@omni_app.command("off")
+def omni_off():
+    """Disable omnipresence mode (persists [omni].enabled in config.toml)."""
+    path = cfg_mod.set_omni_enabled(False)
+    console.print(f"[yellow]omnipresence disabled[/yellow] ({path})")
+    _print_omni_status()
+
+
+@omni_app.command("status")
+def omni_status():
+    """Show the resolved omnipresence settings."""
+    _print_omni_status()
 
 
 @app.command("activity")
