@@ -4234,6 +4234,50 @@ test("runJsonCommand reports oversized output and escalates to SIGKILL", async (
   );
 });
 
+test("runJsonCommand surfaces structured CLI failures printed to stdout", async () => {
+  // The real CLI prints {"ok":false,"error":"..."} to STDOUT and exits 1 with
+  // an empty stderr; the runner must relay that message, flagged as a CLI
+  // rejection, instead of a generic exit-code error.
+  const cliShape =
+    'process.stdout.write(JSON.stringify({ ok: false, error: "unknown feed item: 7" }) + "\\n"); process.exit(1);';
+  await assert.rejects(
+    runJsonCommand(process.execPath, ["-e", cliShape], {
+      timeoutMs: 8000,
+      outputLimitBytes: 65536,
+    }),
+    (err) => {
+      assert.equal(err.message, "unknown feed item: 7");
+      assert.equal(err.cliRejection, true);
+      return true;
+    },
+  );
+
+  // Non-JSON stdout keeps the stderr-or-generic fallback for crashes.
+  const stderrShape = 'process.stderr.write("boom\\n"); process.exit(2);';
+  await assert.rejects(
+    runJsonCommand(process.execPath, ["-e", stderrShape], {
+      timeoutMs: 8000,
+      outputLimitBytes: 65536,
+    }),
+    (err) => {
+      assert.equal(err.message, "boom");
+      assert.notEqual(err.cliRejection, true);
+      return true;
+    },
+  );
+
+  // JSON stdout without the failure shape (partial success output before a
+  // crash) must not be mistaken for a CLI rejection.
+  const partialShape = 'process.stdout.write(JSON.stringify({ ok: true }) + "\\n"); process.exit(3);';
+  await assert.rejects(
+    runJsonCommand(process.execPath, ["-e", partialShape], {
+      timeoutMs: 8000,
+      outputLimitBytes: 65536,
+    }),
+    /exited with code 3/,
+  );
+});
+
 test("a whitespace-padded configured token still authenticates clients", async (t) => {
   // MORPHEUS_G2_TOKEN with a trailing space must mean the same secret as the
   // trimmed value clients send: the trimmed token is canonical at config time.
@@ -4479,4 +4523,565 @@ test("startBridge reports a friendly message when the port is already in use", a
     await sleep(10);
   }
   assert.equal(shutdownCalls, 1, "the listen failure must shut the provider down");
+});
+
+// --- Omnipresence feed (feed:main), feed acks, and context ingestion ---
+
+const FEED_OMNI = {
+  enabled: true,
+  threshold: 0.7,
+  push_per_hour: 6,
+  quiet_hours: null,
+  feed: "main",
+};
+
+function feedItem(id, title, body = "", extra = {}) {
+  return {
+    id,
+    ts: 1_779_999_900 + id,
+    title,
+    body,
+    priority: 1,
+    source_kind: "loop",
+    source_ref: `loop:test-${id}`,
+    metadata: {},
+    ...extra,
+  };
+}
+
+function readFeedStateFile(statePath) {
+  return JSON.parse(fs.readFileSync(statePath, "utf8"));
+}
+
+function writeFeedStateFile(statePath, stateObj) {
+  // Write-then-rename keeps the fixture from ever reading a half-written file
+  // while the bridge feed poller races test-side appends.
+  const tmpPath = `${statePath}.tmp`;
+  fs.writeFileSync(tmpPath, JSON.stringify(stateObj));
+  fs.renameSync(tmpPath, statePath);
+}
+
+function appendFeedItem(statePath, item) {
+  const stateObj = readFeedStateFile(statePath);
+  stateObj.items = [...(stateObj.items || []), item];
+  writeFeedStateFile(statePath, stateObj);
+}
+
+async function withFeedBridge(t, { enabled = true, items = [], options = {} } = {}) {
+  const statePath = path.join(
+    tmpdir(),
+    `morpheus-g2-feed-${process.pid}-${t.name.replace(/[^A-Za-z0-9_-]/g, "_")}.json`,
+  );
+  writeFeedStateFile(statePath, {
+    omni: { ...FEED_OMNI, enabled },
+    items,
+    acks: [],
+    contexts: [],
+  });
+  process.env.MOCK_MORPHEUS_STATE_FILE = statePath;
+  t.after(() => {
+    delete process.env.MOCK_MORPHEUS_STATE_FILE;
+    fs.rmSync(statePath, { force: true });
+  });
+  const bridge = await withBridge(t, options);
+  t.after(() => {
+    // Feed pollers stop themselves once subscribers disappear, but tests that
+    // keep the feed selected would otherwise leave an interval spawning the
+    // fixture for the rest of the suite.
+    if (bridge.state.feedPoller) {
+      clearInterval(bridge.state.feedPoller);
+      bridge.state.feedPoller = null;
+    }
+  });
+  return { ...bridge, statePath };
+}
+
+test("feed endpoint pages with an ascending cursor", async (t) => {
+  const { baseUrl } = await withFeedBridge(t, {
+    items: [feedItem(1, "first push"), feedItem(2, "second push"), feedItem(3, "third push")],
+  });
+
+  const unauthorized = await request(baseUrl, "/api/feed", { token: null });
+  assert.equal(unauthorized.status, 401);
+
+  const newest = await request(baseUrl, "/api/feed?limit=2");
+  assert.equal(newest.status, 200);
+  const newestBody = await newest.json();
+  assert.deepEqual(
+    newestBody.items.map((item) => item.id),
+    [2, 3],
+    "after=0 returns the newest limit items in ascending order",
+  );
+  assert.equal(newestBody.latest_id, 3);
+  assert.equal(newestBody.omnipresence.enabled, true);
+
+  const paged = await request(baseUrl, "/api/feed?after=1");
+  const pagedBody = await paged.json();
+  assert.deepEqual(
+    pagedBody.items.map((item) => item.id),
+    [2, 3],
+    "after cursor returns only strictly newer items",
+  );
+
+  const drained = await request(baseUrl, "/api/feed?after=3");
+  assert.deepEqual((await drained.json()).items, []);
+
+  const garbage = await request(baseUrl, "/api/feed?after=abc&limit=zzz");
+  assert.equal(garbage.status, 200);
+  const garbageBody = await garbage.json();
+  assert.deepEqual(
+    garbageBody.items.map((item) => item.id),
+    [1, 2, 3],
+    "non-numeric params fall back to defaults instead of poisoning the cursor",
+  );
+});
+
+test("feed ack validates actions and replays duplicates without re-acking", async (t) => {
+  const { baseUrl, statePath, auditPath } = await withFeedBridge(t, {
+    items: [feedItem(1, "push")],
+  });
+
+  const badAction = await request(baseUrl, "/api/feed/ack", {
+    body: { itemId: 1, action: "archived", clientRequestId: "ack-bad-0001" },
+  });
+  assert.equal(badAction.status, 400);
+  assert.equal((await badAction.json()).code, "invalid_feed_action");
+
+  const missingItem = await request(baseUrl, "/api/feed/ack", {
+    body: { action: "expanded", clientRequestId: "ack-bad-0002" },
+  });
+  assert.equal(missingItem.status, 400);
+  assert.equal((await missingItem.json()).code, "missing_feed_item_id");
+
+  const ack = await request(baseUrl, "/api/feed/ack", {
+    body: { itemId: 1, action: "expanded", clientRequestId: "ack-0001" },
+  });
+  assert.equal(ack.status, 200);
+  const ackBody = await ack.json();
+  assert.equal(ackBody.ok, true);
+  assert.equal(ackBody.item, 1);
+  assert.equal(ackBody.action, "expanded");
+
+  const replay = await request(baseUrl, "/api/feed/ack", {
+    body: { itemId: 1, action: "expanded", clientRequestId: "ack-0001" },
+  });
+  assert.equal(replay.status, 200);
+  assert.equal((await replay.json()).duplicate, true);
+
+  assert.equal(
+    readFeedStateFile(statePath).acks.length,
+    1,
+    "the duplicate request id must not reach the CLI a second time",
+  );
+
+  await sleep(50);
+  const audit = fs.readFileSync(auditPath, "utf8");
+  assert.match(audit, /feed_ack/);
+});
+
+test("context ingestion validates location strictly and never logs coordinates", async (t) => {
+  const { baseUrl, statePath, auditPath } = await withFeedBridge(t, { items: [] });
+  const rejected = [
+    { kind: "location", lat: "48.13", lon: 11.58 },
+    { kind: "location", lat: 48.13 },
+    { kind: "location", lat: 91, lon: 11.58 },
+    { kind: "location", lat: 48.13, lon: -191 },
+    { kind: "location", lat: 48.13, lon: 11.58, accuracy: "12" },
+    { kind: "battery", level: 80 },
+  ];
+  for (const [idx, body] of rejected.entries()) {
+    const res = await request(baseUrl, "/api/context", {
+      body: { ...body, clientRequestId: `ctx-bad-000${idx}` },
+    });
+    assert.equal(res.status, 400, `must reject ${JSON.stringify(body)}`);
+  }
+  assert.equal(readFeedStateFile(statePath).contexts.length, 0, "rejects never reach the CLI");
+
+  const ok = await request(baseUrl, "/api/context", {
+    body: {
+      kind: "location",
+      lat: 48.137154,
+      lon: 11.576124,
+      accuracy: 12.5,
+      ts: 1_779_999_999.5,
+      clientRequestId: "ctx-0001",
+    },
+  });
+  assert.equal(ok.status, 200);
+  const okBody = await ok.json();
+  assert.equal(okBody.ok, true);
+  assert.equal(okBody.kind, "location");
+  assert.ok(Number.isInteger(okBody.id));
+
+  const replay = await request(baseUrl, "/api/context", {
+    body: {
+      kind: "location",
+      lat: 48.137154,
+      lon: 11.576124,
+      accuracy: 12.5,
+      ts: 1_779_999_999.5,
+      clientRequestId: "ctx-0001",
+    },
+  });
+  assert.equal(replay.status, 200);
+  assert.equal((await replay.json()).duplicate, true);
+
+  const contexts = readFeedStateFile(statePath).contexts;
+  assert.equal(contexts.length, 1, "the duplicate request id must not store a second signal");
+  assert.equal(contexts[0].data.lat, 48.137154);
+  assert.equal(contexts[0].data.lon, 11.576124);
+
+  await sleep(50);
+  const audit = fs.readFileSync(auditPath, "utf8");
+  assert.match(audit, /context_add/);
+  assert.match(audit, /payloadHash/);
+  assert.doesNotMatch(audit, /48\.137154/);
+  assert.doesNotMatch(audit, /11\.576124/);
+});
+
+test("feed row leads the session list when omnipresence is enabled", async (t) => {
+  const { baseUrl } = await withFeedBridge(t, {
+    items: [feedItem(1, "Espresso beans on promo 50m left")],
+  });
+
+  const sessions = await request(baseUrl, "/api/sessions");
+  const body = await sessions.json();
+  assert.equal(body.sessions[0].id, "feed:main");
+  assert.equal(body.sessions[0].title, "Morpheus Feed");
+  assert.ok(body.sessions.some((row) => row.id === "abc123"));
+
+  const projects = await request(baseUrl, "/api/sessions?view=projects");
+  const projectsBody = await projects.json();
+  assert.equal(projectsBody.sessions[0].id, "feed:main");
+  assert.ok(projectsBody.sessions.some((row) => row.id === "project:p_alpha"));
+
+  await request(baseUrl, "/api/select-project", {
+    body: { projectId: "p_alpha", clientRequestId: "feed-select-project-0001" },
+  });
+  const afterSelect = await request(baseUrl, "/api/sessions");
+  const afterBody = await afterSelect.json();
+  assert.equal(afterBody.sessions[0].id, "feed:main");
+
+  const info = await request(baseUrl, "/api/info");
+  assert.deepEqual((await info.json()).omnipresence, { enabled: true });
+});
+
+test("feed row is absent and info reports disabled when omnipresence is off", async (t) => {
+  const { baseUrl } = await withFeedBridge(t, {
+    enabled: false,
+    items: [feedItem(1, "hidden push")],
+  });
+  const sessions = await request(baseUrl, "/api/sessions");
+  const body = await sessions.json();
+  assert.equal(body.sessions[0].id, "abc123");
+  assert.ok(!body.sessions.some((row) => row.id === "feed:main"));
+
+  const info = await request(baseUrl, "/api/info");
+  assert.deepEqual((await info.json()).omnipresence, { enabled: false });
+});
+
+test("opening feed history returns pushes as assistant lines and selects the feed row", async (t) => {
+  const { baseUrl } = await withFeedBridge(t, {
+    items: [feedItem(1, "First push title", "First push body"), feedItem(2, "Second push title")],
+  });
+
+  const history = await request(baseUrl, "/api/sessions/feed:main/history");
+  assert.equal(history.status, 200);
+  const body = await history.json();
+  assert.equal(body.selectedSession.id, "feed:main");
+  assert.equal(body.view, "session");
+  assert.ok(body.history.every((entry) => entry.role === "assistant"));
+  assert.equal(body.history[0].text, "First push title\nFirst push body");
+  assert.equal(body.history[1].text, "Second push title");
+
+  const selected = await request(baseUrl, "/api/selected-session");
+  assert.equal((await selected.json()).selectedSession.id, "feed:main");
+
+  const status = await request(baseUrl, "/api/status?sessionId=feed:main");
+  assert.equal((await status.json()).state, "idle");
+
+  const select = await request(baseUrl, "/api/select-session", {
+    body: { sessionId: "feed:main", clientRequestId: "feed-select-0001" },
+  });
+  assert.equal(select.status, 200);
+  assert.equal((await select.json()).selectedSession.id, "feed:main");
+});
+
+test("new feed items stream to SSE subscribers and message polls under a cursor", async (t) => {
+  const { baseUrl, statePath, state } = await withFeedBridge(t, {
+    items: [feedItem(1, "First push title")],
+    options: { feedPollMs: 25, feedSubscriberIdleMs: 60_000 },
+  });
+
+  const events = await fetch(`${baseUrl}/api/events?sessionId=feed:main&token=${TOKEN}`);
+  assert.equal(events.status, 200);
+  // The first fetch after startup baselines pre-existing items quietly; wait
+  // for it so the appended item is a genuinely new push, not baseline cargo.
+  const baselineUntil = Date.now() + 3000;
+  while (!state.feedBaselined && Date.now() < baselineUntil) {
+    await sleep(10);
+  }
+  assert.equal(state.feedBaselined, true, "the poller must baseline the feed on its first fetch");
+  appendFeedItem(statePath, feedItem(2, "Second push title", "Second push body"));
+  const streamed = await readStreamUntil(events.body, "Second push title", 5000);
+  assert.doesNotMatch(
+    streamed,
+    /First push title/,
+    "pre-existing items must not stream as fresh events",
+  );
+  assert.match(streamed, /"sessionId":"feed:main"/);
+  assert.match(streamed, /"type":"result"/);
+
+  const polled = await readMessagesUntil(
+    baseUrl,
+    "feed:main",
+    (messages) => messages.some((message) => message.feedItem?.id === 2),
+    3000,
+  );
+  const firstMessage = polled.messages.find((message) => message.feedItem?.id === 1);
+  assert.ok(firstMessage, "the first feed item must be in the buffer");
+  const afterCursor = await request(
+    baseUrl,
+    `/api/messages?sessionId=feed:main&after=${firstMessage.id}`,
+  );
+  const afterBody = await afterCursor.json();
+  assert.ok(afterBody.messages.some((message) => message.feedItem?.id === 2));
+  assert.ok(!afterBody.messages.some((message) => message.feedItem?.id === 1));
+});
+
+test("feed poller runs while subscribed and stops after subscribers disappear", async (t) => {
+  const { baseUrl, state } = await withFeedBridge(t, {
+    items: [feedItem(1, "Poller push")],
+    options: { feedPollMs: 25, feedSubscriberIdleMs: 120 },
+  });
+  assert.equal(state.feedPoller, null);
+
+  const history = await request(baseUrl, "/api/sessions/feed:main/history");
+  assert.equal(history.status, 200);
+  assert.ok(state.feedPoller, "opening the feed row must start the poller");
+
+  // Leaving the feed clears the selection; once the idle window passes the
+  // poller's next tick clears its own timer.
+  const back = await request(baseUrl, "/api/back", {
+    body: { clientRequestId: "feed-back-0001" },
+  });
+  assert.equal(back.status, 200);
+  const until = Date.now() + 3000;
+  while (state.feedPoller && Date.now() < until) {
+    await sleep(25);
+  }
+  assert.equal(state.feedPoller, null, "the poller timer must be cleared without subscribers");
+});
+
+test("feed selection alone does not keep the poller alive past the idle window", async (t) => {
+  const { baseUrl, state } = await withFeedBridge(t, {
+    items: [feedItem(1, "Idle push")],
+    options: { feedPollMs: 25, feedSubscriberIdleMs: 120 },
+  });
+
+  const select = await request(baseUrl, "/api/select-session", {
+    body: { sessionId: "feed:main", clientRequestId: "feed-idle-select-0001" },
+  });
+  assert.equal(select.status, 200);
+  assert.ok(state.feedPoller, "selecting the feed must start the poller");
+
+  // Selection is server-side state that survives client disconnects; with no
+  // SSE client and no history/messages/status polls, the idle window must
+  // clear the timer even though feed:main stays selected.
+  const until = Date.now() + 3000;
+  while (state.feedPoller && Date.now() < until) {
+    await sleep(25);
+  }
+  assert.equal(
+    state.feedPoller,
+    null,
+    "a lingering selection must not keep the poller shelling out forever",
+  );
+  assert.equal(state.selectedSession?.id, "feed:main", "stopping the poller must not deselect");
+});
+
+test("full feed pages advance the cursor without dropping burst items", async (t) => {
+  const { baseUrl, statePath, state } = await withFeedBridge(t, {
+    items: [feedItem(1, "Baseline push")],
+    // Long intervals: the test drives fetches deterministically via history
+    // opens, and disarms the poller so background ticks cannot interleave.
+    options: { feedPollMs: 60_000, feedSubscriberIdleMs: 60_000 },
+  });
+  const disarmPoller = () => {
+    if (state.feedPoller) {
+      clearInterval(state.feedPoller);
+      state.feedPoller = null;
+    }
+  };
+
+  // Baseline fetch: hydrates the pre-existing item and jumps to latest_id.
+  const baseline = await request(baseUrl, "/api/sessions/feed:main/history");
+  assert.equal(baseline.status, 200);
+  disarmPoller();
+  assert.equal(state.feedCursor, 1);
+
+  // A 30-item burst against the default 20-item page. feeds.recent_after
+  // returns the OLDEST page above the cursor, so jumping to latest_id on a
+  // full page would silently drop items 22..31.
+  for (let id = 2; id <= 31; id += 1) {
+    appendFeedItem(statePath, feedItem(id, `Burst push ${id}`));
+  }
+
+  const firstPoll = await request(baseUrl, "/api/sessions/feed:main/history");
+  assert.equal(firstPoll.status, 200);
+  disarmPoller();
+  assert.equal(
+    state.feedCursor,
+    21,
+    "a full page must advance to the last published id, not jump to latest_id",
+  );
+
+  const secondPoll = await request(baseUrl, "/api/sessions/feed:main/history");
+  assert.equal(secondPoll.status, 200);
+  disarmPoller();
+  assert.equal(state.feedCursor, 31, "the short second page drains the burst to latest_id");
+
+  const messages = await request(baseUrl, "/api/messages?sessionId=feed:main");
+  const ids = (await messages.json()).messages
+    .filter((message) => message.feedItem)
+    .map((message) => message.feedItem.id);
+  assert.deepEqual(
+    ids,
+    Array.from({ length: 31 }, (_, index) => index + 1),
+    "two polls must publish all burst items in order",
+  );
+});
+
+test("restart baseline shows old items in history without re-pushing them", async (t) => {
+  // Simulates a bridge restart: items 1-2 predate the process (the cursor
+  // starts at 0), so the first fetch must hydrate them for history only.
+  const { baseUrl, statePath, state } = await withFeedBridge(t, {
+    items: [feedItem(1, "Old push one"), feedItem(2, "Old push two")],
+    options: { feedPollMs: 25, feedSubscriberIdleMs: 60_000 },
+  });
+
+  // The SSE client attaches before the baseline fetch runs; pre-existing
+  // items must not arrive on it as fresh events.
+  const events = await fetch(`${baseUrl}/api/events?sessionId=feed:main&token=${TOKEN}`);
+  assert.equal(events.status, 200);
+  const baselineUntil = Date.now() + 3000;
+  while (!state.feedBaselined && Date.now() < baselineUntil) {
+    await sleep(10);
+  }
+  assert.equal(state.feedBaselined, true);
+  assert.equal(state.feedCursor, 2, "the baseline fetch must jump the cursor to latest_id");
+
+  appendFeedItem(statePath, feedItem(3, "Fresh push three"));
+  const streamed = await readStreamUntil(events.body, "Fresh push three", 5000);
+  assert.doesNotMatch(streamed, /Old push one/, "baseline items must not re-notify");
+  assert.doesNotMatch(streamed, /Old push two/, "baseline items must not re-notify");
+
+  // The history endpoint still shows the pre-existing items after restart.
+  const history = await request(baseUrl, "/api/sessions/feed:main/history");
+  assert.equal(history.status, 200);
+  const texts = (await history.json()).history.map((entry) => entry.text);
+  assert.ok(texts.some((text) => text.includes("Old push one")));
+  assert.ok(texts.some((text) => text.includes("Old push two")));
+  assert.ok(texts.some((text) => text.includes("Fresh push three")));
+});
+
+test("feed ack relays CLI validation rejections as 400s with the CLI error", async (t) => {
+  const { baseUrl, statePath, auditPath } = await withFeedBridge(t, {
+    items: [feedItem(1, "push")],
+  });
+
+  // Item 99 passes the bridge's own validation but the CLI rejects it with
+  // {"ok":false,"error":"..."} on stdout and exit 1 (empty stderr).
+  const rejected = await request(baseUrl, "/api/feed/ack", {
+    body: { itemId: 99, action: "dismissed", clientRequestId: "ack-unknown-0001" },
+  });
+  assert.equal(rejected.status, 400, "a CLI validation rejection must not surface as a 500");
+  const rejectedBody = await rejected.json();
+  assert.equal(rejectedBody.code, "feed_ack_failed");
+  assert.match(rejectedBody.error, /unknown feed item: 99/);
+
+  // The replay cache remembers the 400, and the rejected ack never lands.
+  const replay = await request(baseUrl, "/api/feed/ack", {
+    body: { itemId: 99, action: "dismissed", clientRequestId: "ack-unknown-0001" },
+  });
+  assert.equal(replay.status, 400);
+  assert.equal(readFeedStateFile(statePath).acks.length, 0);
+
+  await sleep(50);
+  const audit = fs.readFileSync(auditPath, "utf8");
+  assert.match(audit, /feed_ack_failed/);
+});
+
+test("context ingestion maps CLI rejections to 400 and infrastructure failures to 500", async (t) => {
+  let failureMode = "cli";
+  const runner = async (_command, args) => {
+    if (args[1] === "context-add") {
+      if (failureMode === "cli") {
+        // What runJsonCommand raises for the real CLI's stdout failure shape.
+        const err = new Error("context location requires numeric lat and lon");
+        err.cliRejection = true;
+        throw err;
+      }
+      throw new Error("morpheus timed out after 10000ms");
+    }
+    throw new Error(`unexpected remote command: ${args.join(" ")}`);
+  };
+  const { baseUrl } = await withBridge(t, { runner });
+
+  const cliRejected = await request(baseUrl, "/api/context", {
+    body: { kind: "location", lat: 48.13, lon: 11.58, clientRequestId: "ctx-cli-reject-0001" },
+  });
+  assert.equal(cliRejected.status, 400);
+  const cliBody = await cliRejected.json();
+  assert.equal(cliBody.code, "context_add_failed");
+  assert.match(cliBody.error, /numeric lat and lon/);
+
+  failureMode = "infra";
+  const infraFailed = await request(baseUrl, "/api/context", {
+    body: { kind: "location", lat: 48.13, lon: 11.58, clientRequestId: "ctx-infra-0001" },
+  });
+  assert.equal(infraFailed.status, 500);
+  assert.equal((await infraFailed.json()).code, "context_add_failed");
+});
+
+test("prompts to the feed row answer read-only and never spawn sessions", async (t) => {
+  const { baseUrl, auditPath } = await withFeedBridge(t, {
+    items: [feedItem(1, "Quiet push")],
+  });
+  await request(baseUrl, "/api/sessions/feed:main/history");
+
+  const prompt = await request(baseUrl, "/api/prompt", {
+    body: { text: "hello glasses feed", clientRequestId: "feed-prompt-0001" },
+  });
+  assert.equal(prompt.status, 200);
+  const promptBody = await prompt.json();
+  assert.equal(promptBody.action, "feed_read_only");
+  assert.equal(promptBody.sessionId, "feed:main");
+  assert.match(promptBody.text, /read-only/i);
+  assert.equal(promptBody.answer, promptBody.text);
+
+  const explicit = await request(baseUrl, "/api/prompt", {
+    body: { sessionId: "feed:main", text: "hello again", clientRequestId: "feed-prompt-0002" },
+  });
+  assert.equal(explicit.status, 200);
+  assert.equal((await explicit.json()).action, "feed_read_only");
+
+  const replay = await request(baseUrl, "/api/prompt", {
+    body: { text: "hello glasses feed", clientRequestId: "feed-prompt-0001" },
+  });
+  assert.equal((await replay.json()).duplicate, true);
+
+  const selected = await request(baseUrl, "/api/selected-session");
+  assert.equal((await selected.json()).selectedSession.id, "feed:main");
+
+  const messages = await request(baseUrl, "/api/messages?sessionId=feed:main");
+  const messagesBody = await messages.json();
+  assert.ok(!messagesBody.messages.some((message) => message.type === "session_started"));
+  assert.ok(messagesBody.messages.some((message) => message.feedNotice === true));
+
+  await sleep(50);
+  const audit = fs.readFileSync(auditPath, "utf8");
+  assert.match(audit, /remote_prompt_feed_read_only/);
+  assert.doesNotMatch(audit, /remote_spawn_session/);
+  assert.doesNotMatch(audit, /hello glasses feed/);
 });

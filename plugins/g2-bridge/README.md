@@ -273,6 +273,63 @@ decisions. Set `MORPHEUS_G2_REQUEST_LOG=0` to quiet the ordinary request logs.
 The bridge does not print bearer tokens. Set `MORPHEUS_G2_TOKEN` yourself and
 store it somewhere private while pairing your phone-side client.
 
+## Omnipresence Feed (`feed:main`)
+
+Phase 1+2 of [docs/omnipresence-prd.md](../../docs/omnipresence-prd.md) adds an
+ambient feed surface backed by the `morpheus remote feed` CLI family:
+
+- `GET /api/feed?after=&limit=` returns the CLI feed shape
+  (`{items: [...], latest_id}`) plus `omnipresence: {enabled}`. Items are
+  ascending by id and strictly greater than `after`; `after=0` (or omitted)
+  returns the newest `limit` items, still in ascending order. Non-numeric
+  params fall back to defaults; reads share the read rate budget.
+- `POST /api/feed/ack` with `{itemId, action, clientRequestId}` reports
+  expand/dismiss gestures back through `morpheus remote feed-ack`. `action`
+  must be `expanded` or `dismissed`; duplicate request ids replay the original
+  response instead of re-acking; the audit log records item id and action
+  only, never item text.
+- `POST /api/context` with `{kind: "location", lat, lon, accuracy?, ts?,
+  clientRequestId}` forwards phone/glasses context signals to `morpheus remote
+  context-add`. v1 accepts only `location`, and only with strictly numeric
+  fields (string coordinates are rejected, not coerced; lat/lon are
+  range-checked). Coordinates are never written to the audit log — the audit
+  record carries the kind plus a payload hash only. Duplicate request ids
+  replay instead of storing a second signal.
+- `GET /api/info` includes `omnipresence: {enabled}` from a cached
+  `morpheus remote omni-status` call (TTL `MORPHEUS_G2_OMNI_STATUS_TTL_MS`,
+  default 5000ms). If the CLI call fails, the last known status is used,
+  defaulting to disabled — the session list never breaks because omnipresence
+  status is unavailable.
+
+While omnipresence is enabled, `GET /api/sessions` returns a `Morpheus Feed`
+pseudo-session (`feed:main`) as the first row — both before and after a
+project is selected. Stock Even clients open rows as conversations, so the
+feed needs zero client changes:
+
+- `GET /api/sessions/feed:main/history` pulls fresh feed items, returns them
+  as assistant-only history (one item per assistant line: the title, with the
+  body on the following line when present), and selects the feed row — exactly
+  like history opens on concrete session rows. `POST /api/select-session` with
+  `feed:main` works the same way.
+- While any client is subscribed to the feed — the feed row is selected, an
+  SSE client is connected with `sessionId=feed:main`, or feed
+  history/messages/status was polled within the last
+  `MORPHEUS_G2_FEED_SUBSCRIBER_IDLE_MS` (default 30000ms) — the bridge polls
+  `morpheus remote feed` every `MORPHEUS_G2_FEED_POLL_MS` (default 5000ms)
+  with its cursor and publishes each new item into the `feed:main` message
+  buffer as an assistant-style `result` message (`provider: "morpheus-feed"`
+  with a `feedItem: {id, ts, priority, sourceKind, sourceRef}` payload). New
+  items therefore arrive over the ordinary `/api/events` stream and the
+  `/api/messages` `after` cursor with bridge-global message ids. The poll
+  timer is unref'd and clears itself once the last subscriber disappears, so
+  it never leaks.
+- The feed is read-only in v1. Prompts targeted at `feed:main` (selected or
+  explicit `sessionId`) never spawn Codex sessions: the bridge replies with an
+  assistant-style notice explaining the feed is read-only, buffers the same
+  notice into `feed:main` so message/history pollers render it, and keeps the
+  feed selected. This is the least surprising stock-client behavior — the
+  glasses show a normal assistant answer and pushes keep streaming.
+
 ## Hardware Bring-Up
 
 1. Validate stock Even Terminal on the G2 first:

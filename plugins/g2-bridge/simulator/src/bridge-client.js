@@ -3,6 +3,21 @@ const PROJECT_PREFIX = "project:";
 const PROJECT_SESSION_PREFIX = "project-session:";
 const NAV_PROJECTS_ID = "project:__projects__";
 const LEGACY_NAV_PROJECTS_ID = "nav:projects";
+// Omnipresence feed pseudo-session (bridge PRD §3.1): the bridge exposes the
+// feed as session row `feed:main`, so the feed view reuses the exact
+// select-session / history / SSE machinery a concrete session uses.
+const FEED_SESSION_ID = "feed:main";
+// Local navigation row appended to the feed list so conversations stay one
+// tap away from the ambient feed (PRD §2). Never sent to the bridge.
+const FEED_NAV_CONVERSATIONS_ID = "feed:nav:conversations";
+const FEED_ITEM_ROW_PREFIX = "feed-item:";
+// SSE-aware feed poll cadence: coarse while the event stream delivers items,
+// tighter only when no stream is open (mirrors waitForResultViaMessages).
+const DEFAULT_FEED_POLL_MS = 3000;
+const DEFAULT_FEED_STREAM_POLL_MS = 20000;
+// Even location courier dedupe radius (PRD §3.2): skip fixes that moved less
+// than this since the last posted fix.
+const LOCATION_DEDUPE_METERS = 25;
 
 function trimTrailingSlash(value) {
   return String(value || "").replace(/\/+$/, "");
@@ -148,6 +163,183 @@ function truncateLine(value, max = 76) {
   return `${clean.slice(0, Math.max(0, max - 3))}...`;
 }
 
+// --- Omnipresence feed helpers ---
+
+// Full-shape feed item from GET /api/feed (snake_case) or an already
+// normalized local item (camelCase). Returns null for anything without a
+// positive integer id — those can never be acked or deduped.
+function feedItemFromRaw(raw) {
+  const id = Number(raw?.id || 0);
+  if (!Number.isInteger(id) || id <= 0) return null;
+  const metadata = raw?.metadata && typeof raw.metadata === "object" ? raw.metadata : {};
+  return {
+    id,
+    ts: Number(raw?.ts || 0),
+    title: String(raw?.title || ""),
+    body: String(raw?.body || ""),
+    priority: Number(raw?.priority || 0),
+    sourceKind: String(raw?.source_kind ?? raw?.sourceKind ?? ""),
+    sourceRef: String(raw?.source_ref ?? raw?.sourceRef ?? ""),
+    metadata,
+    // /api/feed serves the full item shape; hydrated fields are authoritative
+    // over the lossy stream copy (see mergeFeedItem).
+    hydrated: true,
+  };
+}
+
+// Feed item derived from a streamed/buffered feed:main message. The bridge
+// attaches `feedItem` metadata ({id, ts, priority, sourceKind, sourceRef}) to
+// each published feed message and renders `title\nbody` as the text.
+function feedItemFromMessage(message) {
+  const meta = message?.feedItem;
+  const id = Number(meta?.id || 0);
+  if (!Number.isInteger(id) || id <= 0) return null;
+  const text = String(message?.text || "");
+  const newline = text.indexOf("\n");
+  return {
+    id,
+    ts: Number(meta?.ts || 0),
+    title: newline >= 0 ? text.slice(0, newline) : text,
+    body: newline >= 0 ? text.slice(newline + 1) : "",
+    priority: Number(meta?.priority || 0),
+    sourceKind: String(meta?.sourceKind || ""),
+    sourceRef: String(meta?.sourceRef || ""),
+    metadata: {},
+    // The bridge message path whitespace-collapses the title and caps the
+    // body, so stream-derived text is lossy and must never win a merge
+    // against hydrated /api/feed text.
+    hydrated: false,
+  };
+}
+
+// Picks the richer of two text fields when merging feed item copies. A
+// hydrated (/api/feed) incoming value is authoritative; a stream-derived one
+// only replaces text it strictly enriches — never a shorter copy, never a
+// whitespace-collapsed copy of a multi-line field.
+function pickRicherFeedText(existing, incoming, incomingHydrated) {
+  if (!incoming) return existing;
+  if (!existing) return incoming;
+  if (incomingHydrated) return incoming;
+  if (incoming.length < existing.length) return existing;
+  if (existing.includes("\n") && !incoming.includes("\n")) return existing;
+  return incoming;
+}
+
+// Richer fields win: a stream-derived item (no metadata, whitespace-collapsed
+// title, body capped by the bridge message path) must never degrade the
+// full-shape item hydrated from /api/feed — regardless of arrival order.
+function mergeFeedItem(existing, incoming) {
+  const incomingHydrated = incoming.hydrated === true;
+  return {
+    ...existing,
+    ...incoming,
+    hydrated: existing.hydrated === true || incomingHydrated,
+    title: pickRicherFeedText(existing.title, incoming.title, incomingHydrated),
+    body: pickRicherFeedText(existing.body, incoming.body, incomingHydrated),
+    priority: incoming.priority || existing.priority,
+    ts: incoming.ts || existing.ts,
+    sourceKind: incoming.sourceKind || existing.sourceKind,
+    sourceRef: incoming.sourceRef || existing.sourceRef,
+    metadata: Object.keys(incoming.metadata || {}).length ? incoming.metadata : existing.metadata,
+  };
+}
+
+function isFeedItemRowId(id) {
+  return typeof id === "string" && id.startsWith(FEED_ITEM_ROW_PREFIX);
+}
+
+function feedItemRow(item) {
+  return {
+    id: `${FEED_ITEM_ROW_PREFIX}${item.id}`,
+    feedItemId: item.id,
+    title: item.title || "(untitled push)",
+    priority: Number(item.priority || 0),
+    status: "",
+  };
+}
+
+function feedNavRow() {
+  return {
+    id: FEED_NAV_CONVERSATIONS_ID,
+    title: "Conversations",
+    priority: 0,
+    status: "",
+  };
+}
+
+// Word-wraps a feed item into display lines for the expanded view.
+function wrapFeedText(value, max = 72) {
+  const lines = [];
+  for (const paragraph of String(value || "").split("\n")) {
+    const words = paragraph.replace(/\s+/g, " ").trim().split(" ").filter(Boolean);
+    if (!words.length) continue;
+    let line = "";
+    for (const word of words) {
+      if (line && line.length + 1 + word.length > max) {
+        lines.push(line);
+        line = word;
+      } else {
+        line = line ? `${line} ${word}` : word;
+      }
+    }
+    if (line) lines.push(line);
+  }
+  return lines;
+}
+
+const FEED_EXPANDED_PAGE_LINES = 7;
+
+function expandedFeedLines(item) {
+  const lines = [];
+  const marker = Number(item.priority || 0) > 0 ? "[!] " : "";
+  lines.push(...wrapFeedText(`${marker}${item.title || "(untitled push)"}`));
+  const bodyLines = wrapFeedText(item.body);
+  if (bodyLines.length) {
+    lines.push("");
+    lines.push(...bodyLines);
+  }
+  // Judge metadata (PRD §3.5): every push can answer "why did you show me
+  // this" — surface the rationale (and score) when the judge wrote them.
+  // The real pipeline nests the verdict under metadata.judge (feeds.py
+  // _route_on_threshold); the flat shape is kept as a legacy fallback.
+  const judge =
+    item.metadata?.judge && typeof item.metadata.judge === "object" ? item.metadata.judge : null;
+  const rationale = judge?.rationale ?? item.metadata?.rationale;
+  if (rationale) {
+    lines.push("");
+    const score = Number(judge?.score ?? item.metadata?.score);
+    const scoreSuffix = Number.isFinite(score) ? ` (score ${score})` : "";
+    lines.push(...wrapFeedText(`why: ${rationale}${scoreSuffix}`));
+  }
+  return lines;
+}
+
+function feedExpandedPageCount(item) {
+  return Math.max(1, Math.ceil(expandedFeedLines(item).length / FEED_EXPANDED_PAGE_LINES));
+}
+
+// Epoch normalization: JS SDKs (Date.now(), Even location fixes) report
+// millisecond epochs while the bridge/CLI contract is seconds. Any value
+// above 1e12 (~year 33658 as seconds) can only be milliseconds — convert it;
+// seconds epochs pass through untouched.
+export function normalizeEpochSeconds(value) {
+  const ts = Number(value);
+  if (!Number.isFinite(ts)) return ts;
+  return ts > 1e12 ? ts / 1000 : ts;
+}
+
+// Haversine distance in meters, for the <25m location dedupe.
+function distanceMeters(a, b) {
+  const toRad = (deg) => (deg * Math.PI) / 180;
+  const earthRadius = 6371000;
+  const dLat = toRad(b.lat - a.lat);
+  const dLon = toRad(b.lon - a.lon);
+  const sinLat = Math.sin(dLat / 2);
+  const sinLon = Math.sin(dLon / 2);
+  const h = sinLat * sinLat + Math.cos(toRad(a.lat)) * Math.cos(toRad(b.lat)) * sinLon * sinLon;
+  return 2 * earthRadius * Math.asin(Math.min(1, Math.sqrt(h)));
+}
+
 export function buildGlassesText(state) {
   const lines = [];
   const mode = state.mode || "projects";
@@ -171,7 +363,29 @@ export function buildGlassesText(state) {
     lines.push(`ERROR ${truncateLine(state.error, 70)}`);
   }
 
-  if (mode === "session") {
+  if (mode === "feed") {
+    lines.push("");
+    const items = coerceArray(state.feedItems);
+    const expanded = items.find((item) => item.id === state.expandedFeedItemId) || null;
+    if (expanded) {
+      const content = expandedFeedLines(expanded);
+      const pages = Math.max(1, Math.ceil(content.length / FEED_EXPANDED_PAGE_LINES));
+      const page = Math.min(Math.max(0, Number(state.feedExpandedPage || 0)), pages - 1);
+      lines.push(...content.slice(page * FEED_EXPANDED_PAGE_LINES, (page + 1) * FEED_EXPANDED_PAGE_LINES));
+      if (pages > 1) lines.push(`-- page ${page + 1}/${pages} (scroll) --`);
+      lines.push("tap: collapse / double-tap: dismiss");
+    } else {
+      if (!items.length) lines.push("Feed is quiet. New pushes appear here.");
+      // Ambient list, newest first: one line per item, priority > 0 marked.
+      coerceArray(state.rows)
+        .slice(0, 9)
+        .forEach((row, index) => {
+          const cursor = index === state.selectedIndex ? ">" : " ";
+          const marker = Number(row.priority || 0) > 0 ? "!" : " ";
+          lines.push(`${cursor}${marker}${truncateLine(row.title || "", 70)}`);
+        });
+    }
+  } else if (mode === "session") {
     lines.push("");
     if (sessionTitle) lines.push(truncateLine(sessionTitle, 76));
     const visibleMessages = coerceArray(state.messages).slice(-8);
@@ -271,6 +485,26 @@ export class G2BridgeClient {
     // epoch cancels a stale wait when a newer submit or reconfigure wins.
     this.pendingResultWait = null;
     this.resultWaitEpoch = 0;
+    // Omnipresence feed state. forceLegacyView (the simulator's `?omni=0`
+    // URL param) keeps the legacy projects landing even when the bridge
+    // reports omnipresence enabled.
+    this.forceLegacyView = Boolean(options.forceLegacyView);
+    this.feedPollMs = options.feedPollMs !== undefined ? Number(options.feedPollMs) : DEFAULT_FEED_POLL_MS;
+    this.feedStreamPollMs =
+      options.feedStreamPollMs !== undefined ? Number(options.feedStreamPollMs) : DEFAULT_FEED_STREAM_POLL_MS;
+    // Highest feed item id ever seen (from /api/feed and streamed feedItem
+    // metadata); /api/feed refreshes page with `after` on this cursor.
+    this.feedCursor = 0;
+    // Client-side ack guard: one ack per item+action, reserved before the
+    // request is sent so rapid duplicate gestures can never double-fire.
+    this.feedAcks = new Set();
+    // Dismissed ids never re-enter the local list (SSE replays and after=0
+    // hydration would otherwise resurrect them).
+    this.dismissedFeedIds = new Set();
+    this.feedRefreshTimer = null;
+    this.feedLastRefreshAt = 0;
+    // Last successfully posted location fix, for the <25m dedupe.
+    this.lastPostedFix = null;
     this.state = {
       info: null,
       mode: "projects",
@@ -281,6 +515,9 @@ export class G2BridgeClient {
       displaySessionId: "",
       activeSessionId: "",
       messages: [],
+      feedItems: [],
+      expandedFeedItemId: 0,
+      feedExpandedPage: 0,
       status: "idle",
       error: "",
     };
@@ -303,9 +540,18 @@ export class G2BridgeClient {
       this.close();
       this.resultWaitEpoch += 1;
       this.serverCursor = 0;
+      // A different bridge also has a different feed: cursor, ack guard, and
+      // dismissed set are all per-bridge state.
+      this.feedCursor = 0;
+      this.feedAcks.clear();
+      this.dismissedFeedIds.clear();
+      this.lastPostedFix = null;
       this.state = {
         ...this.state,
         messages: [],
+        feedItems: [],
+        expandedFeedItemId: 0,
+        feedExpandedPage: 0,
         status: "idle",
         error: "",
       };
@@ -314,6 +560,7 @@ export class G2BridgeClient {
   }
 
   close() {
+    this.stopFeedAutoRefresh();
     if (this.eventSource) {
       this.eventSource.close();
       this.eventSource = null;
@@ -385,7 +632,15 @@ export class G2BridgeClient {
       error: "",
     };
     this.log(`Connected to ${this.bridgeUrl}`);
-    await this.refreshProjects();
+    // Omnipresence is the default mode of a connected G2 (PRD §2): when the
+    // bridge advertises it, land on the ambient feed. `?omni=0`
+    // (forceLegacyView) and disabled omnipresence keep today's projects
+    // landing byte-for-byte.
+    if (info?.omnipresence?.enabled === true && !this.forceLegacyView) {
+      await this.openFeed();
+    } else {
+      await this.refreshProjects();
+    }
     return this.snapshot();
   }
 
@@ -403,6 +658,9 @@ export class G2BridgeClient {
       displaySessionId: "",
       activeSessionId: "",
       messages: [],
+      feedItems: [],
+      expandedFeedItemId: 0,
+      feedExpandedPage: 0,
       status: "idle",
       error: "",
     };
@@ -440,6 +698,21 @@ export class G2BridgeClient {
   }
 
   move(delta) {
+    // Feed view with an expanded item: scroll pages within the item instead
+    // of moving the list selection (PRD §3.6: "scroll pages within an
+    // expanded push").
+    if (this.state.mode === "feed" && this.state.expandedFeedItemId) {
+      const expanded = coerceArray(this.state.feedItems).find(
+        (item) => item.id === this.state.expandedFeedItemId,
+      );
+      const pages = expanded ? feedExpandedPageCount(expanded) : 1;
+      const next = Math.min(Math.max(0, Number(this.state.feedExpandedPage || 0) + delta), pages - 1);
+      if (next !== this.state.feedExpandedPage) {
+        this.state = { ...this.state, feedExpandedPage: next, error: "" };
+        this.emit();
+      }
+      return this.snapshot();
+    }
     const rows = coerceArray(this.state.rows);
     if (!rows.length) return this.snapshot();
     const next = (this.state.selectedIndex + delta + rows.length) % rows.length;
@@ -449,9 +722,13 @@ export class G2BridgeClient {
   }
 
   async activateSelected() {
+    if (this.state.mode === "feed") return this.activateFeedSelection();
     const row = this.selectedRow();
     if (!row?.id) return this.snapshot();
     if (row.id === NAV_PROJECTS_ID || row.id === LEGACY_NAV_PROJECTS_ID) return this.navigateBack();
+    // The bridge prepends the Morpheus Feed pseudo-session to every session
+    // list while omnipresence is enabled; tapping it opens the feed view.
+    if (row.id === FEED_SESSION_ID) return this.openFeed();
     if (isProjectRow(row.id)) return this.selectProject(projectIdFromRow(row.id));
     return this.selectSession(row.id);
   }
@@ -512,7 +789,261 @@ export class G2BridgeClient {
     return this.snapshot();
   }
 
+  // --- Omnipresence feed view ---
+
+  // Opens the ambient feed. feed:main behaves like a session on the bridge,
+  // so this reuses the exact select-session -> history -> SSE -> messages
+  // machinery a concrete session row uses (simulator-fidelity requirement:
+  // stay aligned with how stock Even clients open rows), then hydrates the
+  // full item shape (body, priority, judge metadata) from GET /api/feed.
+  async openFeed() {
+    const body = await this.api("/api/select-session", {
+      body: {
+        sessionId: FEED_SESSION_ID,
+        clientRequestId: requestId("sim-select-feed"),
+      },
+    });
+    this.serverCursor = 0;
+    this.state = {
+      ...this.state,
+      mode: "feed",
+      selectedProject: body.selectedProject || this.state.selectedProject,
+      selectedSession: body.selectedSession || { id: FEED_SESSION_ID, title: "Morpheus Feed" },
+      displaySessionId: FEED_SESSION_ID,
+      activeSessionId: "",
+      messages: [],
+      feedItems: [],
+      rows: [feedNavRow()],
+      selectedIndex: 0,
+      expandedFeedItemId: 0,
+      feedExpandedPage: 0,
+      status: "idle",
+      error: "",
+    };
+    this.emit();
+    await this.loadHistory(FEED_SESSION_ID);
+    this.openEventStream(FEED_SESSION_ID);
+    // Buffered feed messages carry feedItem metadata and are ingested into
+    // the item list by refreshMessages; the /api/feed hydration below then
+    // upgrades them to the full item shape.
+    await this.refreshMessages(FEED_SESSION_ID);
+    await this.refreshFeed({ initial: true }).catch((err) => {
+      this.log(`Feed hydration failed: ${err.message}`);
+    });
+    this.startFeedAutoRefresh();
+    return this.snapshot();
+  }
+
+  // Pulls raw feed items. `initial` hydrates from scratch (after=0 returns
+  // the newest page); refreshes page strictly after the highest id seen.
+  async refreshFeed({ initial = false } = {}) {
+    const after = initial ? 0 : this.feedCursor;
+    const body = await this.api(`/api/feed?after=${encodeURIComponent(after)}&limit=20`);
+    const items = coerceArray(body.items).map(feedItemFromRaw).filter(Boolean);
+    if (this.upsertFeedItems(items)) this.emit();
+    return items;
+  }
+
+  // Upserts items into the newest-first local list. Dismissed ids never
+  // re-enter; richer versions of an item win over stream-derived ones.
+  upsertFeedItems(items) {
+    const byId = new Map(coerceArray(this.state.feedItems).map((item) => [item.id, item]));
+    let changed = false;
+    for (const item of coerceArray(items)) {
+      if (!item || this.dismissedFeedIds.has(item.id)) continue;
+      const existing = byId.get(item.id);
+      byId.set(item.id, existing ? mergeFeedItem(existing, item) : item);
+      if (item.id > this.feedCursor) this.feedCursor = item.id;
+      changed = true;
+    }
+    if (!changed) return false;
+    this.applyFeedItems([...byId.values()]);
+    return true;
+  }
+
+  // Rebuilds rows (newest first + trailing Conversations nav row) and keeps
+  // the cursor on the same row when it survives, clamped otherwise. A cursor
+  // parked on the nav row of an item-less list does not stick: when the first
+  // items hydrate, the ambient default is the newest push, not the nav row.
+  applyFeedItems(items) {
+    const sorted = [...coerceArray(items)].sort((a, b) => b.id - a.id);
+    const rows = [...sorted.map(feedItemRow), feedNavRow()];
+    const previousRows = coerceArray(this.state.rows);
+    const previousRowId = previousRows[this.state.selectedIndex]?.id;
+    const hadItems = previousRows.some((row) => isFeedItemRowId(row.id));
+    let selectedIndex = -1;
+    if (previousRowId && (isFeedItemRowId(previousRowId) || hadItems)) {
+      selectedIndex = rows.findIndex((row) => row.id === previousRowId);
+    }
+    if (selectedIndex < 0) {
+      selectedIndex = Math.min(Math.max(0, this.state.selectedIndex), rows.length - 1);
+    }
+    this.state = { ...this.state, feedItems: sorted, rows, selectedIndex };
+  }
+
+  // Streamed/buffered feed:main messages carry feedItem metadata; fold them
+  // into the item list so pushes appear with zero user action.
+  ingestFeedMessages(messages) {
+    const items = coerceArray(messages).map(feedItemFromMessage).filter(Boolean);
+    if (items.length && this.upsertFeedItems(items)) this.emit();
+  }
+
+  // Single tap / Enter in the feed view: expand is the cheap, reversible
+  // action (PRD §3.6). Tapping an expanded item collapses it again without a
+  // second ack; the Conversations nav row is the one-tap path back to the
+  // legacy projects flow.
+  async activateFeedSelection() {
+    const row = this.selectedRow();
+    if (!row?.id) return this.snapshot();
+    if (row.id === FEED_NAV_CONVERSATIONS_ID) {
+      return this.refreshProjects();
+    }
+    const itemId = Number(row.feedItemId || 0);
+    if (!itemId) return this.snapshot();
+    if (this.state.expandedFeedItemId === itemId) {
+      this.state = { ...this.state, expandedFeedItemId: 0, feedExpandedPage: 0, error: "" };
+      this.emit();
+      return this.snapshot();
+    }
+    this.state = { ...this.state, expandedFeedItemId: itemId, feedExpandedPage: 0, error: "" };
+    this.emit();
+    await this.ackFeedItem(itemId, "expanded");
+    return this.snapshot();
+  }
+
+  // Dismiss: ack, drop from the local list (it never comes back), collapse
+  // if it was the expanded item.
+  async dismissFeedItem(itemId) {
+    this.dismissedFeedIds.add(itemId);
+    const remaining = coerceArray(this.state.feedItems).filter((item) => item.id !== itemId);
+    this.applyFeedItems(remaining);
+    if (this.state.expandedFeedItemId === itemId) {
+      this.state = { ...this.state, expandedFeedItemId: 0, feedExpandedPage: 0 };
+    }
+    this.emit();
+    await this.ackFeedItem(itemId, "dismissed");
+    return this.snapshot();
+  }
+
+  // POST /api/feed/ack with a client-side duplicate guard: the item+action
+  // key is reserved before the request goes out, so the same ack can never
+  // fire twice -- not even from rapid duplicate gestures racing the network.
+  // A transport failure releases the reservation so a later retry can land.
+  async ackFeedItem(itemId, action) {
+    const key = `${itemId}:${action}`;
+    if (this.feedAcks.has(key)) return null;
+    this.feedAcks.add(key);
+    try {
+      return await this.api("/api/feed/ack", {
+        body: {
+          itemId,
+          action,
+          clientRequestId: requestId(`sim-feed-${action}`),
+        },
+      });
+    } catch (err) {
+      this.feedAcks.delete(key);
+      this.log(`Feed ack (${action}) failed: ${err.message}`);
+      return null;
+    }
+  }
+
+  // SSE-aware feed refresh cadence: with the event stream open, new items
+  // arrive over SSE and /api/feed is only polled coarsely as a safety net;
+  // without a stream, polling runs at the tighter cadence. feedPollMs <= 0
+  // disables the timer entirely (tests drive refreshes explicitly).
+  startFeedAutoRefresh() {
+    this.stopFeedAutoRefresh();
+    if (!(this.feedPollMs > 0)) return;
+    this.feedLastRefreshAt = Date.now();
+    const tickMs = Math.min(this.feedPollMs, this.feedStreamPollMs);
+    this.feedRefreshTimer = setInterval(() => {
+      void this.feedAutoRefreshTick();
+    }, tickMs);
+    if (typeof this.feedRefreshTimer.unref === "function") this.feedRefreshTimer.unref();
+  }
+
+  stopFeedAutoRefresh() {
+    if (this.feedRefreshTimer) {
+      clearInterval(this.feedRefreshTimer);
+      this.feedRefreshTimer = null;
+    }
+  }
+
+  async feedAutoRefreshTick() {
+    if (this.state.mode !== "feed") return;
+    const every = this.eventSource ? this.feedStreamPollMs : this.feedPollMs;
+    if (Date.now() - this.feedLastRefreshAt < every) return;
+    this.feedLastRefreshAt = Date.now();
+    await this.refreshFeed().catch((err) => {
+      this.log(`Feed refresh failed: ${err.message}`);
+    });
+  }
+
+  // --- Location context (PRD §3.2) ---
+
+  // POSTs a location fix to /api/context. Validates client-side (mirrors the
+  // bridge's validateLocationContext) so empty/NaN input never leaves the
+  // client. options.dedupeMeters skips fixes that moved less than that since
+  // the last posted fix (used by the Even location courier with 25m);
+  // returns null when a fix was deduped away.
+  async sendLocation(fix = {}, options = {}) {
+    // Number("") is 0, which would silently post the null island; empty and
+    // missing inputs must reject instead.
+    const coerce = (value) =>
+      value === undefined || value === null || (typeof value === "string" && value.trim() === "")
+        ? Number.NaN
+        : Number(value);
+    const lat = coerce(fix.lat);
+    const lon = coerce(fix.lon);
+    if (!Number.isFinite(lat) || lat < -90 || lat > 90) {
+      throw new Error("Location lat must be a number between -90 and 90");
+    }
+    if (!Number.isFinite(lon) || lon < -180 || lon > 180) {
+      throw new Error("Location lon must be a number between -180 and 180");
+    }
+    const dedupeMeters = Number(options.dedupeMeters || 0);
+    if (
+      dedupeMeters > 0 &&
+      this.lastPostedFix &&
+      distanceMeters(this.lastPostedFix, { lat, lon }) < dedupeMeters
+    ) {
+      return null;
+    }
+    const body = { kind: "location", lat, lon, clientRequestId: requestId("sim-location") };
+    const accuracy = Number(fix.accuracy);
+    if (fix.accuracy !== undefined && fix.accuracy !== null && Number.isFinite(accuracy) && accuracy >= 0) {
+      body.accuracy = accuracy;
+    }
+    // Callers (Even SDK fixes, Date.now()) may pass millisecond epochs; the
+    // bridge stores seconds, and a raw ms value would defeat staleness checks.
+    const ts = normalizeEpochSeconds(fix.ts);
+    if (fix.ts !== undefined && fix.ts !== null && Number.isFinite(ts) && ts > 0) {
+      body.ts = ts;
+    }
+    const result = await this.api("/api/context", { body });
+    this.lastPostedFix = { lat, lon };
+    return result;
+  }
+
+  // Double-tap / Escape. Gesture precedence in the feed view (PRD §3.6 plus
+  // the OS double-tap convention caveat), most-deliberate context first:
+  //   1. an item is EXPANDED            -> dismiss it (ack, remove, collapse)
+  //   2. the cursor is on a feed item   -> dismiss that item
+  //   3. otherwise (empty feed, or the cursor on the local "Conversations"
+  //      nav row -- i.e. no item is selected) -> fall through to the
+  //      OS-conventional exit/back behavior, exactly like today.
+  // Dismiss is never mapped to single tap; tap stays the cheap, reversible
+  // expand.
   async navigateBack() {
+    if (this.state.mode === "feed") {
+      const expandedId = Number(this.state.expandedFeedItemId || 0);
+      if (expandedId) return this.dismissFeedItem(expandedId);
+      const row = this.selectedRow();
+      const selectedItemId = Number(row?.feedItemId || 0);
+      if (isFeedItemRowId(row?.id) && selectedItemId) return this.dismissFeedItem(selectedItemId);
+      // No item selected: legacy back/exit below.
+    }
     const body = await this.api("/api/back", {
       body: { clientRequestId: requestId("sim-back") },
     });
@@ -524,6 +1055,9 @@ export class G2BridgeClient {
       displaySessionId: "",
       activeSessionId: "",
       messages: [],
+      feedItems: [],
+      expandedFeedItemId: 0,
+      feedExpandedPage: 0,
       mode: body.to || "projects",
       error: "",
     };
@@ -650,6 +1184,7 @@ export class G2BridgeClient {
     );
     const messages = coerceArray(body.messages).map((message) => normalizeMessage(message));
     this.advanceServerCursor(messages);
+    this.ingestFeedMessages(messages);
     if (messages.length || body.state) {
       this.state = {
         ...this.state,
@@ -721,6 +1256,9 @@ export class G2BridgeClient {
           messages: this.mergeMessages([message]),
           status: parsed.state || this.state.status,
         };
+        // New feed pushes stream as result messages with feedItem metadata;
+        // fold them straight into the ambient list.
+        this.ingestFeedMessages([message]);
         this.emit();
       } catch (err) {
         this.log(`Could not parse event stream message: ${err.message}`);
@@ -810,4 +1348,13 @@ export class G2BridgeClient {
   }
 }
 
-export { DEFAULT_BRIDGE_URL, NAV_PROJECTS_ID, PROJECT_PREFIX, PROJECT_SESSION_PREFIX, textFromMessage };
+export {
+  DEFAULT_BRIDGE_URL,
+  FEED_NAV_CONVERSATIONS_ID,
+  FEED_SESSION_ID,
+  LOCATION_DEDUPE_METERS,
+  NAV_PROJECTS_ID,
+  PROJECT_PREFIX,
+  PROJECT_SESSION_PREFIX,
+  textFromMessage,
+};

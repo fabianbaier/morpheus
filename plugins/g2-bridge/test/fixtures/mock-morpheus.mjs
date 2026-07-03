@@ -1,14 +1,70 @@
 #!/usr/bin/env node
 
+import fs from "node:fs";
+
 const args = process.argv.slice(2);
 
 function write(value) {
   process.stdout.write(`${JSON.stringify(value)}\n`);
 }
 
-function fail(message, code = 1) {
-  process.stderr.write(`${message}\n`);
-  process.exit(code);
+function fail(message) {
+  // The real CLI reports failures as {"ok":false,"error":"..."} JSON on
+  // STDOUT and exits 1 with an empty stderr; the fixture must match so the
+  // bridge's structured-failure parsing is exercised against the real shape.
+  write({ ok: false, error: message });
+  process.exit(1);
+}
+
+function argAfter(name, fallback = "") {
+  const idx = args.indexOf(name);
+  return idx >= 0 && idx + 1 < args.length ? args[idx + 1] : fallback;
+}
+
+// Omnipresence state (feed items, omni flag, recorded acks/contexts) lives in
+// an env-fed JSON file so tests can append feed items between successive
+// `remote feed` calls. Without the file, the fixture serves a static default
+// feed and reports omnipresence disabled, matching the CLI's off-by-default.
+const STATE_FILE = process.env.MOCK_MORPHEUS_STATE_FILE || "";
+
+const DEFAULT_FEED_ITEMS = [
+  {
+    id: 1,
+    ts: 1_779_999_990.0,
+    title: "Supermarket 50m left: your espresso beans are on promo.",
+    body: "Alnatura on Turmstrasse carries your usual brand at -20% today.",
+    priority: 2,
+    source_kind: "loop",
+    source_ref: "loop:location",
+    metadata: {},
+  },
+  {
+    id: 2,
+    ts: 1_779_999_995.0,
+    title: "PR #42 approved and ready to merge.",
+    body: "",
+    priority: 1,
+    source_kind: "loop",
+    source_ref: "loop:github",
+    metadata: {},
+  },
+];
+
+function readStateFile() {
+  if (!STATE_FILE) return null;
+  try {
+    return JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
+  } catch {
+    // A partially written state file must not fall back to the default feed
+    // (that would inject phantom items mid-test); serve an empty feed and let
+    // the next call read the completed file.
+    return { items: [], acks: [], contexts: [] };
+  }
+}
+
+function writeStateFile(state) {
+  if (!STATE_FILE) return;
+  fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2));
 }
 
 if (args[0] !== "remote") {
@@ -128,10 +184,10 @@ if (args[1] === "note") {
   const separator = args.indexOf("--");
   const text = separator >= 0 ? args.slice(separator + 1).join(" ") : "";
   if (target !== "abc123") {
-    fail(`unknown target: ${target}`, 2);
+    fail(`unknown target: ${target}`);
   }
   if (kind !== "note") {
-    fail(`unexpected kind: ${kind}`, 2);
+    fail(`unexpected kind: ${kind}`);
   }
   write({
     ok: true,
@@ -151,7 +207,7 @@ if (args[1] === "prompt") {
   const separator = args.indexOf("--");
   const text = separator >= 0 ? args.slice(separator + 1).join(" ") : "";
   if (target !== "abc123") {
-    fail(`unknown target: ${target}`, 2);
+    fail(`unknown target: ${target}`);
   }
   write({
     ok: true,
@@ -169,7 +225,7 @@ if (args[1] === "prompt") {
 if (args[1] === "output") {
   const ref = args[args.length - 1];
   if (ref !== "abc123" && ref !== "g2spawn") {
-    fail(`unknown target: ${ref}`, 2);
+    fail(`unknown target: ${ref}`);
   }
   write({
     ok: true,
@@ -186,6 +242,89 @@ if (args[1] === "output") {
       char_count: 76,
     },
   });
+  process.exit(0);
+}
+
+if (args[1] === "feed") {
+  const state = readStateFile();
+  const after = Number.parseInt(argAfter("--after", "0"), 10) || 0;
+  const limit = Math.max(1, Number.parseInt(argAfter("--limit", "20"), 10) || 20);
+  const items = [...(state?.items ?? DEFAULT_FEED_ITEMS)].sort((a, b) => a.id - b.id);
+  // Contract: ascending ids strictly greater than `after`; with after=0 the
+  // newest `limit` items, still ascending. latest_id is always present.
+  const page =
+    after > 0 ? items.filter((item) => item.id > after).slice(0, limit) : items.slice(-limit);
+  const latestFromItems = items.length ? items[items.length - 1].id : 0;
+  write({
+    items: page,
+    latest_id: Number(state?.latest_id ?? latestFromItems) || latestFromItems,
+  });
+  process.exit(0);
+}
+
+if (args[1] === "feed-ack") {
+  const item = Number.parseInt(argAfter("--item"), 10);
+  const action = argAfter("--action");
+  if (!Number.isInteger(item) || item <= 0) {
+    fail(`invalid feed item: ${argAfter("--item")}`);
+  }
+  if (action !== "expanded" && action !== "dismissed") {
+    fail(`invalid feed action: ${action}`);
+  }
+  const state = readStateFile();
+  // Acking an item the feed does not know is a CLI-side validation rejection
+  // ({"ok":false,...} on stdout, exit 1) that passes the bridge's own checks,
+  // so tests can exercise the structured-failure path end to end.
+  if (state && STATE_FILE && !(state.items || []).some((entry) => entry.id === item)) {
+    fail(`unknown feed item: ${item}`);
+  }
+  if (state && STATE_FILE) {
+    state.acks = Array.isArray(state.acks) ? state.acks : [];
+    state.acks.push({ item, action });
+    writeStateFile(state);
+  }
+  write({ ok: true, item, action });
+  process.exit(0);
+}
+
+if (args[1] === "context-add") {
+  const kind = argAfter("--kind");
+  const raw = argAfter("--data");
+  if (kind !== "location") {
+    fail(`unsupported context kind: ${kind}`);
+  }
+  let data;
+  try {
+    data = JSON.parse(raw);
+  } catch {
+    fail("context --data is not valid JSON");
+  }
+  if (typeof data.lat !== "number" || typeof data.lon !== "number") {
+    fail("context location requires numeric lat and lon");
+  }
+  const state = readStateFile();
+  let id = 1;
+  if (state && STATE_FILE) {
+    state.contexts = Array.isArray(state.contexts) ? state.contexts : [];
+    state.contexts.push({ kind, data });
+    id = state.contexts.length;
+    writeStateFile(state);
+  }
+  write({ ok: true, id });
+  process.exit(0);
+}
+
+if (args[1] === "omni-status") {
+  const state = readStateFile();
+  write(
+    state?.omni ?? {
+      enabled: false,
+      threshold: 0.7,
+      push_per_hour: 6,
+      quiet_hours: null,
+      feed: "main",
+    },
+  );
   process.exit(0);
 }
 

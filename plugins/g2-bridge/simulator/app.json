@@ -14,6 +14,10 @@
         "http://127.0.0.1:3456",
         "http://localhost:3456"
       ]
+    },
+    {
+      "name": "location",
+      "desc": "Posts coarse phone location to the local Morpheus bridge for omnipresence context."
     }
   ],
   "supported_languages": ["en"]

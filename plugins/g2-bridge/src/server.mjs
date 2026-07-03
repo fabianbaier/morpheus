@@ -36,6 +36,16 @@ const MAX_MESSAGES_PER_SESSION = 500;
 const MAX_TRACKED_SESSIONS = 256;
 const MAX_PROJECT_SESSION_ROW_CACHE_ENTRIES = 64;
 const RATE_LIMIT_MAX_TRACKED_KEYS = 4096;
+const DEFAULT_FEED_POLL_MS = 5000;
+const DEFAULT_FEED_SUBSCRIBER_IDLE_MS = 30_000;
+const DEFAULT_OMNI_STATUS_TTL_MS = 5000;
+const DEFAULT_FEED_LIMIT = 20;
+const MAX_FEED_LIMIT = 100;
+const FEED_SESSION_ID = "feed:main";
+const FEED_SESSION_TITLE = "Morpheus Feed";
+const FEED_ACK_ACTIONS = new Set(["expanded", "dismissed"]);
+const FEED_READ_ONLY_NOTICE =
+  "Morpheus Feed is read-only. New pushes keep arriving here; open a project row to start a conversation.";
 const AGENT_BACKEND_MORPHEUS = "morpheus";
 const AGENT_BACKEND_CODEX_APP_SERVER = "codex_app_server";
 const EVEN_APP_ORIGINS = [
@@ -372,6 +382,10 @@ function protectedSessionKeys(state) {
     for (const alias of state.sessionAliases.get(key) || []) keys.add(alias);
   }
   protect(state.selectedSession?.id);
+  // The feed buffer is protected while the feed poller is running: the poller
+  // only runs while something is subscribed to feed:main, and evicting the
+  // buffer mid-subscription would drop pushes the client has not read yet.
+  if (state.feedPoller) protect(FEED_SESSION_ID);
   for (const session of state.projectActiveSessions.values()) protect(session?.id);
   for (const pending of state.pendingProjectPrompts.values()) {
     protect(pending?.id);
@@ -472,7 +486,10 @@ function presentMessageForSession(msg, sessionId) {
   return { ...msg, sessionId: target, activeSessionId: original };
 }
 
-function appendMessageEntry(state, sessionId, msg, id) {
+// `quiet` buffers the message for history/poll reads without broadcasting it
+// to attached SSE clients: the feed baseline fetch uses it so pre-existing
+// items hydrate the transcript without arriving as fresh push events.
+function appendMessageEntry(state, sessionId, msg, id, { quiet = false } = {}) {
   const key = sessionId || "morpheus";
   const buffer = cleanMessageState(state, sessionId);
   const entry = { id, ...msg };
@@ -480,11 +497,13 @@ function appendMessageEntry(state, sessionId, msg, id) {
   if (buffer.messages.length > MAX_MESSAGES_PER_SESSION) {
     buffer.messages.shift();
   }
-  const payload = JSON.stringify(presentMessageForSession(msg, key));
-  for (const client of buffer.clients) {
-    const res = client?.res || client;
-    if (typeof client?.filter === "function" && !client.filter(msg)) continue;
-    res.write(`id: ${id}\ndata: ${payload}\n\n`);
+  if (!quiet) {
+    const payload = JSON.stringify(presentMessageForSession(msg, key));
+    for (const client of buffer.clients) {
+      const res = client?.res || client;
+      if (typeof client?.filter === "function" && !client.filter(msg)) continue;
+      res.write(`id: ${id}\ndata: ${payload}\n\n`);
+    }
   }
   if (msg?.type === "result" || msg?.type === "error") {
     resolveResultWaiters(state, key, entry);
@@ -694,10 +713,10 @@ function sessionMessageTargets(state, sessionId) {
   return [key, ...(state.sessionAliases.get(key) || [])];
 }
 
-function pushMessageForSession(state, sessionId, msg) {
+function pushMessageForSession(state, sessionId, msg, options = {}) {
   const id = allocateMessageId(state);
   for (const target of sessionMessageTargets(state, sessionId)) {
-    appendMessageEntry(state, target, msg, id);
+    appendMessageEntry(state, target, msg, id, options);
   }
   return id;
 }
@@ -1047,6 +1066,28 @@ class Semaphore {
   }
 }
 
+// The real morpheus CLI reports failures as {"ok":false,"error":"..."} JSON on
+// STDOUT and exits 1 with an empty stderr. Recognize that shape so callers see
+// the CLI's own error message (a deliberate rejection of the request) instead
+// of a generic exit-code failure.
+function parseCliFailure(stdout) {
+  const text = String(stdout || "").trim();
+  if (!text.startsWith("{")) return null;
+  let parsed;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return null;
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+  const error = typeof parsed.error === "string" ? parsed.error.trim() : "";
+  if (parsed.ok !== false && !error) return null;
+  return {
+    error: error || "morpheus CLI reported a failure",
+    code: typeof parsed.code === "string" ? parsed.code : "",
+  };
+}
+
 function runJsonCommand(command, args, options = {}) {
   const {
     timeoutMs = DEFAULT_RUNNER_TIMEOUT_MS,
@@ -1109,6 +1150,18 @@ function runJsonCommand(command, args, options = {}) {
         return;
       }
       if (code !== 0) {
+        // Real CLI failures land as {"ok":false,"error":"..."} on stdout with
+        // an empty stderr; surface that message (flagged as a CLI rejection so
+        // routes can answer 4xx instead of 500) before falling back to
+        // stderr-or-generic for infrastructure failures.
+        const cliFailure = parseCliFailure(stdout);
+        if (cliFailure) {
+          const err = new Error(cliFailure.error);
+          err.cliRejection = true;
+          if (cliFailure.code) err.cliCode = cliFailure.code;
+          reject(err);
+          return;
+        }
         reject(new Error(stderr.trim() || `${command} exited with code ${code}`));
         return;
       }
@@ -1253,6 +1306,44 @@ function createMorpheusProvider(options = {}) {
       }
       args.push(sessionId);
       return morpheusJson(args, { timeoutMs: outputRunnerTimeoutMs });
+    },
+
+    async feedItems({ after = 0, limit = DEFAULT_FEED_LIMIT } = {}) {
+      const args = ["remote", "feed", "--compact"];
+      const afterId = Number(after || 0);
+      if (Number.isFinite(afterId) && afterId > 0) {
+        args.push("--after", String(afterId));
+      }
+      args.push("--limit", String(Math.max(1, Number(limit) || DEFAULT_FEED_LIMIT)));
+      return morpheusJson(args);
+    },
+
+    async feedAck({ item, action }) {
+      return morpheusJson([
+        "remote",
+        "feed-ack",
+        "--compact",
+        "--item",
+        String(item),
+        "--action",
+        String(action),
+      ]);
+    },
+
+    async contextAdd({ kind, data }) {
+      return morpheusJson([
+        "remote",
+        "context-add",
+        "--compact",
+        "--kind",
+        String(kind),
+        "--data",
+        String(data),
+      ]);
+    },
+
+    async omniStatus() {
+      return morpheusJson(["remote", "omni-status", "--compact"]);
     },
   };
 }
@@ -1432,6 +1523,223 @@ function projectsOverviewHistory(projects, lastProject) {
 
 function isProjectsNavProjectId(projectId) {
   return projectId === PROJECTS_NAV_PROJECT_ID;
+}
+
+function isFeedSessionId(sessionId) {
+  return sessionId === FEED_SESSION_ID;
+}
+
+// The omnipresence feed rides the stock Even session-row contract (PRD §3.1):
+// one pseudo-session row that clients open like any conversation.
+function feedSessionRow(state, config) {
+  return hydrateSessionRowWithBufferedHistory(state, {
+    id: FEED_SESSION_ID,
+    title: FEED_SESSION_TITLE,
+    timestamp: nowIso(config.clock),
+    cwd: "",
+    provider: "morpheus",
+    status: "idle",
+    allowedActions: ["select_session"],
+    promptBehavior: "feed_read_only",
+    feed: { cursor: Number(state.feedCursor || 0) },
+  });
+}
+
+// Cached `morpheus remote omni-status`. /api/sessions and /api/info consult it
+// on every request, so it is fetched at most once per TTL; on provider failure
+// the last known answer wins (default: disabled) so the session list never
+// breaks just because omnipresence status is unavailable.
+async function getOmniStatus({ provider, state, config }) {
+  const cache = state.omniStatusCache || (state.omniStatusCache = { value: null, at: 0 });
+  const now = config.clock();
+  if (cache.value && now - cache.at < config.omniStatusTtlMs) return cache.value;
+  if (typeof provider.omniStatus !== "function") {
+    return cache.value || { enabled: false };
+  }
+  try {
+    const status = await provider.omniStatus();
+    state.omniStatusCache = {
+      value: { ...status, enabled: status?.enabled === true },
+      at: now,
+    };
+  } catch (err) {
+    bridgeDebug(config, "omni-status-failed", { reason: safeJsonError(err) });
+    state.omniStatusCache = {
+      value: cache.value || { enabled: false },
+      at: now,
+      stale: true,
+    };
+  }
+  return state.omniStatusCache.value;
+}
+
+async function feedRowIfEnabled(context) {
+  const omni = await getOmniStatus(context);
+  if (!omni?.enabled) return null;
+  return feedSessionRow(context.state, context.config);
+}
+
+function prependFeedRow(feedRow, rows) {
+  const sessions = Array.isArray(rows) ? rows : [];
+  if (!feedRow) return sessions;
+  return [feedRow, ...sessions.filter((row) => row?.id !== FEED_SESSION_ID)];
+}
+
+// One feed item = one assistant line: the title (bounded to the PRD's ~220
+// char one-page push budget), with the body on the next line when present.
+function feedItemMessageText(item) {
+  const title = shortText(item?.title, 220);
+  const body = shortText(item?.body, 1000);
+  if (!title) return body;
+  return body ? `${title}\n${body}` : title;
+}
+
+// Publishes CLI feed items (ascending ids) into the feed:main message buffer
+// as assistant-style result messages, so stock Even clients render each push
+// as an assistant line and SSE fanout comes free via pushMessageForSession.
+// The bridge-wide cursor advances past everything published; it only jumps to
+// latest_id once the CLI page came back short (feeds.recent_after returns the
+// OLDEST `limit` items above the cursor, so a full page means a burst is
+// still paging and the remainder must arrive on the next poll). `quiet`
+// buffers items without SSE fanout and `drainToLatest` forces the latest_id
+// jump — the baseline fetch uses both, since its after=0 page is the newest
+// items rather than a burst tail.
+function publishFeedItems(state, config, result, options = {}) {
+  const { limit = DEFAULT_FEED_LIMIT, quiet = false, drainToLatest = false } = options;
+  const items = Array.isArray(result?.items) ? result.items : [];
+  let published = 0;
+  for (const item of items) {
+    const id = Number(item?.id || 0);
+    if (!Number.isFinite(id) || id <= Number(state.feedCursor || 0)) continue;
+    state.feedCursor = id;
+    const text = feedItemMessageText(item);
+    if (!text) continue;
+    pushMessageForSession(
+      state,
+      FEED_SESSION_ID,
+      {
+        type: "result",
+        success: true,
+        provider: "morpheus-feed",
+        sessionId: FEED_SESSION_ID,
+        text,
+        feedItem: {
+          id,
+          ts: Number(item?.ts || 0),
+          priority: Number(item?.priority || 0),
+          sourceKind: String(item?.source_kind || ""),
+          sourceRef: String(item?.source_ref || ""),
+        },
+        at: nowIso(config.clock),
+      },
+      { quiet },
+    );
+    published += 1;
+  }
+  const requested = Math.max(1, Number(limit) || DEFAULT_FEED_LIMIT);
+  const pageDrained = drainToLatest || items.length < requested;
+  const latestId = Number(result?.latest_id || 0);
+  if (pageDrained && Number.isFinite(latestId) && latestId > Number(state.feedCursor || 0)) {
+    state.feedCursor = latestId;
+  }
+  if (published) {
+    bridgeFlow(config, "feed-items-published", {
+      published,
+      quiet,
+      cursor: Number(state.feedCursor || 0),
+    });
+  }
+  return published;
+}
+
+// One in-flight CLI feed read per bridge (same pattern as
+// state.outputRefreshInflight): the history-open fetch and the background
+// poller share a run instead of racing the cursor and double-publishing.
+function fetchAndPublishFeedItems(context, { limit = DEFAULT_FEED_LIMIT } = {}) {
+  const { provider, state, config } = context;
+  if (typeof provider.feedItems !== "function") return Promise.resolve(0);
+  if (state.feedFetchInflight) return state.feedFetchInflight;
+  const run = (async () => {
+    // The bridge cursor does not survive restarts, so the first fetch after
+    // startup (cursor still 0) is a baseline: it hydrates the feed:main
+    // buffer for history/display, jumps the cursor to latest_id, and never
+    // re-pushes pre-existing items to SSE clients as fresh events. Only items
+    // arriving after the baseline stream as new pushes.
+    const baseline = !state.feedBaselined && Number(state.feedCursor || 0) === 0;
+    const result = await provider.feedItems({
+      after: Number(state.feedCursor || 0),
+      limit,
+    });
+    const published = publishFeedItems(state, config, result, {
+      limit,
+      quiet: baseline,
+      drainToLatest: baseline,
+    });
+    state.feedBaselined = true;
+    return published;
+  })();
+  state.feedFetchInflight = run;
+  run
+    .catch(() => {})
+    .finally(() => {
+      if (state.feedFetchInflight === run) state.feedFetchInflight = null;
+    });
+  return run;
+}
+
+// A client counts as subscribed to the feed while an SSE client is attached
+// to the feed buffer or a feed select/history/messages/status touch landed
+// within the subscriber-idle window. Selection alone is NOT a subscriber:
+// it is server-side state that survives client disconnects, so it may extend
+// the window (selecting calls touchFeedSubscription) but must never keep the
+// poller shelling out to the CLI forever after the glasses vanish.
+function feedHasSubscribers(state, config) {
+  if (state.sessions.get(FEED_SESSION_ID)?.clients?.size) return true;
+  return config.clock() - Number(state.feedLastPolledAt || 0) < config.feedSubscriberIdleMs;
+}
+
+function stopFeedPoller(state, config, reason = "stop") {
+  if (!state.feedPoller) return;
+  clearInterval(state.feedPoller);
+  state.feedPoller = null;
+  bridgeFlow(config, "feed-poller-stop", { reason });
+}
+
+// Bridge feed poller: while anyone is subscribed to feed:main, poll the CLI
+// feed with the shared cursor and publish new items into the feed buffer. The
+// interval is unref'd and clears itself on the first tick without
+// subscribers, so it never leaks timers or keeps the process alive.
+function ensureFeedPoller(context) {
+  const { provider, state, config } = context;
+  if (state.feedPoller || typeof provider.feedItems !== "function") return;
+  let running = false;
+  const tick = async () => {
+    if (!state.feedPoller || running) return;
+    running = true;
+    try {
+      if (!feedHasSubscribers(state, config)) {
+        stopFeedPoller(state, config, "no-subscribers");
+        return;
+      }
+      await fetchAndPublishFeedItems(context);
+    } catch (err) {
+      bridgeDebug(config, "feed-poll-failed", { reason: safeJsonError(err) });
+    } finally {
+      running = false;
+    }
+  };
+  const timer = setInterval(tick, config.feedPollMs);
+  if (typeof timer.unref === "function") timer.unref();
+  state.feedPoller = timer;
+  bridgeFlow(config, "feed-poller-start", { intervalMs: config.feedPollMs });
+  const kick = setTimeout(tick, Math.min(250, config.feedPollMs));
+  if (typeof kick.unref === "function") kick.unref();
+}
+
+function touchFeedSubscription(context) {
+  const { state, config } = context;
+  state.feedLastPolledAt = config.clock();
+  ensureFeedPoller(context);
 }
 
 function shortText(value, max = 240) {
@@ -2179,6 +2487,54 @@ function validateText(text, maxPromptChars) {
   return { ok: true, text: normalized };
 }
 
+function finiteNumber(value) {
+  return typeof value === "number" && Number.isFinite(value);
+}
+
+// v1 location context payload: numeric lat/lon (strict — string coordinates
+// are rejected, never coerced), optional accuracy/ts. Returns a compact
+// allowlisted payload so nothing else from the request body reaches the CLI.
+function validateLocationContext(body) {
+  const lat = body?.lat;
+  const lon = body?.lon;
+  if (!finiteNumber(lat) || lat < -90 || lat > 90) {
+    return {
+      ok: false,
+      code: "invalid_location",
+      error: "lat must be a number between -90 and 90",
+    };
+  }
+  if (!finiteNumber(lon) || lon < -180 || lon > 180) {
+    return {
+      ok: false,
+      code: "invalid_location",
+      error: "lon must be a number between -180 and 180",
+    };
+  }
+  const payload = { lat, lon };
+  if (body.accuracy !== undefined && body.accuracy !== null) {
+    if (!finiteNumber(body.accuracy) || body.accuracy < 0) {
+      return {
+        ok: false,
+        code: "invalid_location",
+        error: "accuracy must be a non-negative number",
+      };
+    }
+    payload.accuracy = body.accuracy;
+  }
+  if (body.ts !== undefined && body.ts !== null) {
+    if (!finiteNumber(body.ts) || body.ts <= 0) {
+      return {
+        ok: false,
+        code: "invalid_location",
+        error: "ts must be a positive epoch number",
+      };
+    }
+    payload.ts = body.ts;
+  }
+  return { ok: true, payload };
+}
+
 function selectedSessionTarget(state, bodySessionId) {
   if (!state.selectedSession) {
     return {
@@ -2738,6 +3094,24 @@ function createCodexAppServerBridgeProvider(options = {}) {
         projectId: projectId || state.selectedProject?.id || state.selectedProject?.tenant_id || "",
         lines,
       });
+    },
+
+    // The omnipresence feed/context surface always lives on the Morpheus CLI,
+    // regardless of which agent backend owns conversations.
+    feedItems(options) {
+      return morpheusProvider.feedItems(options);
+    },
+
+    feedAck(options) {
+      return morpheusProvider.feedAck(options);
+    },
+
+    contextAdd(options) {
+      return morpheusProvider.contextAdd(options);
+    },
+
+    omniStatus() {
+      return morpheusProvider.omniStatus();
     },
 
     getStatus(sessionId) {
@@ -3428,6 +3802,9 @@ async function refreshSessionForSessionsPoll({
   outputFallback = true,
 }) {
   if (!sessionId) return { refreshed: false, published: false };
+  // The feed pseudo-session has no terminal mirror or thread history behind
+  // it; the feed poller owns its refreshes.
+  if (isFeedSessionId(sessionId)) return { refreshed: false, published: false, status: "idle" };
   const beforeLatestId = latestMessageId(state, sessionId);
   const beforeHash = state.outputHashes.get(sessionId) || "";
   const preferThreadHistory = shouldPreferThreadHistoryForClientPoll(provider, state, sessionId);
@@ -3856,6 +4233,54 @@ async function handleNavigateBack(req, res, { config, state, audit }) {
   res.json(body);
 }
 
+// Stock Even clients treat every row as a conversation and will happily speak
+// at the feed. The feed is read-only in v1: instead of spawning a Codex
+// session, answer with an assistant-style notice (also buffered into feed:main
+// so message/history pollers render the same reply) and keep the feed
+// selected. This is the least surprising stock-client behavior: the glasses
+// show a normal assistant answer, and the feed keeps streaming.
+function respondFeedPromptReadOnly({ req, res, context, requestId, text }) {
+  const { config, state, audit } = context;
+  touchFeedSubscription(context);
+  const textHash = sha256(text);
+  pushMessageForSession(state, FEED_SESSION_ID, {
+    type: "result",
+    success: true,
+    provider: "morpheus-feed",
+    sessionId: FEED_SESSION_ID,
+    text: FEED_READ_ONLY_NOTICE,
+    feedNotice: true,
+    at: nowIso(config.clock),
+  });
+  const messages = getMessages(state, FEED_SESSION_ID, 0).map((entry) =>
+    presentMessageForSession(entry, FEED_SESSION_ID),
+  );
+  const body = {
+    ok: true,
+    action: "feed_read_only",
+    provider: "morpheus-feed",
+    sessionId: FEED_SESSION_ID,
+    requestId,
+    textHash,
+    state: "idle",
+    text: FEED_READ_ONLY_NOTICE,
+    answer: FEED_READ_ONLY_NOTICE,
+    message: FEED_READ_ONLY_NOTICE,
+    response: FEED_READ_ONLY_NOTICE,
+    output: { text: FEED_READ_ONLY_NOTICE },
+    history: historyFromBufferedMessages(getMessages(state, FEED_SESSION_ID, 0), 10),
+    messages,
+    selectedSession: state.selectedSession,
+  };
+  rememberReplay(req, state, requestId, 200, body, config.clock, config.requestIdTtlMs);
+  audit("remote_prompt_feed_read_only", {
+    requestId,
+    textHash,
+    textChars: text.length,
+  });
+  res.status(200).json(body);
+}
+
 async function submitTextToMorpheus(req, res, context) {
   const { config, provider, state, audit } = context;
   const requestId = writeRequestId(req, state);
@@ -3892,6 +4317,14 @@ async function submitTextToMorpheus(req, res, context) {
       selectedProjectId: projectKey(state.selectedProject) || "",
       lastProjectId: projectKey(state.lastProject) || "",
     });
+  }
+  // Prompts aimed at the read-only omnipresence feed must never spawn Codex.
+  if (
+    isFeedSessionId(bodySessionId) ||
+    (!bodySessionId && isFeedSessionId(state.selectedSession?.id))
+  ) {
+    respondFeedPromptReadOnly({ req, res, context, requestId, text: textResult.text });
+    return;
   }
   const activeProjectSessionProjectId = projectIdFromActiveSessionId(bodySessionId);
   if (activeProjectSessionProjectId) {
@@ -4122,6 +4555,20 @@ function buildConfigFromEnv(env = process.env, argv = process.argv.slice(2)) {
       DEFAULT_STALE_MIRROR_GRACE_MS,
       { min: 1, max: 5 * 60_000 },
     ),
+    feedPollMs: envInt(env, "MORPHEUS_G2_FEED_POLL_MS", DEFAULT_FEED_POLL_MS, {
+      min: 250,
+      max: 5 * 60_000,
+    }),
+    feedSubscriberIdleMs: envInt(
+      env,
+      "MORPHEUS_G2_FEED_SUBSCRIBER_IDLE_MS",
+      DEFAULT_FEED_SUBSCRIBER_IDLE_MS,
+      { min: 1000, max: 60 * 60_000 },
+    ),
+    omniStatusTtlMs: envInt(env, "MORPHEUS_G2_OMNI_STATUS_TTL_MS", DEFAULT_OMNI_STATUS_TTL_MS, {
+      min: 250,
+      max: 60 * 60_000,
+    }),
     codexAppServerPort: envInt(
       env,
       "CODEX_APP_SERVER_PORT",
@@ -4236,6 +4683,12 @@ function createBridge(options = {}) {
     projectPromptLocks: new Map(),
     projectSessionRowsCache: new Map(),
     projectListCache: null,
+    omniStatusCache: { value: null, at: 0 },
+    feedCursor: 0,
+    feedBaselined: false,
+    feedPoller: null,
+    feedFetchInflight: null,
+    feedLastPolledAt: 0,
     navigationEpoch: 0,
     lastProject: null,
     selectedProject: null,
@@ -4291,12 +4744,14 @@ function createBridge(options = {}) {
 
   app.get("/api/info", async (_req, res) => {
     const providerInfo = await provider.info();
+    const omni = await getOmniStatus({ provider, state, config });
     res.json({
       provider: provider.name,
       bridge: "g2",
       model: providerInfo.model,
       version: "0.1.0",
       publicUrl: config.publicUrl || null,
+      omnipresence: { enabled: Boolean(omni?.enabled) },
       selectedProject: state.selectedProject,
       selectedSession: state.selectedSession,
       allowedActions: provider.allowedActions,
@@ -4315,10 +4770,16 @@ function createBridge(options = {}) {
       req.query.view === "projects" ||
       req.query.scope === "projects" ||
       (!state.selectedProject && config.showProjectsFirst);
+    // The Morpheus Feed pseudo-session leads every session list (projects
+    // view, project sessions, open session) while omnipresence is enabled;
+    // getOmniStatus is cached and never throws.
+    const feedRow = await feedRowIfEnabled({ provider, state, config });
     try {
       if (wantsProjects) {
         const result = await listProjectsForResponse(provider, state, config, config.projectLimit);
-        res.json(projectsResponseBody(result, state));
+        const body = projectsResponseBody(result, state);
+        body.sessions = prependFeedRow(feedRow, body.sessions);
+        res.json(body);
         return;
       }
       await refreshSelectedSessionForSessionsPoll({
@@ -4360,7 +4821,7 @@ function createBridge(options = {}) {
           outputPollStopReason: state.outputPollStats?.get(selected.activeSessionId)?.stopReason || "",
         });
         res.json({
-          sessions,
+          sessions: prependFeedRow(feedRow, sessions),
           snapshot,
           selectedProject: state.selectedProject,
           selectedSession: selected.selectedSession || state.selectedSession,
@@ -4435,7 +4896,7 @@ function createBridge(options = {}) {
         outputPollStopReason: state.outputPollStats?.get(selected.activeSessionId)?.stopReason || "",
       });
       res.json({
-        sessions,
+        sessions: prependFeedRow(feedRow, sessions),
         snapshot,
         selectedProject: state.selectedProject,
         selectedSession: selected.selectedSession || state.selectedSession,
@@ -4464,7 +4925,9 @@ function createBridge(options = {}) {
       if (wantsProjects) {
         const cached = cachedProjects(state, config.projectLimit);
         if (cached) {
-          res.json(projectsResponseBody({ ...cached, error: message }, state));
+          const body = projectsResponseBody({ ...cached, error: message }, state);
+          body.sessions = prependFeedRow(feedRow, body.sessions);
+          res.json(body);
           return;
         }
       } else if (state.selectedProject) {
@@ -4480,7 +4943,7 @@ function createBridge(options = {}) {
         ];
         if (rows.length) {
           res.json({
-            sessions: rows,
+            sessions: prependFeedRow(feedRow, rows),
             snapshot: {
               generated_at: Math.floor(config.clock() / 1000),
               summary: `Using local G2 session state after list failure: ${message}`,
@@ -4515,7 +4978,7 @@ function createBridge(options = {}) {
           return;
         }
       }
-      res.status(500).json({ sessions: [], error: safeJsonError(err) });
+      res.status(500).json({ sessions: prependFeedRow(feedRow, []), error: safeJsonError(err) });
     }
   });
 
@@ -4561,6 +5024,17 @@ function createBridge(options = {}) {
         selectedProject: state.selectedProject,
         selectedSession: null,
         navigation: "projects",
+      });
+      return;
+    }
+    if (isFeedSessionId(sessionId)) {
+      touchFeedSubscription({ provider, state, config });
+      res.json({
+        state: "idle",
+        sessionId,
+        provider: "morpheus",
+        selectedProject: state.selectedProject,
+        selectedSession: state.selectedSession,
       });
       return;
     }
@@ -4774,6 +5248,22 @@ function createBridge(options = {}) {
         requestId,
         priorProjectId: priorProject?.id || priorProject?.tenant_id || "",
       });
+      res.json(body);
+      return;
+    }
+    if (isFeedSessionId(sessionId)) {
+      state.selectedSession = feedSessionRow(state, config);
+      bumpNavigationEpoch(state);
+      touchFeedSubscription({ provider, state, config });
+      void fetchAndPublishFeedItems({ provider, state, config }).catch(() => {});
+      const body = {
+        ok: true,
+        provider: provider.name,
+        selectedSession: state.selectedSession,
+        requestId,
+      };
+      rememberReplay(req, state, requestId, 200, body, config.clock, config.requestIdTtlMs);
+      audit("select_feed_session", { requestId });
       res.json(body);
       return;
     }
@@ -5008,6 +5498,39 @@ function createBridge(options = {}) {
         ...projectsResponseBody(result, state),
         history: projectsOverviewHistory(result.projects, state.lastProject),
         navigation: navigationPayload(state, { action: "navigate_projects" }),
+      });
+      return;
+    }
+    if (isFeedSessionId(sessionId)) {
+      // Stock Even clients open rows by fetching history; opening the feed
+      // row pulls fresh feed items into the buffer, selects the feed (like
+      // concrete session rows), and returns the items as assistant-only
+      // history lines.
+      try {
+        await fetchAndPublishFeedItems(
+          { provider, state, config },
+          { limit: Math.max(limit, DEFAULT_FEED_LIMIT) },
+        );
+      } catch (err) {
+        bridgeDebug(config, "feed-history-fetch-failed", { reason: safeJsonError(err) });
+      }
+      state.selectedSession = feedSessionRow(state, config);
+      bumpNavigationEpoch(state);
+      touchFeedSubscription({ provider, state, config });
+      audit("select_feed_history_open", {});
+      const feedHistory = historyFromBufferedMessages(
+        getMessages(state, FEED_SESSION_ID, 0),
+        limit,
+      );
+      res.json({
+        history: feedHistory.length
+          ? feedHistory
+          : [{ role: "assistant", text: "Morpheus Feed is quiet. New pushes will appear here." }],
+        mode: "session",
+        view: "session",
+        selectedProject: state.selectedProject,
+        selectedSession: state.selectedSession,
+        navigation: navigationPayload(state, { action: "select_feed_session" }),
       });
       return;
     }
@@ -5257,6 +5780,11 @@ function createBridge(options = {}) {
       });
       return;
     }
+    if (isFeedSessionId(sessionId)) {
+      // Message polls count as feed subscription; the feed poller (not this
+      // request) fetches new items, so the poll stays fast.
+      touchFeedSubscription({ provider, state, config });
+    }
     const activeProjectMessagesId = projectIdFromActiveSessionId(sessionId);
     const projectId = projectIdFromSessionId(sessionId);
     const selected =
@@ -5356,9 +5884,125 @@ function createBridge(options = {}) {
     });
   });
 
+  // Omnipresence feed (PRD §3.1): poll-style feed for clients that want raw
+  // items instead of the feed:main pseudo-session. Cursor semantics mirror
+  // the CLI: items ascending by id and strictly greater than `after`;
+  // after=0 (or omitted) returns the newest `limit` items, still ascending.
+  app.get("/api/feed", async (req, res) => {
+    const after = Math.max(0, parseIntParam(req.query.after, 0));
+    const limit = parseLimitParam(req.query.limit, DEFAULT_FEED_LIMIT, MAX_FEED_LIMIT);
+    const omni = await getOmniStatus({ provider, state, config });
+    if (typeof provider.feedItems !== "function") {
+      res.json({ items: [], latest_id: 0, omnipresence: { enabled: Boolean(omni?.enabled) } });
+      return;
+    }
+    try {
+      const result = await provider.feedItems({ after, limit });
+      res.json({
+        items: Array.isArray(result?.items) ? result.items : [],
+        latest_id: Number(result?.latest_id || 0),
+        omnipresence: { enabled: Boolean(omni?.enabled) },
+      });
+    } catch (err) {
+      res.status(500).json({ items: [], error: safeJsonError(err), code: "feed_unavailable" });
+    }
+  });
+
+  // Dismiss/expand acks feed the relevance memory (PRD §3.6). Metadata-only
+  // audit: item id and action, never item text.
+  app.post("/api/feed/ack", async (req, res) => {
+    const requestId = writeRequestId(req);
+    if (await maybeReplay(req, res, state, requestId)) return;
+    const itemId = parseIntParam(req.body?.itemId ?? req.body?.item, 0);
+    const action = typeof req.body?.action === "string" ? req.body.action : "";
+    if (!Number.isInteger(itemId) || itemId <= 0) {
+      res.status(400).json({ error: "Missing itemId", code: "missing_feed_item_id" });
+      return;
+    }
+    if (!FEED_ACK_ACTIONS.has(action)) {
+      res.status(400).json({
+        error: "Feed ack action must be 'expanded' or 'dismissed'.",
+        code: "invalid_feed_action",
+      });
+      return;
+    }
+    if (!reserveReplay(req, state, requestId, config.clock, config.requestIdTtlMs)) {
+      if (await maybeReplay(req, res, state, requestId)) return;
+    }
+    try {
+      const result = await provider.feedAck({ item: itemId, action });
+      const body = { ok: true, item: itemId, action, requestId, result };
+      rememberReplay(req, state, requestId, 200, body, config.clock, config.requestIdTtlMs);
+      audit("feed_ack", { requestId, item: itemId, action });
+      res.json(body);
+    } catch (err) {
+      const message = safeJsonError(err);
+      // A structured {"ok":false,...} stdout failure is the CLI rejecting
+      // this ack (bad item/action), not bridge infrastructure breaking:
+      // relay it as a 400 so clients see the validation error, not a 500.
+      const status = err?.cliRejection === true ? 400 : 500;
+      const body = { error: message, code: "feed_ack_failed" };
+      rememberReplay(req, state, requestId, status, body, config.clock, config.requestIdTtlMs);
+      audit("feed_ack_failed", { requestId, item: itemId, action, reason: message });
+      res.status(status).json(body);
+    }
+  });
+
+  // Context ingestion (PRD §3.2). v1 accepts only `location` with strictly
+  // numeric coordinates. Coordinates are forwarded to the CLI and never
+  // logged: the audit record carries the kind plus a payload hash only.
+  app.post("/api/context", async (req, res) => {
+    const requestId = writeRequestId(req);
+    if (await maybeReplay(req, res, state, requestId)) return;
+    const kind = typeof req.body?.kind === "string" ? req.body.kind : "";
+    if (kind !== "location") {
+      audit("context_rejected", { requestId, kind, reason: "unsupported_kind" });
+      res.status(400).json({
+        error: "Unsupported context kind. v1 accepts kind 'location' only.",
+        code: "unsupported_context_kind",
+      });
+      return;
+    }
+    const validated = validateLocationContext(req.body);
+    if (!validated.ok) {
+      audit("context_rejected", { requestId, kind, reason: validated.code });
+      res.status(400).json({ error: validated.error, code: validated.code });
+      return;
+    }
+    if (!reserveReplay(req, state, requestId, config.clock, config.requestIdTtlMs)) {
+      if (await maybeReplay(req, res, state, requestId)) return;
+    }
+    const data = JSON.stringify(validated.payload);
+    const payloadHash = sha256(data);
+    try {
+      const result = await provider.contextAdd({ kind, data });
+      const body = { ok: true, kind, id: result?.id, requestId };
+      rememberReplay(req, state, requestId, 200, body, config.clock, config.requestIdTtlMs);
+      audit("context_add", { requestId, kind, payloadHash });
+      res.json(body);
+    } catch (err) {
+      const message = safeJsonError(err);
+      // Structured CLI rejections (stdout {"ok":false,...}) mean the CLI
+      // refused this signal; answer 400 like the bridge's own validation.
+      const status = err?.cliRejection === true ? 400 : 500;
+      const body = { error: message, code: "context_add_failed" };
+      rememberReplay(req, state, requestId, status, body, config.clock, config.requestIdTtlMs);
+      // The failure reason may echo CLI arguments (which include coordinates),
+      // so the audit record stays hash-only; the reason goes to debug logging.
+      audit("context_add_failed", { requestId, kind, payloadHash });
+      bridgeDebug(config, "context-add-failed", { requestId, reason: message });
+      res.status(status).json(body);
+    }
+  });
+
   app.get("/api/events", async (req, res) => {
     const requestedSessionId = typeof req.query.sessionId === "string" ? req.query.sessionId : "";
     const sessionId = String(requestedSessionId || state.selectedSession?.id || "morpheus");
+    if (isFeedSessionId(sessionId)) {
+      // A connected SSE client counts as a feed subscriber for as long as the
+      // stream stays open (the buffer's client set keeps the poller alive).
+      touchFeedSubscription({ provider, state, config });
+    }
     const safeLastEventId = parseIntParam(req.headers["last-event-id"] || req.query.after, 0);
     const replayRequested =
       req.query.needReplay === "true" ||

@@ -1,5 +1,10 @@
 import "../styles/main.css";
-import { G2BridgeClient, DEFAULT_BRIDGE_URL, buildEvenClientModel } from "./bridge-client.js";
+import {
+  G2BridgeClient,
+  DEFAULT_BRIDGE_URL,
+  buildEvenClientModel,
+  normalizeEpochSeconds,
+} from "./bridge-client.js";
 import {
   clearLegacyTokenStorage,
   saveBridgeConfig,
@@ -31,6 +36,10 @@ const elements = {
   backButton: document.querySelector("#backButton"),
   morpheusSkinButton: document.querySelector("#morpheusSkinButton"),
   evenSkinButton: document.querySelector("#evenSkinButton"),
+  locationLat: document.querySelector("#locationLat"),
+  locationLon: document.querySelector("#locationLon"),
+  sendLocationButton: document.querySelector("#sendLocationButton"),
+  walkButton: document.querySelector("#walkButton"),
 };
 
 elements.bridgeUrl.value = params.get("bridge") || savedBridgeUrl || DEFAULT_BRIDGE_URL;
@@ -46,6 +55,9 @@ const client = new G2BridgeClient({
   token: elements.bridgeToken.value,
   onChange: render,
   onLog: log,
+  // `?omni=0` forces the legacy projects landing for debugging even when the
+  // bridge advertises omnipresence (config surface, PRD §3.6).
+  forceLegacyView: params.get("omni") === "0",
 });
 
 function log(message) {
@@ -80,6 +92,7 @@ function setBusy(isBusy) {
     elements.clickButton,
     elements.downButton,
     elements.backButton,
+    elements.sendLocationButton,
   ]) {
     button.disabled = isBusy;
   }
@@ -203,19 +216,29 @@ async function initEvenDisplay() {
     }
     evenDisplay = { sdk, bridge, created: false };
     bridge.onEvenHubEvent((event) => {
-      const eventType = event?.textEvent?.eventType ?? event?.listEvent?.eventType;
+      // Foreground/background transitions arrive as sysEvent frames.
+      const eventType =
+        event?.textEvent?.eventType ?? event?.listEvent?.eventType ?? event?.sysEvent?.eventType;
       void handleEvenEvent(eventType);
     });
     log("Even bridge ready");
     // Route through the shared chain so the startup render serializes with any
     // renders already in flight and the container is only created once.
     await queueEvenDisplayRender(client.snapshot().glassesText);
+    // Even location courier (PRD §3.2): the mini app posts phone fixes to
+    // /api/context. Guarded end to end, so 0.0.10 hosts fall back silently.
+    await armEvenLocation("startup");
   } catch (err) {
     log(`Even SDK unavailable: ${err.message}`);
   }
 }
 
-// OsEventTypeList: 0 = click, 1 = scroll top, 2 = scroll bottom, 3 = double click.
+// OsEventTypeList: 0 = click, 1 = scroll top, 2 = scroll bottom,
+// 3 = double click, 4 = foreground enter, 5 = foreground exit.
+// Click/double-click semantics are view-aware inside the client: in the feed
+// view a click expands the selected push and a double click dismisses it
+// (falling through to the OS back convention only when no item is selected);
+// everywhere else they stay activate/back.
 async function handleEvenEvent(eventType) {
   if (eventType === 0) {
     await runAction(() => client.activateSelected());
@@ -233,7 +256,127 @@ async function handleEvenEvent(eventType) {
     await runAction(() => client.navigateBack());
     return;
   }
+  if (eventType === 4) {
+    // FOREGROUND_ENTER: Android may have suspended the WebView and dropped
+    // the location subscription -- always re-arm (SDK background caveat).
+    void armEvenLocation("foreground-enter");
+    return;
+  }
+  if (eventType === 5) {
+    return; // FOREGROUND_EXIT: nothing to do; continuous updates are best-effort.
+  }
   log(`Ignoring unrecognized Even hub event type: ${eventType}`);
+}
+
+// --- Location courier (EvenHub SDK 0.0.11) ---
+
+const LOCATION_DISTANCE_FILTER_METERS = 50;
+const LOCATION_DEDUPE_METERS = 25;
+
+const evenLocation = { unsubscribe: null };
+
+// Arms continuous phone-location updates through the EvenHub SDK 0.0.11 APIs
+// (startAppLocationUpdates / onAppLocationChanged). Every SDK touch is
+// guarded: on a 0.0.10 host runtime these methods simply do not exist and
+// the app falls back silently to manual/browser location controls.
+async function armEvenLocation(reason) {
+  const bridge = evenDisplay?.bridge;
+  if (!bridge) return;
+  if (
+    typeof bridge.startAppLocationUpdates !== "function" ||
+    typeof bridge.onAppLocationChanged !== "function"
+  ) {
+    if (reason === "startup") {
+      log("Even location APIs unavailable (SDK < 0.0.11 host); location courier disabled");
+    }
+    return;
+  }
+  try {
+    if (!evenLocation.unsubscribe) {
+      evenLocation.unsubscribe = bridge.onAppLocationChanged((fix) => {
+        void postEvenLocationFix(fix);
+      });
+    }
+    // Medium accuracy with a ~50m distance filter: block-level context
+    // without draining the phone (PRD §3.2).
+    const started = await bridge.startAppLocationUpdates({
+      accuracy: "medium",
+      distanceFilter: LOCATION_DISTANCE_FILTER_METERS,
+    });
+    log(`Even location updates ${started ? "armed" : "not granted"} (${reason})`);
+  } catch (err) {
+    // PERMISSION_DENIED is expected on QR-sideloaded dev builds; installed
+    // Hub builds are the validated path.
+    log(`Even location unavailable (${reason}): ${err.message}`);
+  }
+}
+
+async function postEvenLocationFix(fix) {
+  const lat = Number(fix?.latitude ?? fix?.lat);
+  const lon = Number(fix?.longitude ?? fix?.lon);
+  try {
+    // JS SDK fixes report millisecond epochs; the bridge stores seconds.
+    // sendLocation normalizes too, but convert here so no layer ever sees a
+    // milliseconds value masquerading as a seconds epoch.
+    const result = await client.sendLocation(
+      { lat, lon, accuracy: fix?.accuracy, ts: normalizeEpochSeconds(fix?.timestamp) },
+      { dedupeMeters: LOCATION_DEDUPE_METERS },
+    );
+    // Coordinates intentionally never hit the debug log (PRD §3.2 privacy).
+    log(result ? "Location fix posted to /api/context" : "Location fix skipped (<25m move)");
+  } catch (err) {
+    log(`Location post failed: ${err.message}`);
+  }
+}
+
+// --- Browser-mode manual location controls ---
+
+let walkTimer = null;
+
+function readManualCoordinates() {
+  return {
+    lat: Number.parseFloat(elements.locationLat.value),
+    lon: Number.parseFloat(elements.locationLon.value),
+  };
+}
+
+async function sendManualLocation() {
+  saveConfig();
+  const { lat, lon } = readManualCoordinates();
+  // sendLocation validates client-side and throws on empty/NaN/out-of-range
+  // input; runAction surfaces the message without hitting the bridge.
+  await client.sendLocation({ lat, lon, ts: Date.now() / 1000 });
+  log("Manual location posted to /api/context");
+}
+
+// Demo "walk": steps the coordinates ~40m north-east every 2s and posts each
+// fix, so location-triggered loops can be exercised without a phone.
+function toggleWalkSimulator() {
+  if (walkTimer) {
+    clearInterval(walkTimer);
+    walkTimer = null;
+    elements.walkButton.textContent = "Walk";
+    log("Walk simulator stopped");
+    return;
+  }
+  const start = readManualCoordinates();
+  if (!Number.isFinite(start.lat) || !Number.isFinite(start.lon)) {
+    log("Walk simulator needs valid start coordinates");
+    return;
+  }
+  elements.walkButton.textContent = "Stop walk";
+  log("Walk simulator started");
+  walkTimer = setInterval(() => {
+    const lat = Number.parseFloat(elements.locationLat.value) + 0.00035;
+    const lon = Number.parseFloat(elements.locationLon.value) + 0.0002;
+    if (!Number.isFinite(lat) || !Number.isFinite(lon)) return;
+    elements.locationLat.value = lat.toFixed(6);
+    elements.locationLon.value = lon.toFixed(6);
+    client
+      .sendLocation({ lat, lon, ts: Date.now() / 1000 })
+      .then(() => log("Walk step posted to /api/context"))
+      .catch((err) => log(`Walk step failed: ${err.message}`));
+  }, 2000);
 }
 
 let actionInFlight = false;
@@ -278,6 +421,9 @@ elements.sendTranscriptButton.addEventListener("click", () =>
     await client.submitTranscriptViaSessionPolling(elements.transcriptText.value);
   }),
 );
+
+elements.sendLocationButton.addEventListener("click", () => runAction(() => sendManualLocation()));
+elements.walkButton.addEventListener("click", () => toggleWalkSimulator());
 
 elements.upButton.addEventListener("click", () => client.move(-1));
 elements.downButton.addEventListener("click", () => client.move(1));

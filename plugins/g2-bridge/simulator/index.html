@@ -47,6 +47,18 @@
         <div class="command-row">
           <button id="sendTranscriptButton" type="button">Send Transcript</button>
         </div>
+        <div class="field-row">
+          <label for="locationLat">Lat</label>
+          <input id="locationLat" autocomplete="off" spellcheck="false" inputmode="decimal" value="48.137154" />
+        </div>
+        <div class="field-row">
+          <label for="locationLon">Lon</label>
+          <input id="locationLon" autocomplete="off" spellcheck="false" inputmode="decimal" value="11.576124" />
+        </div>
+        <div class="command-row" aria-label="Manual location controls">
+          <button id="sendLocationButton" type="button">Send location</button>
+          <button id="walkButton" type="button">Walk</button>
+        </div>
         <pre id="debugLog" class="debug-log" aria-label="Debug log"></pre>
       </section>
     </main>
