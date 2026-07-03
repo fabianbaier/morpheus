@@ -9,6 +9,7 @@ LOCAL_BIN ?= $(HOME)/.local/bin
 #   make start-omni G2_PUBLIC_URL=https://other-host.ts.net
 G2_PUBLIC_URL ?= https://fabians-macbook-pro.tail3387a8.ts.net
 G2_PORT ?= 3456
+G2_CODEX_PORT ?= 8765
 G2_TOKEN_FILE ?= $(HOME)/.morpheus/g2-token
 G2_DIR := plugins/g2-bridge
 
@@ -16,7 +17,7 @@ VENV_PY := $(VENV)/bin/python
 MORPHEUS := $(VENV)/bin/morpheus
 LOCAL_MORPHEUS := $(LOCAL_BIN)/morpheus
 
-.PHONY: help bootstrap install install-cli uninstall-cli start up dashboard desktop daemon daemon-start daemon-stop daemon-status status loop-runner loop-runner-stop loop-runner-status watch doctor logs loop-logs graph-status test clean start-omni omni-off omni-status g2-bridge g2-token
+.PHONY: help bootstrap install install-cli uninstall-cli start up dashboard desktop daemon daemon-start daemon-stop daemon-status status loop-runner loop-runner-stop loop-runner-status watch doctor logs loop-logs graph-status test clean start-omni omni-off omni-status g2-bridge g2-stop g2-token
 
 help:
 	@printf "Morpheus dev commands\n\n"
@@ -34,7 +35,8 @@ help:
 	@printf "  make loop-logs     Tail ~/.morpheus/loop-runner.log\n"
 	@printf "  make test          Run lightweight local checks\n"
 	@printf "  make start-omni    Omnipresence: omni on + init, loop runner, tailscale serve, G2 bridge\n"
-	@printf "  make g2-bridge     Start only the G2 bridge (foreground) with the persisted token\n"
+	@printf "  make g2-bridge     Start (or restart) the G2 bridge in the foreground\n"
+	@printf "  make g2-stop       Stop a running G2 bridge and its codex app-server\n"
 	@printf "  make omni-status   Show omnipresence settings, template loops, and recent pushes\n"
 	@printf "  make omni-off      Disable omnipresence pushes\n"
 	@printf "\nOverride polling with POLL=2, e.g. make start POLL=2\n"
@@ -134,7 +136,16 @@ g2-token:
 		printf "Generated G2 bridge token: %s\n" "$(G2_TOKEN_FILE)"; \
 	fi
 
-g2-bridge: bootstrap g2-token
+g2-stop:
+	@PIDS=$$(lsof -t -i :$(G2_PORT) -i :$(G2_CODEX_PORT) 2>/dev/null | sort -u); \
+	if [ -n "$$PIDS" ]; then \
+		kill $$PIDS 2>/dev/null || true; sleep 1; \
+		printf "Stopped previous G2 bridge / codex app-server (pids: %s)\n" "$$(echo $$PIDS | tr '\n' ' ')"; \
+	else \
+		printf "No G2 bridge running on :%s\n" "$(G2_PORT)"; \
+	fi
+
+g2-bridge: bootstrap g2-token g2-stop
 	@if [ ! -d "$(G2_DIR)/node_modules" ]; then npm --prefix "$(G2_DIR)" install; fi
 	@printf "G2 bridge: public URL %s (token file %s)\n" "$(G2_PUBLIC_URL)" "$(G2_TOKEN_FILE)"
 	MORPHEUS_G2_TOKEN="$$(cat "$(G2_TOKEN_FILE)")" \

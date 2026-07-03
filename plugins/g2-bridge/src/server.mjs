@@ -315,7 +315,9 @@ async function retryWhileCodexAppServerStarts(config, label, fn) {
       return await fn();
     } catch (err) {
       const remainingMs = deadline - config.clock();
-      if (!isCodexAppServerStartupError(err) || remainingMs <= 0) throw err;
+      // A fatal bridge startup failure (e.g. port already in use) sets
+      // abortStartup; keeping the codex warm-up retrying past that is noise.
+      if (config.abortStartup || !isCodexAppServerStartupError(err) || remainingMs <= 0) throw err;
       bridgeFlow(config, "codex-app-server-startup-retry", {
         label,
         attempt,
@@ -6183,6 +6185,7 @@ function startBridge(options = {}) {
     // WebSocket). Tear down what it started so the failed process can drain
     // its event loop and exit, instead of hanging unreachable; process.exit()
     // is deliberately avoided so in-process embedders (and tests) survive.
+    config.abortStartup = true;
     try {
       Promise.resolve(provider.shutdown?.()).catch(() => {});
     } catch {
