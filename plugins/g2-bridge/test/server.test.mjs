@@ -5065,6 +5065,7 @@ test("context ingestion maps CLI rejections to 400 and infrastructure failures t
 test("prompts to the feed row answer read-only and never spawn sessions", async (t) => {
   const { baseUrl, auditPath } = await withFeedBridge(t, {
     items: [feedItem(1, "Quiet push")],
+    options: { feedPromptMode: "notice" },
   });
   await request(baseUrl, "/api/sessions/feed:main/history");
 
@@ -5102,4 +5103,23 @@ test("prompts to the feed row answer read-only and never spawn sessions", async 
   assert.match(audit, /remote_prompt_feed_read_only/);
   assert.doesNotMatch(audit, /remote_spawn_session/);
   assert.doesNotMatch(audit, /hello glasses feed/);
+});
+
+test("feed prompts route to the most recent project by default", async (t) => {
+  const { baseUrl } = await withFeedBridge(t, {
+    items: [feedItem(1, "Quiet push")],
+  });
+  await request(baseUrl, "/api/sessions/feed:main/history");
+
+  const prompt = await request(baseUrl, "/api/prompt", {
+    body: { text: "what is the weather", clientRequestId: "feed-route-0001" },
+  });
+  // Routed like a sessionless prompt: no read-only notice — the spawn path
+  // answers (200 with the result, or 202 while the turn is still pending)
+  // with a real session id.
+  assert.ok(prompt.status === 200 || prompt.status === 202, `status ${prompt.status}`);
+  const promptBody = await prompt.json();
+  assert.notEqual(promptBody.action, "feed_read_only");
+  assert.ok(promptBody.sessionId);
+  assert.notEqual(promptBody.sessionId, "feed:main");
 });

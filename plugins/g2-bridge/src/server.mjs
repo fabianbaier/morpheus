@@ -4270,6 +4270,15 @@ function respondFeedPromptReadOnly({ req, res, context, requestId, text }) {
     feedNotice: true,
     at: nowIso(config.clock),
   });
+  // Stock clients keep a "Computing..." spinner until an idle status frame
+  // follows the result, mirroring the terminal sequence real turns publish.
+  pushMessageForSession(state, FEED_SESSION_ID, {
+    type: "status",
+    state: "idle",
+    provider: "morpheus-feed",
+    sessionId: FEED_SESSION_ID,
+    at: nowIso(config.clock),
+  });
   const messages = getMessages(state, FEED_SESSION_ID, 0).map((entry) =>
     presentMessageForSession(entry, FEED_SESSION_ID),
   );
@@ -4327,7 +4336,7 @@ async function submitTextToMorpheus(req, res, context) {
   // to die with selected_session_stale. The menu row is navigation, not a
   // session, so route the text like a sessionless prompt: project context
   // (selected or last project) decides between spawn and follow-up.
-  const bodySessionId = isProjectMenuSessionId(rawBodySessionId) ? "" : rawBodySessionId;
+  let bodySessionId = isProjectMenuSessionId(rawBodySessionId) ? "" : rawBodySessionId;
   if (rawBodySessionId && !bodySessionId) {
     bridgeFlow(config, "prompt-menu-row-redirect", {
       requestId,
@@ -4336,13 +4345,36 @@ async function submitTextToMorpheus(req, res, context) {
       lastProjectId: projectKey(state.lastProject) || "",
     });
   }
-  // Prompts aimed at the read-only omnipresence feed must never spawn Codex.
+  // Prompts aimed at the omnipresence feed. Default: route like a sessionless
+  // prompt (the feed is the landing view, so speaking there should just work
+  // — same redirect the projects menu row gets). Project context is the
+  // selected project, the last project, or the most recently seen project;
+  // MORPHEUS_G2_FEED_PROMPT_MODE=notice restores the read-only reply.
+  let feedRouted = false;
   if (
     isFeedSessionId(bodySessionId) ||
     (!bodySessionId && isFeedSessionId(state.selectedSession?.id))
   ) {
-    respondFeedPromptReadOnly({ req, res, context, requestId, text: textResult.text });
-    return;
+    if ((config.feedPromptMode || "route") === "notice") {
+      respondFeedPromptReadOnly({ req, res, context, requestId, text: textResult.text });
+      return;
+    }
+    if (!projectContextForPrompt(state)) {
+      const listed = await listProjectsForResponse(
+        provider,
+        state,
+        config,
+        config.projectLimit,
+      ).catch(() => null);
+      const first = listed?.projects?.[0];
+      if (first) rememberProjectContext(state, first);
+    }
+    feedRouted = true;
+    bodySessionId = "";
+    bridgeFlow(config, "prompt-feed-route", {
+      requestId,
+      projectId: projectKey(projectContextForPrompt(state)) || "",
+    });
   }
   const activeProjectSessionProjectId = projectIdFromActiveSessionId(bodySessionId);
   if (activeProjectSessionProjectId) {
@@ -4432,7 +4464,7 @@ async function submitTextToMorpheus(req, res, context) {
   let targetSessionId = "";
   if (bodySessionId) {
     targetSessionId = bodySessionId;
-  } else if (state.selectedSession) {
+  } else if (state.selectedSession && !feedRouted) {
     targetSessionId = state.selectedSession.id;
   }
 
