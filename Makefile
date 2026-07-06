@@ -12,12 +12,14 @@ G2_PORT ?= 3456
 G2_CODEX_PORT ?= 8765
 G2_TOKEN_FILE ?= $(HOME)/.morpheus/g2-token
 G2_DIR := plugins/g2-bridge
+G2_APP_DIR := plugins/g2-bridge/simulator
+G2_APP_PORT ?= 5173
 
 VENV_PY := $(VENV)/bin/python
 MORPHEUS := $(VENV)/bin/morpheus
 LOCAL_MORPHEUS := $(LOCAL_BIN)/morpheus
 
-.PHONY: help bootstrap install install-cli uninstall-cli start up dashboard desktop daemon daemon-start daemon-stop daemon-status status loop-runner loop-runner-stop loop-runner-status watch doctor logs loop-logs graph-status test clean start-omni omni-off omni-status g2-bridge g2-stop g2-token
+.PHONY: help bootstrap install install-cli uninstall-cli start up dashboard desktop daemon daemon-start daemon-stop daemon-status status loop-runner loop-runner-stop loop-runner-status watch doctor logs loop-logs graph-status test clean start-omni omni-off omni-status g2-bridge g2-stop g2-token g2-app-pack g2-app-dev g2-app-qr
 
 help:
 	@printf "Morpheus dev commands\n\n"
@@ -37,6 +39,9 @@ help:
 	@printf "  make start-omni    Omnipresence: omni on + init, loop runner, tailscale serve, G2 bridge\n"
 	@printf "  make g2-bridge     Start (or restart) the G2 bridge in the foreground\n"
 	@printf "  make g2-stop       Stop a running G2 bridge and its codex app-server\n"
+	@printf "  make g2-app-pack   Build the G2 mini app into an installable .ehpk (enables glasses GPS)\n"
+	@printf "  make g2-app-dev    Run the mini app dev server for on-glasses hot-reload (no GPS)\n"
+	@printf "  make g2-app-qr     Print a QR the Even app Developer Center scans to load the dev app\n"
 	@printf "  make omni-status   Show omnipresence settings, template loops, and recent pushes\n"
 	@printf "  make omni-off      Disable omnipresence pushes\n"
 	@printf "\nOverride polling with POLL=2, e.g. make start POLL=2\n"
@@ -170,3 +175,26 @@ omni-off: bootstrap
 
 omni-status: bootstrap
 	$(MORPHEUS) omni status
+
+# EvenHub mini app — the native path for phone GPS (no companion app). The
+# packed .ehpk installed via Private testing is the ONLY path Even grants the
+# location permission; the dev-QR path below is for fast UI/feed iteration but
+# cannot read GPS. See docs/omnipresence-mini-app.md.
+g2-app-pack:
+	@if [ ! -d "$(G2_APP_DIR)/node_modules" ]; then npm --prefix "$(G2_APP_DIR)" install; fi
+	MORPHEUS_G2_PUBLIC_URL="$(G2_PUBLIC_URL)" npm --prefix "$(G2_APP_DIR)" run pack
+	@printf "\nBuilt %s/morpheus-g2.ehpk (bridge host: %s)\n" "$(G2_APP_DIR)" "$(G2_PUBLIC_URL)"
+	@printf "Install for GPS: run 'npx evenhub login', upload the .ehpk at hub.evenrealities.com,\n"
+	@printf "then install it to your glasses via Private testing. Full steps: docs/omnipresence-mini-app.md\n"
+
+g2-app-dev:
+	@if [ ! -d "$(G2_APP_DIR)/node_modules" ]; then npm --prefix "$(G2_APP_DIR)" install; fi
+	@printf "Mini app dev server on :%s. In another shell: make g2-app-qr (scan in Even Developer Center).\n" "$(G2_APP_PORT)"
+	@printf "Note: the dev-QR path cannot read GPS (Even denies location to sideloaded dev apps) — use make g2-app-pack for that.\n"
+	npm --prefix "$(G2_APP_DIR)" run dev
+
+g2-app-qr: g2-token
+	@LAN_IP=$$(ipconfig getifaddr en0 2>/dev/null || ipconfig getifaddr en1 2>/dev/null || hostname); \
+	URL="http://$$LAN_IP:$(G2_APP_PORT)/?bridge=$(G2_PUBLIC_URL)&token=$$(cat $(G2_TOKEN_FILE))"; \
+	printf "Loading dev app from %s\n" "$$URL"; \
+	npx --prefix "$(G2_APP_DIR)" evenhub qr --url "$$URL"

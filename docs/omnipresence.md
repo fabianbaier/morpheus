@@ -102,10 +102,12 @@ messages, and new ones stream in while the row is open. In the simulator (and
 future mini app): tap expands a push (with the judge's "why"), double-tap
 dismisses it, and both reactions feed back into the memory updater.
 
-Location: the simulator/mini app streams phone GPS to the bridge via the
-EvenHub SDK ≥ 0.0.11 (`location` permission; fixes are deduped under 25 m).
-Browser dev mode has manual lat/lon controls and a walk simulator. Anything
-that can POST JSON can also feed
+Location: the mini app streams phone GPS to the bridge via the EvenHub SDK
+≥ 0.0.11 (`location` permission; fixes are deduped under 25 m). Install it with
+`make g2-app-pack` — see **[omnipresence-mini-app.md](omnipresence-mini-app.md)**
+for the full install path (the packed `.ehpk` is the only path Even grants
+location). Browser dev mode has manual lat/lon controls and a walk simulator.
+Anything that can POST JSON can also feed
 `POST /api/context {"kind":"location","lat":..,"lon":..}` over the tailnet
 (iOS Shortcuts, Overland, OwnTracks).
 
