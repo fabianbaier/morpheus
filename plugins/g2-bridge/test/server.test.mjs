@@ -422,7 +422,8 @@ test("can expose projects as G2 session rows first", async (t) => {
   const body = await res.json();
   assert.equal(body.mode, "projects");
   assert.equal(body.sessions[0].id, "project:p_alpha");
-  assert.equal(body.sessions[0].title, "alpha");
+  // Glanceable project title: name + live count (see feature: start-screen).
+  assert.equal(body.sessions[0].title, "alpha · 1 live");
   assert.equal(body.sessions[0].provider, "codex");
   assert.equal(body.sessions[0].status, "idle");
   assert.equal(body.sessions[0].cwd, "/tmp/morpheus-alpha");
@@ -1028,7 +1029,7 @@ test("project menu history request returns to projects for stock Even row opens"
   assert.equal(historyBody.navigation.view, "projects");
   assert.match(historyBody.history[0].text, /Morpheus projects — 2/);
   assert.equal(historyBody.sessions[0].id, "project:p_alpha");
-  assert.equal(historyBody.sessions[0].title, "alpha");
+  assert.equal(historyBody.sessions[0].title, "alpha · 1 live");
 
   const projects = await request(baseUrl, `/api/sessions?token=${TOKEN}`, { token: null });
   const projectsBody = await projects.json();
@@ -1097,6 +1098,10 @@ test("session menu polling uses cached rows if live provider listing fails", asy
   const { baseUrl } = await withBridge(t, {
     agentBackend: "codex_app_server",
     includeCodexHistory: true,
+    // Exercise the cachedProjects/projectSessionRowsCache stale-fallback in
+    // isolation; the short-TTL listing cache (tested separately) would
+    // otherwise serve the first poll's rows before the provider failure.
+    sessionsCacheTtlMs: 0,
     createCodexAgentProvider: () => ({
       async getInfo() {
         return { provider: "codex", model: "Codex", version: "test" };
@@ -4827,8 +4832,10 @@ test("opening feed history returns pushes as assistant lines and selects the fee
   assert.equal(body.selectedSession.id, "feed:main");
   assert.equal(body.view, "session");
   assert.ok(body.history.every((entry) => entry.role === "assistant"));
-  assert.equal(body.history[0].text, "First push title\nFirst push body");
-  assert.equal(body.history[1].text, "Second push title");
+  // Headline rendering: `! ` priority marker; meaningful body kept as a 2nd
+  // line; no "loop [...] · status=" machine noise.
+  assert.equal(body.history[0].text, "! First push title\nFirst push body");
+  assert.equal(body.history[1].text, "! Second push title");
 
   const selected = await request(baseUrl, "/api/selected-session");
   assert.equal((await selected.json()).selectedSession.id, "feed:main");
@@ -5206,4 +5213,139 @@ test("codex permission requests surface on the glasses and can auto-approve", as
         message.type === "text" && /auto-approved.*git log/i.test(String(message.text || "")),
     ),
   );
+});
+
+// ── Start-screen redesign, glanceable feed, and sessions cache ──────────────
+
+test("sessions listing cache serves rapid polls without re-invoking the CLI", async (t) => {
+  const countPath = path.join(
+    tmpdir(),
+    `morpheus-g2-count-${process.pid}-${t.name.replace(/[^A-Za-z0-9_-]/g, "_")}.log`,
+  );
+  fs.rmSync(countPath, { force: true });
+  process.env.MOCK_MORPHEUS_COUNT_FILE = countPath;
+  t.after(() => {
+    delete process.env.MOCK_MORPHEUS_COUNT_FILE;
+    fs.rmSync(countPath, { force: true });
+  });
+
+  const { baseUrl, state } = await withBridge(t, { showProjectsFirst: true });
+  for (let i = 0; i < 3; i += 1) {
+    const res = await request(baseUrl, `/api/sessions?token=${TOKEN}`, { token: null });
+    assert.equal(res.status, 200);
+  }
+  const counts = fs.readFileSync(countPath, "utf8").trim().split("\n");
+  const projectCalls = counts.filter((line) => line === "projects").length;
+  // The listing cache (default 4s TTL) must collapse 3 rapid polls into a
+  // single provider fetch; without the config wiring this would be 3.
+  assert.equal(projectCalls, 1, `expected 1 projects call, got ${projectCalls}`);
+  assert.ok(state.sessionsListingCache.size > 0);
+});
+
+test("a mutation invalidates the sessions listing cache", async (t) => {
+  const { baseUrl, state } = await withBridge(t, { showProjectsFirst: true });
+  await request(baseUrl, `/api/sessions?token=${TOKEN}`, { token: null });
+  assert.ok(state.sessionsListingCache.size > 0, "cache should be warm after a poll");
+  await request(baseUrl, "/api/select-project", {
+    body: { projectId: "p_alpha", clientRequestId: "cache-invalidate-select" },
+  });
+  assert.equal(state.sessionsListingCache.size, 0, "select-project must clear the cache");
+});
+
+test("feed history drops the loop status machine-body noise line", async (t) => {
+  const { baseUrl } = await withFeedBridge(t, {
+    items: [
+      feedItem(1, "Espresso beans on promo 50m left", "loop [omni-location] · status=success"),
+      feedItem(2, "PR #42 approved", "Ready to merge on main."),
+    ],
+  });
+  const history = await request(baseUrl, "/api/sessions/feed:main/history");
+  const body = await history.json();
+  // Machine body filtered → headline only; meaningful body kept as 2nd line.
+  assert.equal(body.history[0].text, "! Espresso beans on promo 50m left");
+  assert.equal(body.history[1].text, "! PR #42 approved\nReady to merge on main.");
+});
+
+function writeSnapshotState(t, snapshotSessions, extra = {}) {
+  const statePath = path.join(
+    tmpdir(),
+    `morpheus-g2-snap-${process.pid}-${t.name.replace(/[^A-Za-z0-9_-]/g, "_")}.json`,
+  );
+  fs.writeFileSync(statePath, JSON.stringify({ snapshotSessions, ...extra }));
+  process.env.MOCK_MORPHEUS_STATE_FILE = statePath;
+  t.after(() => {
+    delete process.env.MOCK_MORPHEUS_STATE_FILE;
+    fs.rmSync(statePath, { force: true });
+  });
+}
+
+test("attention row appears for blocked sessions and lists them, absent otherwise", async (t) => {
+  writeSnapshotState(t, [
+    {
+      tab_ref: "blk1",
+      mission_ref: "missionblk",
+      state: "blocked",
+      goal: "G2: fix the failing deploy",
+      blocked_on: "waiting on approval",
+      age_secs: 30,
+      tenant_id: "p_alpha",
+      project_root: "/tmp/morpheus-alpha",
+    },
+  ]);
+  const { baseUrl } = await withBridge(t, { showProjectsFirst: true });
+  const res = await request(baseUrl, `/api/sessions?token=${TOKEN}`, { token: null });
+  const body = await res.json();
+  const attentionRow = body.sessions.find((s) => s.id === "attention:main");
+  assert.ok(attentionRow, "attention:main row should be present for a blocked session");
+  assert.match(attentionRow.title, /need|1/i);
+
+  const history = await request(baseUrl, "/api/sessions/attention:main/history");
+  const historyBody = await history.json();
+  assert.ok(historyBody.history.every((e) => e.role === "assistant"));
+  assert.ok(historyBody.history.some((e) => /fix the failing deploy|blocked/i.test(e.text)));
+});
+
+test("attention row is absent when nothing needs attention", async (t) => {
+  writeSnapshotState(t, [
+    {
+      tab_ref: "ok1",
+      mission_ref: "missionok",
+      state: "idle",
+      goal: "G2: idle session",
+      age_secs: 5,
+      tenant_id: "p_alpha",
+      project_root: "/tmp/morpheus-alpha",
+    },
+  ]);
+  const { baseUrl } = await withBridge(t, { showProjectsFirst: true });
+  const res = await request(baseUrl, `/api/sessions?token=${TOKEN}`, { token: null });
+  const body = await res.json();
+  assert.equal(body.sessions.some((s) => s.id === "attention:main"), false);
+});
+
+test("prompting while an attention row is selected routes sessionless, not to the synthetic id", async (t) => {
+  writeSnapshotState(t, [
+    {
+      tab_ref: "blk1",
+      mission_ref: "missionblk",
+      state: "blocked",
+      goal: "G2: blocked mission",
+      blocked_on: "needs input",
+      age_secs: 30,
+      tenant_id: "p_alpha",
+      project_root: "/tmp/morpheus-alpha",
+    },
+  ]);
+  const { baseUrl } = await withBridge(t, { showProjectsFirst: true });
+  await request(baseUrl, `/api/sessions?token=${TOKEN}`, { token: null });
+  await request(baseUrl, "/api/select-session", {
+    body: { sessionId: "attention:main", clientRequestId: "attn-select" },
+  });
+  const prompt = await request(baseUrl, "/api/prompt", {
+    body: { text: "what needs me", clientRequestId: "attn-prompt" },
+  });
+  // Must not 409 on a synthetic id and must not target "attention:main".
+  assert.ok(prompt.status === 200 || prompt.status === 202, `status ${prompt.status}`);
+  const promptBody = await prompt.json();
+  assert.notEqual(promptBody.sessionId, "attention:main");
 });

@@ -306,11 +306,16 @@ pseudo-session (`feed:main`) as the first row — both before and after a
 project is selected. Stock Even clients open rows as conversations, so the
 feed needs zero client changes:
 
+- Feed items render as glanceable **headlines**, not walls of text: one line
+  per item, a `! ` prefix when `priority > 0`, the title truncated to ~110
+  chars. Streamed messages are headline-only. History may append a *meaningful*
+  body as a truncated second line, but the machine noise line loops attach
+  (`loop [name] · status=success`) is filtered out. `GET /api/feed` is
+  unchanged and still returns the raw body/metadata for richer clients.
 - `GET /api/sessions/feed:main/history` pulls fresh feed items, returns them
-  as assistant-only history (one item per assistant line: the title, with the
-  body on the following line when present), and selects the feed row — exactly
-  like history opens on concrete session rows. `POST /api/select-session` with
-  `feed:main` works the same way.
+  as assistant-only history (headline lines as above), and selects the feed row
+  — exactly like history opens on concrete session rows. `POST
+  /api/select-session` with `feed:main` works the same way.
 - While any client is subscribed to the feed — the feed row is selected, an
   SSE client is connected with `sessionId=feed:main`, or feed
   history/messages/status was polled within the last
@@ -323,12 +328,39 @@ feed needs zero client changes:
   `/api/messages` `after` cursor with bridge-global message ids. The poll
   timer is unref'd and clears itself once the last subscriber disappears, so
   it never leaks.
-- The feed is read-only in v1. Prompts targeted at `feed:main` (selected or
-  explicit `sessionId`) never spawn Codex sessions: the bridge replies with an
-  assistant-style notice explaining the feed is read-only, buffers the same
-  notice into `feed:main` so message/history pollers render it, and keeps the
-  feed selected. This is the least surprising stock-client behavior — the
-  glasses show a normal assistant answer and pushes keep streaming.
+- Prompts from the feed row start a real conversation by default. Because the
+  feed is the landing view, speaking there routes like a sessionless prompt
+  (the selected, last, or most-recently-seen project decides spawn vs
+  follow-up), so the glasses do not need to leave the feed to ask a question.
+  Set `MORPHEUS_G2_FEED_PROMPT_MODE=notice` to restore the v1 read-only reply
+  (an assistant-style "feed is read-only" notice buffered into `feed:main`).
+
+### Start-screen cockpit rows
+
+`GET /api/sessions` (projects view) leads with the most useful rows, all as
+stock-compatible session rows:
+
+- The `Morpheus Feed` row (when omnipresence is enabled).
+- An **attention row** (`attention:main`, title like `! 2 need you`) — present
+  only when the snapshot has attention-worthy sessions (blocked/crashed).
+  Opening its history lists those sessions as assistant lines. It is a summary,
+  not a session: selecting it and then speaking routes like a sessionless
+  prompt, never spawning a bogus `attention:main` session.
+- **Glanceable project rows**: titles carry counts (`name · N live`, plus
+  ` · M blocked` when non-zero), long names are middle-ellipsised to fit, and
+  rows are sorted by recent activity. Beyond a cap the remainder collapse into
+  a single `More projects (N)` row whose history lists them.
+
+### Sessions-poll cache
+
+Stock clients poll `GET /api/sessions` every ~2s and each poll otherwise
+shells out to the `morpheus` CLI (~2s). A short-TTL single-flight cache
+(`MORPHEUS_G2_SESSIONS_CACHE_TTL_MS`, default 4000ms; 0 disables) collapses
+rapid polls into one provider fetch: a fresh entry is served instantly, a
+stale entry is served immediately while exactly one background refresh runs,
+and mutations (select-project, spawn, prompt-created sessions) invalidate it so
+new rows appear at once. The existing `cachedProjects` stale-fallback still
+covers provider outages past the TTL.
 
 ## Hardware Bring-Up
 

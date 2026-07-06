@@ -43,6 +43,22 @@ const DEFAULT_FEED_LIMIT = 20;
 const MAX_FEED_LIMIT = 100;
 const FEED_SESSION_ID = "feed:main";
 const FEED_SESSION_TITLE = "Morpheus Feed";
+// Glanceable feed rendering (576x288 display, ~45-55 chars/line): one headline
+// per push, bounded so a priority marker plus title still reads in a glance.
+const FEED_HEADLINE_MAX = 110;
+// Machine-generated loop bodies ("loop [name] · status=success") are pure
+// noise on the glasses; they stay in the raw /api/feed item for richer clients.
+const FEED_LOOP_STATUS_BODY_RE = /^loop \[.*\] · status=/;
+// Start-screen cockpit rows (PRD §8): a synthetic attention row plus a bounded
+// project list with a "More projects" overflow row. Like feed:main these are
+// plain session rows so stock Even clients need zero changes.
+const ATTENTION_SESSION_ID = "attention:main";
+const MORE_PROJECTS_SESSION_ID = "projects:more";
+const MAX_START_SCREEN_PROJECT_ROWS = 4;
+const PROJECT_ROW_TITLE_MAX = 48;
+const ATTENTION_SESSION_STATES = new Set(["blocked", "crashed"]);
+const DEFAULT_SESSIONS_CACHE_TTL_MS = 4000;
+const MAX_SESSIONS_LISTING_CACHE_ENTRIES = 32;
 // Synthetic session that carries guidance notices (e.g. "open a project
 // first") for stock clients, which reject prompt responses without a session
 // id and render errors as nothing.
@@ -851,6 +867,9 @@ function rememberActiveProjectSession(state, project, session) {
   state.projectActiveSessions.set(activeProjectId, session);
   addSessionAlias(state, session.id, projectSessionId(project));
   addSessionAlias(state, session.id, activeProjectSessionId(project));
+  // A new session row now exists; drop the listing cache so the next
+  // /api/sessions poll shows it instead of serving stale rows for up to TTL.
+  invalidateSessionsListingCache(state, undefined, "session-created");
 }
 
 function navigationEpoch(state) {
@@ -1385,11 +1404,45 @@ function codexThreadToEvenSession(row, fallback = {}) {
   };
 }
 
-function projectRowToEvenSession(project) {
+// Middle-ellipsis: long project names (morpheus-g2-bridge-morpheus-impl) keep
+// their distinguishing head AND tail on the glasses instead of losing the tail
+// to a plain truncation.
+function middleEllipsis(value, max) {
+  const text = String(value || "").replace(/\s+/g, " ").trim();
+  if (text.length <= max) return text;
+  if (max <= 1) return "…";
+  const head = Math.ceil((max - 1) / 2);
+  const tail = Math.floor((max - 1) / 2);
+  return `${text.slice(0, head)}…${text.slice(text.length - tail)}`;
+}
+
+// Glanceable project row title: `name · N live` plus ` · M blocked` only when
+// M > 0. Counts we cannot source from existing payloads are skipped rather
+// than invented; the name part is middle-ellipsized so the full title fits
+// the ~48-char glasses row.
+function projectRowTitle(project, blockedCount = null) {
+  const name = String(project?.name || project?.id || "Morpheus project");
+  const live = Number(project?.usage?.live_sessions);
+  const parts = [];
+  if (Number.isFinite(live)) parts.push(`${live} live`);
+  const blocked = Number(blockedCount);
+  if (Number.isFinite(blocked) && blocked > 0) parts.push(`${blocked} blocked`);
+  const suffix = parts.length ? ` · ${parts.join(" · ")}` : "";
+  const nameBudget = Math.max(8, PROJECT_ROW_TITLE_MAX - suffix.length);
+  return `${middleEllipsis(name, nameBudget)}${suffix}`;
+}
+
+function sortProjectsByLastSeen(projects) {
+  return [...(Array.isArray(projects) ? projects : [])].sort(
+    (left, right) => Number(right?.last_seen_at || 0) - Number(left?.last_seen_at || 0),
+  );
+}
+
+function projectRowToEvenSession(project, { blockedCount = null } = {}) {
   const usage = project.usage || {};
   return {
     id: projectSessionId(project),
-    title: String(project.name || project.id || "Morpheus project").slice(0, 64),
+    title: projectRowTitle(project, blockedCount).slice(0, 64),
     timestamp: new Date(Math.max(0, Number(project.last_seen_at || 0)) * 1000 || Date.now()).toISOString(),
     cwd: String(project.root_path || ""),
     provider: "codex",
@@ -1535,6 +1588,121 @@ function isFeedSessionId(sessionId) {
   return sessionId === FEED_SESSION_ID;
 }
 
+function isAttentionSessionId(sessionId) {
+  return sessionId === ATTENTION_SESSION_ID;
+}
+
+function isMoreProjectsSessionId(sessionId) {
+  return sessionId === MORE_PROJECTS_SESSION_ID;
+}
+
+// Overview rows (attention, more-projects) are glanceable summaries riding the
+// stock session-row contract. Prompts aimed at them route like sessionless
+// prompts (same as the feed row) — they must never be treated as real
+// conversations to resume or spawn under.
+function isOverviewRowSessionId(sessionId) {
+  return isAttentionSessionId(sessionId) || isMoreProjectsSessionId(sessionId);
+}
+
+// Attention-worthy items from what the provider listing already returns:
+// session rows whose Morpheus state is blocked/crashed (surfaced to Even
+// clients as `awaiting`), plus urgent attention cards when the compact
+// snapshot carries them (failed goals etc. — morpheus backend only; the codex
+// app-server listing synthesizes its snapshot without cards).
+function attentionItemsFromListing(sessions, snapshot) {
+  const items = [];
+  const seenRefs = new Set();
+  for (const session of Array.isArray(sessions) ? sessions : []) {
+    const morpheusState = String(session?.morpheus?.state || "");
+    if (!ATTENTION_SESSION_STATES.has(morpheusState) && session?.status !== "awaiting") continue;
+    seenRefs.add(String(session?.id || ""));
+    if (session?.morpheus?.tab_ref) seenRefs.add(String(session.morpheus.tab_ref));
+    const title = String(session?.title || session?.id || "session");
+    items.push({
+      line: shortText(`${title} — ${morpheusState || session?.status || "awaiting"}`, FEED_HEADLINE_MAX),
+    });
+  }
+  for (const card of Array.isArray(snapshot?.cards) ? snapshot.cards : []) {
+    if (String(card?.priority || "") !== "urgent") continue;
+    const ref = String(card?.source?.tab_ref || "");
+    if (ref && seenRefs.has(ref)) continue;
+    items.push({ line: shortText(card?.title, FEED_HEADLINE_MAX) });
+  }
+  return items;
+}
+
+// Per-project blocked counts for the glanceable project titles, from the same
+// listing the attention row consumes (snapshot session rows carry tenant_id).
+function blockedCountsByProject(sessions) {
+  const counts = new Map();
+  for (const session of Array.isArray(sessions) ? sessions : []) {
+    const tenantId = String(session?.morpheus?.tenant_id || "");
+    if (!tenantId) continue;
+    if (!ATTENTION_SESSION_STATES.has(String(session?.morpheus?.state || ""))) continue;
+    counts.set(tenantId, (counts.get(tenantId) || 0) + 1);
+  }
+  return counts;
+}
+
+function attentionSessionRow(config, items) {
+  const count = Array.isArray(items) ? items.length : 0;
+  return {
+    id: ATTENTION_SESSION_ID,
+    title: `! ${count} need${count === 1 ? "s" : ""} you`,
+    timestamp: nowIso(config.clock),
+    cwd: "",
+    // Cosmetic only, same reason as feedSessionRow: the stock Even app drops
+    // rows whose provider differs from its configured agent.
+    provider: "codex",
+    status: "awaiting",
+    allowedActions: ["select_session"],
+    promptBehavior: "overview_read_only",
+    preview: items?.[0]?.line || "",
+    lastMessage: items?.[0]?.line || "",
+    attention: { count },
+  };
+}
+
+// One assistant line per attention item — same overview-only semantics as
+// projectsOverviewHistory: returned in the history response, never buffered.
+function attentionOverviewHistory(items) {
+  if (!items?.length) {
+    return [{ role: "assistant", text: "Nothing needs your attention right now." }];
+  }
+  return items.map((item) => ({ role: "assistant", text: item.line }));
+}
+
+function moreProjectsRow(count, config) {
+  return {
+    id: MORE_PROJECTS_SESSION_ID,
+    title: `More projects (${count})`,
+    timestamp: nowIso(config.clock),
+    cwd: "",
+    provider: "codex",
+    status: "idle",
+    allowedActions: ["select_session"],
+    promptBehavior: "overview_read_only",
+    preview: "Older projects",
+    lastMessage: "Older projects",
+  };
+}
+
+function moreProjectsOverviewHistory(projects) {
+  if (!projects?.length) {
+    return [{ role: "assistant", text: "No more projects." }];
+  }
+  return projects.map((project) => ({
+    role: "assistant",
+    text: shortText(projectRowTitle(project), FEED_HEADLINE_MAX),
+  }));
+}
+
+// The remaining projects behind the "More projects (N)" row: everything after
+// the start screen's project-row cap, in the same last-seen order.
+function moreProjectsBeyondCap(projects) {
+  return sortProjectsByLastSeen(projects).slice(MAX_START_SCREEN_PROJECT_ROWS);
+}
+
 // The omnipresence feed rides the stock Even session-row contract (PRD §3.1):
 // one pseudo-session row that clients open like any conversation.
 function feedSessionRow(state, config) {
@@ -1603,13 +1771,70 @@ function prependFeedRow(feedRow, rows) {
   return [feedRow, ...sessions.filter((row) => row?.id !== FEED_SESSION_ID)];
 }
 
-// One feed item = one assistant line: the title (bounded to the PRD's ~220
-// char one-page push budget), with the body on the next line when present.
-function feedItemMessageText(item) {
-  const title = shortText(item?.title, 220);
-  const body = shortText(item?.body, 1000);
-  if (!title) return body;
-  return body ? `${title}\n${body}` : title;
+// Attention data for the start screen, sourced from the global sessions
+// listing the bridge already fetches (through the sessions-poll cache, so the
+// projects view stays fast). Failures degrade to "no attention row" rather
+// than breaking the project list.
+async function startScreenAttention({ provider, state, config }) {
+  try {
+    const listing = await cachedProviderListing(
+      { state, config },
+      sessionsListingKey("", config.sessionLimit),
+      () => provider.listSessions(config.sessionLimit, { projectId: "" }),
+    );
+    const sessions = Array.isArray(listing) ? listing : listing?.sessions || [];
+    const snapshot = Array.isArray(listing) ? null : listing?.snapshot || null;
+    return {
+      items: attentionItemsFromListing(sessions, snapshot),
+      blockedCounts: blockedCountsByProject(sessions),
+    };
+  } catch (err) {
+    bridgeDebug(config, "attention-listing-failed", { reason: safeJsonError(err) });
+    return { items: [], blockedCounts: null };
+  }
+}
+
+// A body is only worth glasses real estate when it says something a human
+// wrote: non-empty and not the machine-generated loop status line.
+function feedItemMeaningfulBody(item) {
+  const body = String(item?.body || "").trim();
+  if (!body || FEED_LOOP_STATUS_BODY_RE.test(body)) return "";
+  return body;
+}
+
+// One feed item = ONE glanceable headline: `! ` when priority > 0, title
+// truncated to ~110 chars, no body/source/status lines. Streamed messages are
+// headline-only; history may add one meaningful body line (see
+// feedHistoryFromBufferedMessages). The raw item stays intact in GET /api/feed
+// for richer clients (the simulator's expand view reads it from there).
+function feedItemHeadline(item) {
+  const title = shortText(item?.title, FEED_HEADLINE_MAX);
+  const headline = title || shortText(item?.body, FEED_HEADLINE_MAX);
+  if (!headline) return "";
+  return Number(item?.priority || 0) > 0 ? `! ${headline}` : headline;
+}
+
+// The body line shown in history: only when the item had a title (otherwise
+// the body already IS the headline) and the body is meaningful.
+function feedItemHistoryBody(item) {
+  if (!String(item?.title || "").trim()) return "";
+  return feedItemMeaningfulBody(item);
+}
+
+// History rendering for feed:main: the buffered headline, plus the meaningful
+// body as a second line truncated like the headline. Non-feed results (e.g.
+// the read-only notice) pass through unchanged.
+function feedHistoryFromBufferedMessages(state, limit) {
+  const entries = [];
+  for (const message of getMessages(state, FEED_SESSION_ID, 0)) {
+    if (message.type !== "result" || !message.text) continue;
+    const body = shortText(message.feedItem?.body, FEED_HEADLINE_MAX);
+    entries.push({
+      role: "assistant",
+      text: body ? `${message.text}\n${body}` : String(message.text),
+    });
+  }
+  return entries.slice(-Math.max(1, limit));
 }
 
 // Publishes CLI feed items (ascending ids) into the feed:main message buffer
@@ -1630,7 +1855,7 @@ function publishFeedItems(state, config, result, options = {}) {
     const id = Number(item?.id || 0);
     if (!Number.isFinite(id) || id <= Number(state.feedCursor || 0)) continue;
     state.feedCursor = id;
-    const text = feedItemMessageText(item);
+    const text = feedItemHeadline(item);
     if (!text) continue;
     pushMessageForSession(
       state,
@@ -1647,6 +1872,8 @@ function publishFeedItems(state, config, result, options = {}) {
           priority: Number(item?.priority || 0),
           sourceKind: String(item?.source_kind || ""),
           sourceRef: String(item?.source_ref || ""),
+          // History-only body line; streamed presentation stays headline-only.
+          body: feedItemHistoryBody(item),
         },
         at: nowIso(config.clock),
       },
@@ -1899,7 +2126,11 @@ async function projectSessionMenuRows(provider, state, config, project, limit) {
   let result = null;
   let listError = "";
   try {
-    result = await provider.listSessions(limit, { projectId });
+    result = await cachedProviderListing(
+      { state, config },
+      sessionsListingKey(projectId, limit),
+      () => provider.listSessions(limit, { projectId }),
+    );
     const providerSessions = Array.isArray(result) ? result : result.sessions || [];
     state.projectSessionRowsCache.set(cacheKey, {
       sessions: providerSessions,
@@ -2093,6 +2324,94 @@ function cachedProjects(state, limit) {
   };
 }
 
+function sessionsListingKey(projectId, limit) {
+  return `sessions:${projectId || "__global__"}:${Math.max(1, Number(limit) || 1)}`;
+}
+
+// Short-TTL single-flight cache for the provider listings behind /api/sessions
+// (projects list + snapshot sessions + codex threads). Stock clients poll
+// every ~2s and each listing shells out to the morpheus CLI (~2s), so:
+// fresh entries are served instantly; stale entries are served instantly AND
+// refreshed in the background (never more than one refresh per listing in
+// flight — the next poll after the refresh completes serves fresh data);
+// concurrent misses share one fetch. A failed first fetch propagates to the
+// caller's own fallbacks (cachedProjects, projectSessionRowsCache) and leaves
+// no entry behind; a failed refresh keeps the stale value and retries on the
+// next stale poll. TTL 0 disables the cache entirely. The feed poller does
+// not go through listings, so it is unaffected.
+async function cachedProviderListing({ state, config }, key, fetchFn) {
+  const ttlMs = Number(config.sessionsCacheTtlMs || 0);
+  if (ttlMs <= 0) return fetchFn();
+  const cache = state.sessionsListingCache || (state.sessionsListingCache = new Map());
+  const now = config.clock();
+  const entry = cache.get(key);
+  if (entry?.hasValue) {
+    const ageMs = now - entry.at;
+    if (ageMs < ttlMs) {
+      bridgeFlow(config, "sessions-cache", { key, outcome: "hit", ageMs });
+      return entry.value;
+    }
+    if (!entry.inflight) {
+      entry.inflight = (async () => {
+        try {
+          entry.value = await fetchFn();
+          entry.at = config.clock();
+        } catch (err) {
+          bridgeDebug(config, "sessions-cache-refresh-failed", {
+            key,
+            reason: safeJsonError(err),
+          });
+        } finally {
+          entry.inflight = null;
+        }
+      })();
+    }
+    bridgeFlow(config, "sessions-cache", { key, outcome: "stale-refresh", ageMs });
+    return entry.value;
+  }
+  if (entry?.inflight) {
+    bridgeFlow(config, "sessions-cache", { key, outcome: "miss-joined" });
+    return entry.inflight;
+  }
+  bridgeFlow(config, "sessions-cache", { key, outcome: "miss" });
+  const fresh = { value: null, at: 0, hasValue: false, inflight: null };
+  cache.set(key, fresh);
+  evictOldest(cache, {
+    cap: MAX_SESSIONS_LISTING_CACHE_ENTRIES,
+    tsOf: (value) => value?.at || 0,
+    skip: (cacheKey) => cacheKey === key,
+  });
+  fresh.inflight = (async () => {
+    try {
+      const value = await fetchFn();
+      fresh.value = value;
+      fresh.at = config.clock();
+      fresh.hasValue = true;
+      return value;
+    } catch (err) {
+      if (state.sessionsListingCache.get(key) === fresh) {
+        state.sessionsListingCache.delete(key);
+      }
+      throw err;
+    } finally {
+      fresh.inflight = null;
+    }
+  })();
+  return fresh.inflight;
+}
+
+// Mutations that change rows (select-project, spawn, prompt-created sessions)
+// drop the whole listing cache so the next poll fetches fresh rows. In-flight
+// fetches complete into orphaned entries, which is harmless.
+function invalidateSessionsListingCache(state, config, reason = "") {
+  const cache = state.sessionsListingCache;
+  if (!cache?.size) return;
+  cache.clear();
+  // config is optional: some mutation chokepoints (rememberActiveProjectSession)
+  // do not carry it, so only log when a logger is available.
+  if (config?.logger) bridgeFlow(config, "sessions-cache-invalidate", { reason });
+}
+
 async function listProjectsForResponse(provider, state, config, limit, options = {}) {
   const { preferCache = false } = options;
   if (preferCache) {
@@ -2100,7 +2419,9 @@ async function listProjectsForResponse(provider, state, config, limit, options =
     if (cached) return cached;
   }
   try {
-    return cacheProjects(state, await listProjects(provider, limit), config.clock);
+    return await cachedProviderListing({ state, config }, `projects:${limit}`, async () =>
+      cacheProjects(state, await listProjects(provider, limit), config.clock),
+    );
   } catch (err) {
     const message = safeJsonError(err);
     bridgeDebug(config, "project-list-failed", { reason: message });
@@ -2113,9 +2434,26 @@ async function listProjectsForResponse(provider, state, config, limit, options =
   }
 }
 
-function projectsResponseBody(result, state) {
+// Start-screen project rows: newest project first (last_seen_at desc), at
+// most MAX_START_SCREEN_PROJECT_ROWS of them, with a single "More projects
+// (N)" overflow row whose history lists the remainder. `attentionRow` (when
+// provided) leads the project rows; `blockedCounts` feeds the glanceable
+// per-project titles.
+function projectsResponseBody(result, state, options = {}) {
+  const { attentionRow = null, blockedCounts = null, config = null } = options;
+  const sorted = sortProjectsByLastSeen(result.projects || []);
+  const shown = sorted.slice(0, MAX_START_SCREEN_PROJECT_ROWS);
+  const rows = shown.map((project) =>
+    projectRowToEvenSession(project, {
+      blockedCount: blockedCounts?.get(projectKey(project)) ?? null,
+    }),
+  );
+  const remaining = sorted.length - shown.length;
+  if (remaining > 0) {
+    rows.push(moreProjectsRow(remaining, config || { clock: Date.now }));
+  }
   return {
-    sessions: (result.projects || []).map(projectRowToEvenSession),
+    sessions: attentionRow ? [attentionRow, ...rows] : rows,
     projects: result.projects || [],
     selectedProject: state.selectedProject,
     mode: "projects",
@@ -4374,8 +4712,13 @@ async function submitTextToMorpheus(req, res, context) {
   // Prompts sent while a projects-menu row is open ("Back to projects") used
   // to die with selected_session_stale. The menu row is navigation, not a
   // session, so route the text like a sessionless prompt: project context
-  // (selected or last project) decides between spawn and follow-up.
-  let bodySessionId = isProjectMenuSessionId(rawBodySessionId) ? "" : rawBodySessionId;
+  // (selected or last project) decides between spawn and follow-up. The
+  // overview rows (attention:main, projects:more) get the same redirect —
+  // they are summaries, not sessions to resume or spawn under.
+  let bodySessionId =
+    isProjectMenuSessionId(rawBodySessionId) || isOverviewRowSessionId(rawBodySessionId)
+      ? ""
+      : rawBodySessionId;
   if (rawBodySessionId && !bodySessionId) {
     bridgeFlow(config, "prompt-menu-row-redirect", {
       requestId,
@@ -4402,6 +4745,17 @@ async function submitTextToMorpheus(req, res, context) {
     bodySessionId = "";
     bridgeFlow(config, "prompt-feed-route", {
       requestId,
+      projectId: projectKey(projectContextForPrompt(state)) || "",
+    });
+  }
+  // Prompts while an overview row (attention:main, projects:more) is selected
+  // route like sessionless prompts, same as the feed row.
+  let overviewRouted = false;
+  if (!bodySessionId && !feedRouted && isOverviewRowSessionId(state.selectedSession?.id)) {
+    overviewRouted = true;
+    bridgeFlow(config, "prompt-overview-route", {
+      requestId,
+      selectedSessionId: state.selectedSession?.id || "",
       projectId: projectKey(projectContextForPrompt(state)) || "",
     });
   }
@@ -4493,7 +4847,10 @@ async function submitTextToMorpheus(req, res, context) {
   let targetSessionId = "";
   if (bodySessionId) {
     targetSessionId = bodySessionId;
-  } else if (state.selectedSession && !feedRouted) {
+  } else if (state.selectedSession && !feedRouted && !overviewRouted) {
+    // feedRouted/overviewRouted mean the selected row is a synthetic landing
+    // row (feed / attention / more-projects), not a resumable session — route
+    // like a sessionless prompt instead of targeting the synthetic id.
     targetSessionId = state.selectedSession.id;
   }
 
@@ -4711,6 +5068,17 @@ function buildConfigFromEnv(env = process.env, argv = process.argv.slice(2)) {
       min: 250,
       max: 60 * 60_000,
     }),
+    // Short-TTL cache for the provider listings behind /api/sessions so stock
+    // clients polling every ~2s do not each pay a fresh CLI shell-out. 0 = off.
+    sessionsCacheTtlMs: envInt(
+      env,
+      "MORPHEUS_G2_SESSIONS_CACHE_TTL_MS",
+      DEFAULT_SESSIONS_CACHE_TTL_MS,
+      { min: 0, max: 60_000 },
+    ),
+    // "route" (default): prompts from the feed row start a real conversation
+    // in the current project. "notice": read-only reply instead.
+    feedPromptMode: env.MORPHEUS_G2_FEED_PROMPT_MODE === "notice" ? "notice" : "route",
     codexAppServerPort: envInt(
       env,
       "CODEX_APP_SERVER_PORT",
@@ -4923,7 +5291,16 @@ function createBridge(options = {}) {
     try {
       if (wantsProjects) {
         const result = await listProjectsForResponse(provider, state, config, config.projectLimit);
-        const body = projectsResponseBody(result, state);
+        // Start-screen cockpit: feed row (omni), then the attention row when
+        // anything is attention-worthy, then glanceable project rows.
+        const attention = await startScreenAttention({ provider, state, config });
+        const body = projectsResponseBody(result, state, {
+          config,
+          attentionRow: attention.items.length
+            ? attentionSessionRow(config, attention.items)
+            : null,
+          blockedCounts: attention.blockedCounts,
+        });
         body.sessions = prependFeedRow(feedRow, body.sessions);
         res.json(body);
         return;
@@ -5071,7 +5448,7 @@ function createBridge(options = {}) {
       if (wantsProjects) {
         const cached = cachedProjects(state, config.projectLimit);
         if (cached) {
-          const body = projectsResponseBody({ ...cached, error: message }, state);
+          const body = projectsResponseBody({ ...cached, error: message }, state, { config });
           body.sessions = prependFeedRow(feedRow, body.sessions);
           res.json(body);
           return;
@@ -5179,6 +5556,18 @@ function createBridge(options = {}) {
         state: "idle",
         sessionId,
         provider: "morpheus",
+        selectedProject: state.selectedProject,
+        selectedSession: state.selectedSession,
+      });
+      return;
+    }
+    if (isOverviewRowSessionId(sessionId)) {
+      // Overview rows are not real sessions; status polls must not 404 while
+      // one is open on the glasses.
+      res.json({
+        state: "idle",
+        sessionId,
+        provider: provider.name,
         selectedProject: state.selectedProject,
         selectedSession: state.selectedSession,
       });
@@ -5316,7 +5705,7 @@ function createBridge(options = {}) {
         };
       }
       const body = {
-        ...projectsResponseBody(result, state),
+        ...projectsResponseBody(result, state, { config }),
         navigation: navigationPayload(state, {
           action: "navigate_projects",
           requestId,
@@ -5344,6 +5733,9 @@ function createBridge(options = {}) {
       state.selectedProject = resolved.project;
       state.selectedSession = null;
       bumpNavigationEpoch(state);
+      // Opening a project changes which rows the next poll should render;
+      // drop the listing cache so the switch is reflected immediately.
+      invalidateSessionsListingCache(state, config, "select-project");
       const body = {
         ok: true,
         provider: provider.name,
@@ -5410,6 +5802,41 @@ function createBridge(options = {}) {
       };
       rememberReplay(req, state, requestId, 200, body, config.clock, config.requestIdTtlMs);
       audit("select_feed_session", { requestId });
+      res.json(body);
+      return;
+    }
+    if (isOverviewRowSessionId(sessionId)) {
+      // Selecting an overview row (attention, more-projects) must not break
+      // prompts: it is remembered as the selected row so follow-up prompts
+      // route like sessionless prompts, exactly like the feed row.
+      if (isAttentionSessionId(sessionId)) {
+        const attention = await startScreenAttention({ provider, state, config });
+        state.selectedSession = attentionSessionRow(config, attention.items);
+      } else {
+        let remaining = [];
+        try {
+          const listed = await listProjectsForResponse(
+            provider,
+            state,
+            config,
+            config.projectLimit,
+            { preferCache: true },
+          );
+          remaining = moreProjectsBeyondCap(listed.projects || []);
+        } catch {
+          remaining = [];
+        }
+        state.selectedSession = moreProjectsRow(remaining.length, config);
+      }
+      bumpNavigationEpoch(state);
+      const body = {
+        ok: true,
+        provider: provider.name,
+        selectedSession: state.selectedSession,
+        requestId,
+      };
+      rememberReplay(req, state, requestId, 200, body, config.clock, config.requestIdTtlMs);
+      audit("select_overview_session", { requestId, sessionId });
       res.json(body);
       return;
     }
@@ -5641,7 +6068,7 @@ function createBridge(options = {}) {
         };
       }
       res.json({
-        ...projectsResponseBody(result, state),
+        ...projectsResponseBody(result, state, { config }),
         history: projectsOverviewHistory(result.projects, state.lastProject),
         navigation: navigationPayload(state, { action: "navigate_projects" }),
       });
@@ -5664,10 +6091,7 @@ function createBridge(options = {}) {
       bumpNavigationEpoch(state);
       touchFeedSubscription({ provider, state, config });
       audit("select_feed_history_open", {});
-      const feedHistory = historyFromBufferedMessages(
-        getMessages(state, FEED_SESSION_ID, 0),
-        limit,
-      );
+      const feedHistory = feedHistoryFromBufferedMessages(state, limit);
       res.json({
         history: feedHistory.length
           ? feedHistory
@@ -5677,6 +6101,50 @@ function createBridge(options = {}) {
         selectedProject: state.selectedProject,
         selectedSession: state.selectedSession,
         navigation: navigationPayload(state, { action: "select_feed_session" }),
+      });
+      return;
+    }
+    if (isAttentionSessionId(sessionId)) {
+      // Stock clients open the attention row like a conversation: return one
+      // assistant line per attention-worthy session (goal + state). Overview
+      // only — the lines never enter message buffers. Prompts while this row
+      // is selected route like sessionless prompts (see submitTextToMorpheus).
+      const attention = await startScreenAttention({ provider, state, config });
+      state.selectedSession = attentionSessionRow(config, attention.items);
+      bumpNavigationEpoch(state);
+      audit("select_attention_history_open", { items: attention.items.length });
+      res.json({
+        history: attentionOverviewHistory(attention.items),
+        mode: "session",
+        view: "session",
+        selectedProject: state.selectedProject,
+        selectedSession: state.selectedSession,
+        navigation: navigationPayload(state, { action: "select_attention_session" }),
+      });
+      return;
+    }
+    if (isMoreProjectsSessionId(sessionId)) {
+      // Overflow row for the start screen's 4-project cap: history lists the
+      // remaining projects (overview-only), prompts route like sessionless.
+      let result;
+      try {
+        result = await listProjectsForResponse(provider, state, config, config.projectLimit, {
+          preferCache: true,
+        });
+      } catch (err) {
+        result = { projects: [], stale: true, error: safeJsonError(err) };
+      }
+      const remaining = moreProjectsBeyondCap(result.projects || []);
+      state.selectedSession = moreProjectsRow(remaining.length, config);
+      bumpNavigationEpoch(state);
+      audit("select_more_projects_history_open", { remaining: remaining.length });
+      res.json({
+        history: moreProjectsOverviewHistory(remaining),
+        mode: "session",
+        view: "session",
+        selectedProject: state.selectedProject,
+        selectedSession: state.selectedSession,
+        navigation: navigationPayload(state, { action: "select_more_projects" }),
       });
       return;
     }

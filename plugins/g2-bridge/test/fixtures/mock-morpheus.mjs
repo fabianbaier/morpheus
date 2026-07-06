@@ -4,6 +4,17 @@ import fs from "node:fs";
 
 const args = process.argv.slice(2);
 
+// Cache tests count how often the CLI is actually invoked for a subcommand.
+// Each mock run is a fresh process, so persist a line per invocation.
+const COUNT_FILE = process.env.MOCK_MORPHEUS_COUNT_FILE || "";
+if (COUNT_FILE) {
+  try {
+    fs.appendFileSync(COUNT_FILE, `${args[1] || ""}\n`);
+  } catch {
+    // best-effort counting only
+  }
+}
+
 function write(value) {
   process.stdout.write(`${JSON.stringify(value)}\n`);
 }
@@ -74,6 +85,19 @@ if (args[0] !== "remote") {
 if (args[1] === "snapshot") {
   const projectIndex = args.indexOf("--project");
   const project = projectIndex >= 0 ? args[projectIndex + 1] : "";
+  const fileState = readStateFile();
+  if (fileState && Array.isArray(fileState.snapshotSessions)) {
+    // Tests can override the snapshot sessions (e.g. a blocked session for the
+    // attention row) via the state file.
+    write({
+      generated_at: 1_779_999_999,
+      summary: `${fileState.snapshotSessions.length} session(s).`,
+      counts: {},
+      sessions: fileState.snapshotSessions,
+      policy: { raw_terminal_buffers: false },
+    });
+    process.exit(0);
+  }
   if (project === "p_beta") {
     write({
       generated_at: 1_779_999_999,
