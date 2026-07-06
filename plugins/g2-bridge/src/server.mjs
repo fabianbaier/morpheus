@@ -1543,7 +1543,10 @@ function feedSessionRow(state, config) {
     title: FEED_SESSION_TITLE,
     timestamp: nowIso(config.clock),
     cwd: "",
-    provider: "morpheus",
+    // Cosmetic only (our handlers key off the id): the stock Even app is
+    // configured with one agent ("Agent setup: Codex") and drops session
+    // rows whose provider differs — every other rendered row says "codex".
+    provider: "codex",
     status: "idle",
     allowedActions: ["select_session"],
     promptBehavior: "feed_read_only",
