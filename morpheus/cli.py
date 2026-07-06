@@ -2657,6 +2657,20 @@ def _print_omni_status() -> None:
         "judge_command",
         settings["judge_command"] or f"(default: {loops_mod.DEFAULT_COMMAND})",
     )
+    # Phone-push escalation channel. The topic is a capability URL — never
+    # print it in full; the last 6 chars are enough to recognize it.
+    topic = settings["ntfy_topic"]
+    # Show a recognizable tail only when the topic is long enough that the
+    # tail is not the whole secret; short topics show no tail at all.
+    if not topic:
+        topic_display = "[dim]unset — escalation off[/dim]"
+    elif len(topic) > 8:
+        topic_display = f"[green]set[/green] (…{topic[-4:]})"
+    else:
+        topic_display = "[green]set[/green]"
+    table.add_row("ntfy_topic", topic_display)
+    table.add_row("ntfy_server", settings["ntfy_server"])
+    table.add_row("escalate_score", f"{settings['escalate_score']:g}")
     for tpl in omni_templates.template_status():
         label = f"#{tpl['loop_id']} {tpl['status']}" if tpl["present"] else "[yellow]missing — run `morpheus omni init`[/yellow]"
         table.add_row(f"loop {tpl['name']}", label)
@@ -2725,6 +2739,35 @@ def omni_off():
 def omni_status():
     """Show the resolved omnipresence settings."""
     _print_omni_status()
+
+
+@omni_app.command("test-push")
+def omni_test_push():
+    """Send a test phone push through the ntfy escalation channel.
+
+    Escalated headlines reach the glasses because the Even app mirrors phone
+    notifications; this verifies the whole chain end to end.
+    """
+    from morpheus import push as push_mod
+
+    settings = cfg_mod.omni_settings()
+    if not settings["ntfy_topic"]:
+        console.print("[yellow]escalation is off[/yellow] — no ntfy_topic set.")
+        console.print(f"Set ntfy_topic in the omni section of {cfg_mod.CONFIG_PATH}")
+        console.print("(pick a hard-to-guess topic; it acts as a capability URL).")
+        raise typer.Exit(1)
+    ok = push_mod.send_push(
+        "Morpheus test push",
+        "If you can read this, the escalation channel works.",
+        settings=settings,
+    )
+    if ok:
+        console.print("[green]test push sent[/green] — check the ntfy app on your phone.")
+        console.print("[dim]glasses tip: whitelist ntfy in the Even app notification settings.[/dim]")
+    else:
+        console.print("[red]test push failed[/red] — check ntfy_server / ntfy_topic and network.")
+        console.print("[dim]details: see the morpheus.push log warning.[/dim]")
+        raise typer.Exit(1)
 
 
 @app.command("activity")

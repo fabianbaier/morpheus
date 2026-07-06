@@ -322,6 +322,79 @@ class OmniToggleTest(unittest.TestCase):
         self.assertIn("push_per_hour", result.output)
 
 
+class OmniEscalationCliTest(unittest.TestCase):
+    """`omni status` masks the ntfy topic (a capability URL) and
+    `omni test-push` exercises the escalation channel end to end."""
+
+    def test_status_masks_topic_and_shows_server_and_score(self):
+        topic = "supersecrettopic123"
+        with isolated_omni_runtime() as root:
+            (root / "config.toml").write_text(
+                f'[omni]\nntfy_topic = "{topic}"\n'
+                'ntfy_server = "https://push.example.com"\n'
+                "escalate_score = 0.9\n"
+            )
+            result = runner.invoke(cli.app, ["omni", "status"])
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertNotIn(topic, result.output)       # never the full topic
+        self.assertIn(topic[-4:], result.output)     # …but recognizable
+        self.assertIn("set", result.output)
+        self.assertIn("push.example.com", result.output)
+        self.assertIn("escalate_score", result.output)
+        self.assertIn("0.9", result.output)
+
+    def test_status_does_not_leak_a_short_topic(self):
+        topic = "short1"  # <= 8 chars: no tail shown at all
+        with isolated_omni_runtime() as root:
+            (root / "config.toml").write_text(f'[omni]\nntfy_topic = "{topic}"\n')
+            result = runner.invoke(cli.app, ["omni", "status"])
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertNotIn(topic, result.output)
+        self.assertIn("set", result.output)
+
+    def test_status_reports_unset_topic_as_escalation_off(self):
+        with isolated_omni_runtime():
+            result = runner.invoke(cli.app, ["omni", "status"])
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertIn("unset", result.output)
+        self.assertIn("ntfy_topic", result.output)
+
+    def test_test_push_success_hints_at_ntfy_and_even_whitelist(self):
+        with isolated_omni_runtime() as root:
+            (root / "config.toml").write_text('[omni]\nntfy_topic = "t-abc"\n')
+            with patch("morpheus.push.send_push", return_value=True) as send:
+                result = runner.invoke(cli.app, ["omni", "test-push"])
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        send.assert_called_once()
+        self.assertEqual(send.call_args.args[0], "Morpheus test push")
+        self.assertEqual(send.call_args.kwargs["settings"]["ntfy_topic"], "t-abc")
+        self.assertIn("ntfy app", result.output)
+        self.assertIn("Even app", result.output)
+        self.assertIn("whitelist", result.output)
+
+    def test_test_push_failure_exits_nonzero(self):
+        with isolated_omni_runtime() as root:
+            (root / "config.toml").write_text('[omni]\nntfy_topic = "t-abc"\n')
+            with patch("morpheus.push.send_push", return_value=False) as send:
+                result = runner.invoke(cli.app, ["omni", "test-push"])
+
+        self.assertEqual(result.exit_code, 1)
+        send.assert_called_once()
+        self.assertIn("failed", result.output)
+
+    def test_test_push_without_topic_exits_without_sending(self):
+        with isolated_omni_runtime():
+            with patch("morpheus.push.send_push", return_value=True) as send:
+                result = runner.invoke(cli.app, ["omni", "test-push"])
+
+        self.assertEqual(result.exit_code, 1)
+        send.assert_not_called()
+        self.assertIn("ntfy_topic", result.output)
+
+
 class MemoryCliTest(unittest.TestCase):
     def test_add_show_log_roundtrip(self):
         with isolated_omni_runtime():

@@ -107,6 +107,12 @@ DEFAULTS: dict[str, Any] = {
         "quiet_hours": "",           # "HH:MM-HH:MM"; empty = none (the default)
         "feed": "main",              # which feed omnipresence delivers
         "judge_command": "",         # empty = default `codex exec` (wave 2)
+        # Phone-push escalation (PRD §3.1 notification mirroring): high-priority
+        # feed pushes ALSO fire a phone push via ntfy so the Even app mirrors
+        # them onto the glasses even when the display sleeps.
+        "ntfy_topic": "",            # empty (default) = escalation off
+        "ntfy_server": "https://ntfy.sh",
+        "escalate_score": 0.85,      # judge score at which a posted item escalates
     },
 }
 
@@ -240,6 +246,19 @@ quiet_hours = ""
 feed = "main"
 # Judge runner command. Empty = default `codex exec`; e.g. "claude -p".
 judge_command = ""
+# ── phone-push escalation (notification mirroring) ──
+# High-priority feed pushes ALSO fire a phone push via ntfy, so the Even app
+# mirrors them onto the glasses even when the display sleeps.
+# PRIVACY: escalated headlines leave the tailnet via the ntfy server and the
+# Apple/Google push infrastructure — reserve escalation for genuinely urgent
+# items, or self-host ntfy and point ntfy_server at your own instance.
+# The topic is a capability URL: anyone who knows it can read your pushes.
+# Empty topic (the default) = escalation off.
+#ntfy_topic = ""
+#ntfy_server = "https://ntfy.sh"
+# Relevance-judge score (0-1) at which a posted item ALSO escalates to a
+# phone push (clamped to [0, 1]).
+#escalate_score = 0.85
 """
     CONFIG_PATH.write_text(text)
 
@@ -343,6 +362,8 @@ def omni_settings(
     threshold = _as_float(omni_cfg.get("threshold"), defaults["threshold"])
     threshold = min(1.0, max(0.0, threshold))
     push_per_hour = max(0, _as_int(omni_cfg.get("push_per_hour"), defaults["push_per_hour"]))
+    escalate_score = _as_float(omni_cfg.get("escalate_score"), defaults["escalate_score"])
+    escalate_score = min(1.0, max(0.0, escalate_score))
     return {
         "enabled": enabled,
         "threshold": threshold,
@@ -350,6 +371,12 @@ def omni_settings(
         "quiet_hours": parse_quiet_hours(omni_cfg.get("quiet_hours", defaults["quiet_hours"])),
         "feed": str(omni_cfg.get("feed") or defaults["feed"]),
         "judge_command": str(omni_cfg.get("judge_command") or defaults["judge_command"]),
+        # Phone-push escalation channel (PRD §3.1 notification mirroring).
+        # Empty topic = escalation off; the topic is a capability URL, so
+        # consumers must never print it in full.
+        "ntfy_topic": str(omni_cfg.get("ntfy_topic") or defaults["ntfy_topic"]).strip(),
+        "ntfy_server": str(omni_cfg.get("ntfy_server") or "").strip() or defaults["ntfy_server"],
+        "escalate_score": escalate_score,
     }
 
 

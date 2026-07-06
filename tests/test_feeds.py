@@ -245,7 +245,9 @@ class RoutingTest(unittest.TestCase):
 def _omni(**over):
     """A resolved [omni] settings dict like config.omni_settings() returns."""
     base = {"enabled": True, "threshold": 0.7, "push_per_hour": 6,
-            "quiet_hours": None, "feed": "main", "judge_command": ""}
+            "quiet_hours": None, "feed": "main", "judge_command": "",
+            "ntfy_topic": "", "ntfy_server": "https://ntfy.sh",
+            "escalate_score": 0.85}
     base.update(over)
     return base
 
@@ -422,6 +424,33 @@ class OnThresholdRoutingTest(unittest.TestCase):
                 self.assertIsNone(item_id)
                 judge.assert_not_called()
 
+    def test_no_find_meta_summaries_skip_judge(self):
+        # Agents sometimes narrate the sentinel ("no 'location' signals
+        # yet.") — a healthy meta-summary that must not burn a judge call
+        # every 5 minutes.
+        with _TempDB():
+            lp = self._loop()
+            feeds.set_rule("loop", str(lp.id), policy="on_threshold")
+            for summary in ("no 'location' signals yet.",
+                            "No new finds this run",
+                            "NO relevant results nearby",
+                            "no location updates"):
+                item_id, judge = self._route(lp, summary)
+                self.assertIsNone(item_id, summary)
+                judge.assert_not_called()
+            self.assertEqual(feeds.recent(), [])
+
+    def test_no_find_matcher_leaves_real_headlines_alone(self):
+        with _TempDB():
+            lp = self._loop()
+            feeds.set_rule("loop", str(lp.id), policy="on_threshold")
+            for summary in ("Nothing beats this café: 2-for-1 espresso today",
+                            "Noodle bar around the corner has signals night",
+                            "North exit closed: use the west entrance"):
+                item_id, judge = self._route(lp, summary)
+                self.assertIsNotNone(item_id, summary)
+                judge.assert_called()
+
     def test_judge_failure_fails_closed_and_logs_once_per_streak(self):
         with _TempDB():
             lp = self._loop()
@@ -471,6 +500,110 @@ class OnThresholdRoutingTest(unittest.TestCase):
             joined = "\n".join(kwargs["context_lines"])
             self.assertIn("location", joined)
             self.assertIn("52.52", joined)
+
+
+class EscalationTest(unittest.TestCase):
+    """Phone-push escalation (PRD §3.1): a successful judged post ALSO fires
+    an ntfy push when the score clears [omni].escalate_score (or the posted
+    priority is > 0); escalation never blocks or alters the feed post."""
+
+    def setUp(self):
+        feeds._judge_failing_sources.clear()
+
+    def _loop(self):
+        return db.create_loop(name="omni-location", prompt="scout",
+                              interval_seconds=300, command="echo")
+
+    def _route(self, lp, summary, *, settings, score=0.9, status="ok",
+               send=None):
+        judge = MagicMock(return_value=JudgeResult(score=score, rationale="r"))
+        send = send if send is not None else MagicMock(return_value=True)
+        with patch.object(feeds, "_omni_settings", return_value=settings), \
+                patch.object(feeds, "_judge_item", judge), \
+                patch("morpheus.push.send_push", send):
+            item_id = feeds.route_loop_run(lp, _run(lp, status=status,
+                                                    summary=summary))
+        return item_id, send
+
+    def test_score_at_or_above_escalate_score_fires_push_with_title(self):
+        with _TempDB():
+            lp = self._loop()
+            feeds.set_rule("loop", str(lp.id), policy="on_threshold")
+            item_id, send = self._route(
+                lp, "Beans on promo", score=0.9,
+                settings=_omni(ntfy_topic="t-abc", escalate_score=0.85))
+            self.assertIsNotNone(item_id)
+            send.assert_called_once()
+            self.assertEqual(send.call_args.args[0], "Beans on promo")
+            self.assertEqual(
+                send.call_args.kwargs["settings"]["ntfy_topic"], "t-abc")
+
+    def test_score_below_escalate_score_posts_without_push(self):
+        with _TempDB():
+            lp = self._loop()
+            feeds.set_rule("loop", str(lp.id), policy="on_threshold")
+            item_id, send = self._route(
+                lp, "Mild find", score=0.75,  # clears threshold 0.7 only
+                settings=_omni(ntfy_topic="t-abc", escalate_score=0.85))
+            self.assertIsNotNone(item_id)  # still posted to the feed
+            send.assert_not_called()
+
+    def test_priority_positive_judged_item_escalates_via_rule_helper(self):
+        # Judged posts carry priority 0 today; the rule still covers
+        # priority > 0 items should the judged path ever set one.
+        settings = _omni(ntfy_topic="t-abc", escalate_score=0.85)
+        send = MagicMock(return_value=True)
+        with patch("morpheus.push.send_push", send):
+            feeds._escalate_if_urgent("urgent", 0.2, 1, settings)
+        send.assert_called_once()
+        self.assertEqual(send.call_args.args[0], "urgent")
+
+    def test_low_score_zero_priority_does_not_escalate(self):
+        send = MagicMock(return_value=True)
+        with patch("morpheus.push.send_push", send):
+            feeds._escalate_if_urgent(
+                "meh", 0.2, 0, _omni(ntfy_topic="t-abc", escalate_score=0.85))
+        send.assert_not_called()
+
+    def test_empty_topic_never_calls_sender(self):
+        with _TempDB():
+            lp = self._loop()
+            feeds.set_rule("loop", str(lp.id), policy="on_threshold")
+            item_id, send = self._route(
+                lp, "Great find", score=0.99,
+                settings=_omni(ntfy_topic="", escalate_score=0.85))
+            self.assertIsNotNone(item_id)  # feed post unaffected
+            send.assert_not_called()
+
+    def test_send_failure_does_not_affect_the_feed_post(self):
+        with _TempDB():
+            lp = self._loop()
+            feeds.set_rule("loop", str(lp.id), policy="on_threshold")
+            for send in (MagicMock(return_value=False),
+                         MagicMock(side_effect=RuntimeError("boom"))):
+                feeds.set_rule("loop", str(lp.id), policy="on_threshold")
+                item_id, _ = self._route(
+                    lp, f"Find {id(send)}", score=0.95,
+                    settings=_omni(ntfy_topic="t-abc"), send=send)
+                self.assertIsNotNone(item_id)
+                send.assert_called_once()
+            self.assertEqual(len(feeds.recent()), 2)
+
+    def test_failure_force_posts_never_escalate(self):
+        # Deliberate: a flapping watcher force-posting priority-1 failures
+        # must not spam the phone; escalation is judged-path only.
+        with _TempDB():
+            lp = self._loop()
+            feeds.set_rule("loop", str(lp.id), policy="on_match",
+                           pattern="never-xyz")
+            send = MagicMock(return_value=True)
+            with patch.object(feeds, "_omni_settings",
+                              return_value=_omni(ntfy_topic="t-abc")), \
+                    patch("morpheus.push.send_push", send):
+                feeds.route_loop_run(lp, _run(lp, status="error",
+                                              summary="loop crashed"))
+            self.assertEqual(feeds.recent()[0].priority, 1)  # posted as before
+            send.assert_not_called()
 
 
 class QuietHoursHelperTest(unittest.TestCase):

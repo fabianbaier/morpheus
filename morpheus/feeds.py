@@ -35,7 +35,7 @@ import logging
 import re
 import time
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any, Mapping, Optional
 
 from morpheus import db as _db
 from morpheus.db import _connect
@@ -51,6 +51,12 @@ DEDUPE_WINDOW_SECONDS = 6 * 3600.0
 # A judged loop that found nothing prints exactly this (see omni_templates);
 # it is a healthy no-op, never a candidate — skipping it keeps the run free.
 NOTHING_SENTINEL = "NOTHING"
+# Agents sometimes narrate the sentinel instead of printing it ("no
+# 'location' signals yet.") — a meta-summary, not a find. Judging it every
+# 5 minutes wastes tokens, so summaries that *start* with a no-X-yet shape
+# are treated like NOTHING and skipped before the judge.
+_NO_FIND_RE = re.compile(
+    r"^no\b.{0,40}\b(signals?|finds?|updates?|results?)\b", re.IGNORECASE)
 # Push acknowledgements from a display client (G2 glasses tap/double-tap):
 # "expanded" is a positive relevance signal, "dismissed" a negative one. The
 # omnipresence memory-updater loop mines these via recent_acks().
@@ -441,6 +447,10 @@ def route_loop_run(loop, run) -> Optional[int]:
             posted = item_id if item_id is not None else posted
             continue
         if failed or evaluate(rule, summary=summary, failed=failed):
+            # Deliberately NO phone escalation on this path — including the
+            # priority-1 failure force-posts: a flapping watcher retrying
+            # every minute would spam the phone. Escalation is judged-path
+            # only (see _escalate_if_urgent).
             posted = post(
                 summary,
                 body=f"loop [{loop.name}] · status={run.status}",
@@ -528,7 +538,8 @@ def _route_on_threshold(rule: FeedRule, loop, run, summary: str,
         # visible in `morpheus loops list` / notes like any other run.
         return None
     candidate = _normalize_title(summary)
-    if not candidate or candidate.upper() == NOTHING_SENTINEL:
+    if (not candidate or candidate.upper() == NOTHING_SENTINEL
+            or _NO_FIND_RE.match(candidate)):
         return None  # healthy "nothing relevant" run — free by design
     settings = _omni_settings()
     if not settings.get("enabled"):
@@ -576,12 +587,13 @@ def _route_on_threshold(rule: FeedRule, loop, run, summary: str,
     threshold = rule.threshold if rule.threshold > 0 else float(settings.get("threshold") or 0.0)
     if verdict.score < threshold:
         return None
-    return post(
+    posted_priority = 0
+    item_id = post(
         candidate,
         body=body,
         source_kind="loop",
         source_ref=str(loop.id),
-        priority=0,
+        priority=posted_priority,
         feed=rule.feed,
         metadata={
             "loop_id": loop.id,
@@ -590,3 +602,35 @@ def _route_on_threshold(rule: FeedRule, loop, run, summary: str,
             "judge": {"score": verdict.score, "rationale": verdict.rationale},
         },
     )
+    # Escalation strictly FOLLOWS the successful feed post and never blocks
+    # it: a failed phone push changes nothing about the item above.
+    _escalate_if_urgent(candidate, verdict.score, posted_priority, settings)
+    return item_id
+
+
+def _escalate_if_urgent(title: str, score: float, priority: int,
+                        settings: Mapping) -> None:
+    """Phone-push escalation (PRD §3.1 notification mirroring).
+
+    THE RULE, deliberately conservative: a phone push fires ONLY after a
+    successful judged (on_threshold) feed post, and only when the judge
+    score clears ``[omni].escalate_score`` OR the posted item carries
+    priority > 0. Nothing else escalates — in particular the classic-policy
+    failure force-posts in route_loop_run never reach the phone, because a
+    flapping watcher retrying every minute would spam push notifications.
+    Send failures are swallowed inside push.send_push (and belt-and-braces
+    here), so escalation can never break routing.
+    """
+    if not str(settings.get("ntfy_topic") or "").strip():
+        return  # escalation off — do not even import/call the sender
+    try:
+        escalate_score = min(1.0, max(0.0, float(settings.get("escalate_score"))))
+    except (TypeError, ValueError):
+        return  # unset/garbage escalate_score: fail closed, no escalation
+    if score < escalate_score and priority <= 0:
+        return
+    from morpheus import push
+    try:
+        push.send_push(title, settings=settings)
+    except Exception:  # pragma: no cover — send_push never raises by contract
+        _log.debug("escalation send_push raised; ignored", exc_info=True)
