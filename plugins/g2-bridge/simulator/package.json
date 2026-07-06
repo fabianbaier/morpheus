@@ -9,7 +9,8 @@
     "build": "vite build",
     "preview": "vite preview --host 127.0.0.1 --port 5173",
     "even": "evenhub-simulator \"http://127.0.0.1:5173/?even=1\" --automation-port 9898",
-    "pack": "vite build && evenhub pack app.json dist -o morpheus-g2-simulator.ehpk"
+    "manifest": "node scripts/build-manifest.mjs",
+    "pack": "node scripts/build-manifest.mjs && vite build && evenhub pack app.build.json dist -o morpheus-g2.ehpk"
   },
   "dependencies": {
     "@evenrealities/even_hub_sdk": "^0.0.11"
