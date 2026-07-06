@@ -4398,16 +4398,6 @@ async function submitTextToMorpheus(req, res, context) {
       respondFeedPromptReadOnly({ req, res, context, requestId, text: textResult.text });
       return;
     }
-    if (!projectContextForPrompt(state)) {
-      const listed = await listProjectsForResponse(
-        provider,
-        state,
-        config,
-        config.projectLimit,
-      ).catch(() => null);
-      const first = listed?.projects?.[0];
-      if (first) rememberProjectContext(state, first);
-    }
     feedRouted = true;
     bodySessionId = "";
     bridgeFlow(config, "prompt-feed-route", {
@@ -4508,7 +4498,28 @@ async function submitTextToMorpheus(req, res, context) {
   }
 
   if (!targetSessionId) {
-    const promptProject = projectContextForPrompt(state);
+    let promptProject = projectContextForPrompt(state);
+    if (!promptProject) {
+      // Fresh bridge state (restart) or a client entry screen that skips
+      // project selection: default to the most recently seen project rather
+      // than a notice the stock client cannot render. Notice only remains
+      // for the no-projects-at-all case.
+      const listed = await listProjectsForResponse(
+        provider,
+        state,
+        config,
+        config.projectLimit,
+      ).catch(() => null);
+      const first = listed?.projects?.[0];
+      if (first) {
+        rememberProjectContext(state, first);
+        promptProject = projectContextForPrompt(state);
+        bridgeFlow(config, "prompt-default-project", {
+          requestId,
+          projectId: projectKey(promptProject) || "",
+        });
+      }
+    }
     if (!promptProject) {
       // Stock Even clients render nothing for error-shaped responses, so a
       // bare 409 leaves the glasses stuck on an empty "Waiting input" view

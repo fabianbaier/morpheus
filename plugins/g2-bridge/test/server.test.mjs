@@ -704,32 +704,50 @@ test("spawns a session for prompt submission without an existing selected sessio
   assert.match(resultMessage.text, /current directory tree/);
 });
 
-test("prompt without project context answers with a rendered notice instead of a bare 409", async (t) => {
+test("prompt without project context routes to the most recent project", async (t) => {
   const { baseUrl } = await withBridge(t);
   const res = await request(baseUrl, "/api/prompt", {
     body: { text: "follow up please", clientRequestId: "prompt-followup-0001" },
   });
+  // Fresh bridge state (e.g. after a restart) must not dead-end in a notice
+  // the stock client cannot render: default to the most recent project.
+  assert.ok(res.status === 200 || res.status === 202, `status ${res.status}`);
+  const body = await res.json();
+  assert.notEqual(body.code, "project_not_selected");
+  assert.ok(body.sessionId);
+});
+
+test("projectless prompt falls back to a rendered notice only when no projects exist", async (t) => {
+  const statePath = path.join(
+    tmpdir(),
+    `morpheus-g2-noproj-${process.pid}.json`,
+  );
+  writeFeedStateFile(statePath, {
+    omni: { enabled: false },
+    items: [],
+    acks: [],
+    contexts: [],
+    projects: [],
+  });
+  process.env.MOCK_MORPHEUS_STATE_FILE = statePath;
+  t.after(() => {
+    delete process.env.MOCK_MORPHEUS_STATE_FILE;
+    fs.rmSync(statePath, { force: true });
+  });
+  const { baseUrl } = await withBridge(t);
+  const res = await request(baseUrl, "/api/prompt", {
+    body: { text: "hello", clientRequestId: "prompt-followup-0002" },
+  });
   // Stock Even clients render nothing for error responses, so the bridge
-  // must answer 200 with the guidance in the redundant answer fields.
+  // answers 200 with the guidance in the redundant answer fields and a
+  // synthetic session id they can subscribe to.
   assert.equal(res.status, 200);
   const body = await res.json();
   assert.equal(body.code, "project_not_selected");
   assert.equal(body.state, "idle");
   assert.match(body.text, /open a project/i);
-  assert.equal(body.answer, body.text);
+  assert.equal(body.sessionId, "notice:select-project");
   assert.equal(body.history[0].role, "assistant");
-});
-
-test("projectless prompt notice names cached projects when known", async (t) => {
-  const { baseUrl } = await withBridge(t);
-  await request(baseUrl, "/api/projects");
-  const res = await request(baseUrl, "/api/prompt", {
-    body: { text: "hello", clientRequestId: "prompt-followup-0002" },
-  });
-  assert.equal(res.status, 200);
-  const body = await res.json();
-  assert.match(body.text, /alpha/i);
-  assert.match(body.text, /open a project/i);
 });
 
 test("spawns in remembered project when Add session prompt omits sessionId", async (t) => {

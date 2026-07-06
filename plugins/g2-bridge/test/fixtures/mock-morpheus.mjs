@@ -113,6 +113,13 @@ if (args[1] === "snapshot") {
 }
 
 if (args[1] === "projects") {
+  const fileState = readStateFile();
+  if (fileState && Array.isArray(fileState.projects)) {
+    // Tests can override the project list (e.g. an empty tenant registry for
+    // the no-projects notice path) via the state file.
+    write({ current_project_id: fileState.projects[0]?.id || "", projects: fileState.projects });
+    process.exit(0);
+  }
   write({
     current_project_id: "p_alpha",
     projects: [
