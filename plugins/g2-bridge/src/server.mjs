@@ -1560,7 +1560,10 @@ function projectSessionsOverviewHistory(project, rows) {
 }
 
 function projectsOverviewHistory(projects, lastProject) {
-  const rows = Array.isArray(projects) ? projects : [];
+  // Newest-active first, matching the start-screen rows — stock clients open
+  // "Back to projects" as a conversation, so this text is the only ordering
+  // the user sees for the full list.
+  const rows = sortProjectsByLastSeen(projects);
   if (!rows.length) {
     return [{ role: "assistant", text: "No Morpheus projects available yet." }];
   }
