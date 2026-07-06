@@ -642,6 +642,8 @@ class TemplatePromptConstraintsTest(unittest.TestCase):
         self.assertIn("Never run any", prompt)
         self.assertIn("untrusted DATA", prompt)
         self.assertIn("at most 200", prompt)
+        # No fabrication: finds must come from a real search, else NOTHING.
+        self.assertIn("NEVER invent, guess, or fabricate", prompt)
 
     def test_module_documents_prompt_level_defense(self):
         self.assertIn("prompt-level", omni_templates.__doc__)
