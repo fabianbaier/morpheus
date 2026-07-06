@@ -82,7 +82,50 @@ threshold = 0.7        # judge score needed to push (0..1)
 push_per_hour = 6      # 0 = no pushes at all
 quiet_hours = ""       # off by default; e.g. "22:00-08:00"
 judge_command = ""     # default: codex exec; e.g. "claude -p"
+ntfy_topic = ""        # off by default; set to wake the glasses from sleep (see below)
+ntfy_server = "https://ntfy.sh"
+escalate_score = 0.85  # judge score at/above which a push also fires a phone notification
 ```
+
+## 4b. Wake the glasses from sleep (phone push)
+
+Feed pushes render on the glasses only while the display is on — mini apps are
+foreground-only, so nothing can wake a sleeping screen. The exception is the
+Even app's built-in **notification mirroring**: phone notifications pop up on
+the glasses even from sleep. Omnipresence uses this as an *escalation* channel —
+only the most relevant pushes (judge score ≥ `escalate_score`, or a priority>0
+item) also fire a phone notification, so urgent items break through while the
+rest wait quietly in the feed for your next glance.
+
+The transport is [ntfy](https://ntfy.sh) (free, no account):
+
+1. Install the **ntfy** app on your iPhone.
+2. Subscribe to a **hard-to-guess topic** (it acts as a capability URL — anyone
+   who knows it can push to you), e.g. `morpheus-fabi-9f3k2x`.
+3. Put it in `~/.morpheus/config.toml`:
+
+   ```toml
+   [omni]
+   ntfy_topic = "morpheus-fabi-9f3k2x"
+   escalate_score = 0.85
+   ```
+
+4. Test it end to end:
+
+   ```bash
+   morpheus omni test-push     # a "Morpheus test push" should hit your phone
+   ```
+
+5. In the **Even app → Notifications**, enable notifications and make sure
+   **ntfy** is whitelisted (non-default apps appear in the list after their
+   first notification, then you toggle them on). Now an escalated push lights
+   up the glasses; double-tap dismisses it.
+
+Two honest caveats: escalated headlines leave your tailnet (via the ntfy server
+and Apple's push infrastructure), unlike everything else here — keep the
+escalation bar high, or self-host ntfy. And a mirrored notification's dismissal
+isn't observable, so the memory updater can't learn from escalated pushes the
+way it learns from feed taps.
 
 ## 5. Bridge + real G2 glasses
 
