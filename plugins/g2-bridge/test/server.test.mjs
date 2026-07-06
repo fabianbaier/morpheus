@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
-import { createBridge, createMorpheusProvider, runJsonCommand, startBridge } from "../src/server.mjs";
+import { createBridge, createMorpheusProvider, formatProseForGlasses, runJsonCommand, startBridge } from "../src/server.mjs";
 import { G2BridgeClient } from "../simulator/src/bridge-client.js";
 
 const TOKEN = "test-token-123456";
@@ -5348,4 +5348,67 @@ test("prompting while an attention row is selected routes sessionless, not to th
   assert.ok(prompt.status === 200 || prompt.status === 202, `status ${prompt.status}`);
   const promptBody = await prompt.json();
   assert.notEqual(promptBody.sessionId, "attention:main");
+});
+
+test("formatProseForGlasses strips markdown while preserving breaks", () => {
+  const out = formatProseForGlasses(
+    "### Heading\n\n**bold** and `code` and [label](http://x)\n\n- one\n- two\n\n\n\ntail",
+  );
+  assert.doesNotMatch(out, /\*\*|`|\]\(|^#{1,6}\s/m);
+  assert.match(out, /Heading/);
+  assert.match(out, /bold and code and label/);
+  assert.match(out, /^• one$/m);
+  assert.match(out, /^• two$/m);
+  // Paragraph breaks kept; 3+ blank lines collapsed to a single gap.
+  assert.ok(out.includes("\n\n"));
+  assert.doesNotMatch(out, /\n{3,}/);
+  // Content is never dropped or shortened.
+  assert.match(out, /tail$/);
+  // Math and snake_case survive the italic pass.
+  assert.equal(formatProseForGlasses("a * b and snake_case_name"), "a * b and snake_case_name");
+});
+
+test("emit reformats codex result prose for the glasses", async (t) => {
+  let capturedEmit = null;
+  const providerFactory = (emit) => {
+    capturedEmit = emit;
+    return {
+      async getInfo() { return { provider: "codex", model: "Codex", version: "t" }; },
+      async listSessions() { return []; },
+      getStatus() { return null; },
+    };
+  };
+  const { baseUrl } = await withBridge(t, {
+    agentBackend: "codex_app_server",
+    createCodexAgentProvider: providerFactory,
+    mirrorCodexTui: false,
+  });
+  capturedEmit("thread-md", { type: "result", success: true, text: "**Done.**\n\n- a\n- b" });
+  const messages = await request(baseUrl, "/api/messages?sessionId=thread-md");
+  const body = await messages.json();
+  const result = body.messages.find((m) => m.type === "result");
+  assert.doesNotMatch(result.text, /\*\*/);
+  assert.match(result.text, /^• a$/m);
+});
+
+test("MORPHEUS_G2_FORMAT_PROSE=0 passes raw markdown through", async (t) => {
+  let capturedEmit = null;
+  const providerFactory = (emit) => {
+    capturedEmit = emit;
+    return {
+      async getInfo() { return { provider: "codex", model: "Codex", version: "t" }; },
+      async listSessions() { return []; },
+      getStatus() { return null; },
+    };
+  };
+  const { baseUrl } = await withBridge(t, {
+    agentBackend: "codex_app_server",
+    createCodexAgentProvider: providerFactory,
+    mirrorCodexTui: false,
+    formatProse: false,
+  });
+  capturedEmit("thread-raw", { type: "result", success: true, text: "**Done.**" });
+  const messages = await request(baseUrl, "/api/messages?sessionId=thread-raw");
+  const body = await messages.json();
+  assert.match(body.messages.find((m) => m.type === "result").text, /\*\*Done\.\*\*/);
 });

@@ -1997,6 +1997,37 @@ function shortText(value, max = 240) {
   return text.length > max ? `${text.slice(0, Math.max(0, max - 1)).trim()}...` : text;
 }
 
+// The G2 renders plain text with no markdown: raw `**`, `#`, backticks, and
+// link syntax show as literal noise, and dense prose is hard to scan. Convert
+// assistant answers to glasses-legible plain text while PRESERVING line and
+// paragraph breaks so paragraphs stay separated (the terminal's readability).
+// Structure only — never shortens or drops content.
+function formatProseForGlasses(value) {
+  let s = String(value == null ? "" : value).replace(/\r\n/g, "\n");
+  // Fenced code blocks: keep the code, drop the ``` / ~~~ fence + language.
+  s = s.replace(/^[ \t]{0,3}(?:```|~~~)[^\n]*\n?/gm, "");
+  // Headings: drop the leading #'s, keep the heading text on its own line.
+  s = s.replace(/^[ \t]{0,3}#{1,6}[ \t]+/gm, "");
+  // Blockquote markers.
+  s = s.replace(/^[ \t]{0,3}>[ \t]?/gm, "");
+  // Bullets (-, *, +) become • ; numbered lists (1.) are left intact.
+  s = s.replace(/^([ \t]*)[-*+][ \t]+/gm, "$1• ");
+  // Images then links: ![alt](url) -> alt ; [label](url) -> label.
+  s = s.replace(/!?\[([^\]]*)\]\([^)]*\)/g, "$1");
+  // Emphasis markers (bold before italic so ** is consumed first).
+  s = s.replace(/\*\*([^*\n]+)\*\*/g, "$1");
+  s = s.replace(/__([^_\n]+)__/g, "$1");
+  s = s.replace(/~~([^~\n]+)~~/g, "$1");
+  // Single-marker italics, guarded to avoid math (a * b) and snake_case.
+  s = s.replace(/(^|[^*\w])\*(?!\s)([^*\n]+?)\*(?!\*)/g, "$1$2");
+  s = s.replace(/(^|[^_\w])_(?!\s)([^_\n]+?)_(?![\w_])/g, "$1$2");
+  // Inline code.
+  s = s.replace(/`([^`\n]+)`/g, "$1");
+  // Tidy: strip trailing spaces per line, collapse 3+ blank lines to one gap.
+  s = s.replace(/[ \t]+$/gm, "").replace(/\n{3,}/g, "\n\n");
+  return s.trim();
+}
+
 function latestHistoryText(history, role) {
   for (let idx = history.length - 1; idx >= 0; idx -= 1) {
     const item = history[idx];
@@ -3010,6 +3041,17 @@ function createCodexAppServerBridgeProvider(options = {}) {
       at: nowIso(config.clock),
       ...msg,
     };
+    // Reformat finished assistant prose for the glasses (markdown -> plain,
+    // breaks preserved). Streaming text_delta chunks are left raw — markdown
+    // can span chunks — so only the final result/standalone text is cleaned.
+    if (
+      config.formatProse !== false &&
+      (entry.type === "result" || entry.type === "text") &&
+      typeof entry.text === "string" &&
+      entry.text
+    ) {
+      entry.text = formatProseForGlasses(entry.text);
+    }
     bridgeDebug(config, "codex-event", {
       sessionId,
       type: entry.type,
@@ -5095,6 +5137,9 @@ function buildConfigFromEnv(env = process.env, argv = process.argv.slice(2)) {
       { min: 0, max: 5 * 60_000 },
     ),
     warmCodexAppServer: env.MORPHEUS_G2_WARM_CODEX_APP_SERVER !== "0",
+    // Markdown -> plain reformat of assistant answers for the G2. Default on;
+    // set MORPHEUS_G2_FORMAT_PROSE=0 to pass raw model markdown through.
+    formatProse: env.MORPHEUS_G2_FORMAT_PROSE !== "0",
     // Owner-configured laptop-side policy, NOT glasses approval authority:
     // when on, the bridge answers codex permission requests itself so G2
     // turns don't stall waiting for an approval no glasses client can give.
@@ -6828,6 +6873,7 @@ export {
   createBridge,
   createCodexAppServerBridgeProvider,
   createMorpheusProvider,
+  formatProseForGlasses,
   runJsonCommand,
   sessionRowToEvenSession,
   startBridge,

@@ -260,6 +260,13 @@ retries while the app-server is still starting, for up to
 `MORPHEUS_G2_CODEX_STARTUP_WAIT_MS` (default 30000). Set
 `MORPHEUS_G2_WARM_CODEX_APP_SERVER=0` to skip the startup warm-up.
 
+Assistant answers are reformatted for the G2's plain-text display: markdown
+markers (`**bold**`, `` `code` ``, `#` headings, `[label](url)` links) are
+converted to legible plain text and `-`/`*` bullets become `•`, while line and
+paragraph breaks are preserved so paragraphs stay separated — content is never
+shortened. Set `MORPHEUS_G2_FORMAT_PROSE=0` to pass the raw model markdown
+through unchanged.
+
 Set `MORPHEUS_G2_INCLUDE_CODEX_HISTORY=0` if you do not want the project
 session list to include older Codex app-server threads (for example when
 deleted/archived laptop sessions keep reappearing on the glasses).
