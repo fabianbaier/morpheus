@@ -2677,6 +2677,45 @@ function createCodexAppServerBridgeProvider(options = {}) {
       targets: sessionMessageTargets(state, sessionId).length,
     });
     pushMessageForSession(state, sessionId, entry);
+    if (entry.type === "permission_request") {
+      const description = String(entry.description || entry.toolName || "a command").slice(0, 160);
+      if (config.autoApprovePermissions) {
+        config.logger.log(
+          `[g2-bridge] auto-approving codex permission (${description}) for ${sessionId}`,
+        );
+        // Answer on the next tick so the request is registered before the
+        // response; failures fall back to the provider's 60s auto-deny.
+        setTimeout(() => {
+          try {
+            codex.respondPermission?.(sessionId, "allow");
+          } catch (err) {
+            config.logger.warn(
+              `[g2-bridge] permission auto-approve failed: ${safeJsonError(err)}`,
+            );
+          }
+        }, 0).unref?.();
+        pushMessageForSession(state, sessionId, {
+          type: "text",
+          provider: "codex",
+          sessionId,
+          text: `[auto-approved] ${description}`,
+          at: nowIso(config.clock),
+        });
+      } else {
+        // Glasses cannot approve (by policy); without this line a stalled
+        // approval looks like an endless silent "Thinking...".
+        pushMessageForSession(state, sessionId, {
+          type: "text",
+          provider: "codex",
+          sessionId,
+          text:
+            `Codex is asking to run: ${description}. Glasses cannot approve; ` +
+            "it auto-denies in ~60s. Start the bridge with " +
+            "MORPHEUS_G2_AUTO_APPROVE_PERMISSIONS=1 to allow automatically.",
+          at: nowIso(config.clock),
+        });
+      }
+    }
 
     const existing =
       state.codexSessions.get(sessionId) ||
@@ -4674,6 +4713,10 @@ function buildConfigFromEnv(env = process.env, argv = process.argv.slice(2)) {
       { min: 0, max: 5 * 60_000 },
     ),
     warmCodexAppServer: env.MORPHEUS_G2_WARM_CODEX_APP_SERVER !== "0",
+    // Owner-configured laptop-side policy, NOT glasses approval authority:
+    // when on, the bridge answers codex permission requests itself so G2
+    // turns don't stall waiting for an approval no glasses client can give.
+    autoApprovePermissions: env.MORPHEUS_G2_AUTO_APPROVE_PERMISSIONS === "1",
     requestIdTtlMs: envInt(env, "MORPHEUS_G2_REQUEST_ID_TTL_MS", DEFAULT_REQUEST_ID_TTL_MS, {
       min: 1000,
       max: 60 * 60 * 1000,

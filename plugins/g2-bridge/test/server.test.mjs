@@ -5123,3 +5123,69 @@ test("feed prompts route to the most recent project by default", async (t) => {
   assert.ok(promptBody.sessionId);
   assert.notEqual(promptBody.sessionId, "feed:main");
 });
+
+test("codex permission requests surface on the glasses and can auto-approve", async (t) => {
+  const approvals = [];
+  let capturedEmit = null;
+  const providerFactory = (emit) => {
+    capturedEmit = emit;
+    return {
+      async getInfo() {
+        return { provider: "codex", model: "Codex", version: "test" };
+      },
+      async listSessions() {
+        return [];
+      },
+      getStatus() {
+        return null;
+      },
+      respondPermission(sessionId, decision) {
+        approvals.push({ sessionId, decision });
+      },
+    };
+  };
+
+  // Default: no auto-approve — the stall is explained in the buffer.
+  const plain = await withBridge(t, {
+    agentBackend: "codex_app_server",
+    createCodexAgentProvider: providerFactory,
+    mirrorCodexTui: false,
+  });
+  capturedEmit("thread-1", {
+    type: "permission_request",
+    description: "ls -la",
+    toolUseId: "req-1",
+  });
+  const plainMessages = await request(plain.baseUrl, "/api/messages?sessionId=thread-1");
+  const plainBody = await plainMessages.json();
+  assert.ok(
+    plainBody.messages.some(
+      (message) =>
+        message.type === "text" && /cannot approve/i.test(String(message.text || "")),
+    ),
+  );
+  assert.equal(approvals.length, 0);
+
+  // Opt-in: the bridge answers the request itself.
+  const auto = await withBridge(t, {
+    agentBackend: "codex_app_server",
+    createCodexAgentProvider: providerFactory,
+    mirrorCodexTui: false,
+    autoApprovePermissions: true,
+  });
+  capturedEmit("thread-2", {
+    type: "permission_request",
+    description: "git log",
+    toolUseId: "req-2",
+  });
+  await sleep(20);
+  assert.deepEqual(approvals, [{ sessionId: "thread-2", decision: "allow" }]);
+  const autoMessages = await request(auto.baseUrl, "/api/messages?sessionId=thread-2");
+  const autoBody = await autoMessages.json();
+  assert.ok(
+    autoBody.messages.some(
+      (message) =>
+        message.type === "text" && /auto-approved.*git log/i.test(String(message.text || "")),
+    ),
+  );
+});
